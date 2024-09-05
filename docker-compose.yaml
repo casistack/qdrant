@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_IMAGE_TAG:-latest}  # Dynamic image tag with a default value
+    ports:
+      - "6333:6333"  # Expose the Qdrant API
+    volumes:
+      - qdrant_data:/qdrant/storage  # Named volume for persistent storage
+    environment:
+      - QDRANT__API__KEY=${QDRANT_API_KEY}  # Dynamic environment variable for API key
+      - QDRANT__LOG_LEVEL=${QDRANT_LOG_LEVEL:-info}  # Dynamic log level with a default value
+
+volumes:
+  qdrant_data:  # Named volume definition
