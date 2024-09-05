@@ -4,7 +4,7 @@ services:
   qdrant:
     image: qdrant/qdrant:${QDRANT_IMAGE_TAG:-latest}  # Dynamic image tag with a default value
     ports:
-      - "6333:6333"  # Expose the Qdrant API
+      - ":6333"  # Expose the Qdrant API
     volumes:
       - qdrant_data:/qdrant/storage  # Named volume for persistent storage
     environment:
