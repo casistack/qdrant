@@ -4,8 +4,8 @@ services:
   qdrant:
     image: qdrant/qdrant:${QDRANT_IMAGE_TAG:-latest}
     ports:
-      - ":6333"  # Expose the Qdrant API internally
-      - ":6334"  # Expose the gRPC port internally
+      - "6333:6333"  # Expose the Qdrant API internally
+      - "6334:6334"  # Expose the gRPC port internally
     expose:
       - 6333
       - 6334
