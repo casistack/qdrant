@@ -54,6 +54,12 @@ services:
       
       # Telemetry
       - QDRANT__TELEMETRY_DISABLED=${QDRANT_TELEMETRY_DISABLED:-true}
+  qdrant-web-ui:
+    image: qdrant/qdrant-web-ui:latest
+    ports:
+      - ":3000"  # Expose the Web UI on port 3000
+    environment:
+      - REACT_APP_QDRANT_URL=http://qdrant:6333        
 
 volumes:
   qdrant_data:
