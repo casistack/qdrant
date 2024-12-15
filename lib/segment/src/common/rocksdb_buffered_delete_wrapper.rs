@@ -78,8 +78,8 @@ impl DatabaseColumnScheduledDeleteWrapper {
         })
     }
 
-    pub fn lock_db(&self) -> LockedDatabaseColumnSheduledDeleteWrapper<'_> {
-        LockedDatabaseColumnSheduledDeleteWrapper {
+    pub fn lock_db(&self) -> LockedDatabaseColumnScheduledDeleteWrapper<'_> {
+        LockedDatabaseColumnScheduledDeleteWrapper {
             base: self.db.lock_db(),
             deleted_pending_persistence: &self.deleted_pending_persistence,
         }
@@ -114,28 +114,32 @@ impl DatabaseColumnScheduledDeleteWrapper {
     pub fn remove_column_family(&self) -> OperationResult<()> {
         self.db.remove_column_family()
     }
+
+    pub fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        self.db.get_storage_size_bytes()
+    }
 }
 
-pub struct LockedDatabaseColumnSheduledDeleteWrapper<'a> {
+pub struct LockedDatabaseColumnScheduledDeleteWrapper<'a> {
     base: LockedDatabaseColumnWrapper<'a>,
     deleted_pending_persistence: &'a Mutex<HashSet<Vec<u8>>>,
 }
 
-impl LockedDatabaseColumnSheduledDeleteWrapper<'_> {
-    pub fn iter(&self) -> OperationResult<DatabaseColumnSheduledDeleteIterator<'_>> {
-        Ok(DatabaseColumnSheduledDeleteIterator {
+impl LockedDatabaseColumnScheduledDeleteWrapper<'_> {
+    pub fn iter(&self) -> OperationResult<DatabaseColumnScheduledDeleteIterator<'_>> {
+        Ok(DatabaseColumnScheduledDeleteIterator {
             base: self.base.iter()?,
             deleted_pending_persistence: self.deleted_pending_persistence,
         })
     }
 }
 
-pub struct DatabaseColumnSheduledDeleteIterator<'a> {
+pub struct DatabaseColumnScheduledDeleteIterator<'a> {
     base: DatabaseColumnIterator<'a>,
     deleted_pending_persistence: &'a Mutex<HashSet<Vec<u8>>>,
 }
 
-impl<'a> Iterator for DatabaseColumnSheduledDeleteIterator<'a> {
+impl Iterator for DatabaseColumnScheduledDeleteIterator<'_> {
     type Item = (Box<[u8]>, Box<[u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {

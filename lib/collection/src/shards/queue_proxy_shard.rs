@@ -4,12 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::tar_ext;
 use common::types::TelemetryDetail;
 use parking_lot::Mutex as ParkingMutex;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::order_by::OrderBy;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, ScoredPoint, SnapshotFormat, WithPayload, WithPayloadInterface,
+    WithVector,
 };
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -21,7 +24,7 @@ use super::update_tracker::UpdateTracker;
 use crate::operations::point_ops::WriteOrdering;
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, PointRequestInternal, Record, UpdateResult,
+    CountRequestInternal, CountResult, PointRequestInternal, RecordInternal, UpdateResult,
 };
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::OperationWithClockTag;
@@ -98,9 +101,10 @@ impl QueueProxyShard {
         let wal = wrapped_shard.wal.wal.clone();
         let wal_lock = wal.lock();
 
-        // If start version is not in current WAL bounds [first_idx, last_idx], we cannot reliably transfer WAL
+        // If start version is not in current WAL bounds [first_idx, last_idx + 1], we cannot reliably transfer WAL
+        // Allow it to be one higher than the last index to only send new updates
         let (first_idx, last_idx) = (wal_lock.first_closed_index(), wal_lock.last_index());
-        if !(first_idx..=last_idx).contains(&version) {
+        if !(first_idx..=last_idx + 1).contains(&version) {
             return Err((wrapped_shard, CollectionError::service_error(format!("Cannot create queue proxy shard from version {version} because it is out of WAL bounds ({first_idx}..={last_idx})"))));
         }
 
@@ -123,12 +127,13 @@ impl QueueProxyShard {
     pub async fn create_snapshot(
         &self,
         temp_path: &Path,
-        target_path: &Path,
+        tar: &tar_ext::BuilderExt,
+        format: SnapshotFormat,
         save_wal: bool,
     ) -> CollectionResult<()> {
         self.inner_unchecked()
             .wrapped_shard
-            .create_snapshot(temp_path, target_path, save_wal)
+            .create_snapshot(temp_path, tar, format, save_wal)
             .await
     }
 
@@ -152,6 +157,17 @@ impl QueueProxyShard {
             .wrapped_shard
             .on_optimizer_config_update()
             .await
+    }
+
+    pub async fn on_strict_mode_config_update(&self) {
+        self.inner_unchecked()
+            .wrapped_shard
+            .on_strict_mode_config_update()
+            .await
+    }
+
+    pub fn trigger_optimizers(&self) {
+        self.inner_unchecked().wrapped_shard.trigger_optimizers();
     }
 
     pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
@@ -221,7 +237,7 @@ impl ShardOperation for QueueProxyShard {
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
         timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>> {
+    ) -> CollectionResult<Vec<RecordInternal>> {
         self.inner_unchecked()
             .scroll_by(
                 offset,
@@ -245,9 +261,10 @@ impl ShardOperation for QueueProxyShard {
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         self.inner_unchecked()
-            .core_search(request, search_runtime_handle, timeout)
+            .core_search(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
@@ -257,9 +274,10 @@ impl ShardOperation for QueueProxyShard {
         request: Arc<CountRequestInternal>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<CountResult> {
         self.inner_unchecked()
-            .count(request, search_runtime_handle, timeout)
+            .count(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
@@ -271,7 +289,7 @@ impl ShardOperation for QueueProxyShard {
         with_vector: &WithVector,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>> {
+    ) -> CollectionResult<Vec<RecordInternal>> {
         self.inner_unchecked()
             .retrieve(
                 request,
@@ -289,10 +307,11 @@ impl ShardOperation for QueueProxyShard {
         requests: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
         self.inner_unchecked()
             .wrapped_shard
-            .query_batch(requests, search_runtime_handle, timeout)
+            .query_batch(requests, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
@@ -426,6 +445,10 @@ impl Inner {
             let items_left = (wal.last_index() + 1).saturating_sub(transfer_from);
             let items_total = (transfer_from - self.started_at) + items_left;
             let batch = wal.read(transfer_from).take(BATCH_SIZE).collect::<Vec<_>>();
+            debug_assert!(
+                batch.len() <= items_left as usize,
+                "batch cannot be larger than items_left",
+            );
             (items_left, items_total, batch)
         };
 
@@ -528,7 +551,7 @@ impl ShardOperation for Inner {
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
         timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>> {
+    ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
             .scroll_by(
@@ -556,10 +579,11 @@ impl ShardOperation for Inner {
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .core_search(request, search_runtime_handle, timeout)
+            .core_search(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
@@ -569,10 +593,11 @@ impl ShardOperation for Inner {
         request: Arc<CountRequestInternal>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<CountResult> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .count(request, search_runtime_handle, timeout)
+            .count(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
@@ -584,7 +609,7 @@ impl ShardOperation for Inner {
         with_vector: &WithVector,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>> {
+    ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
             .retrieve(
@@ -603,10 +628,11 @@ impl ShardOperation for Inner {
         request: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .query_batch(request, search_runtime_handle, timeout)
+            .query_batch(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 

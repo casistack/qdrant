@@ -3,6 +3,7 @@ use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use parking_lot::Mutex;
@@ -22,7 +23,7 @@ use crate::operations::universal_query::planned_query::{
     MergePlan, PlannedQuery, RescoreParams, Source,
 };
 use crate::operations::universal_query::shard_query::{
-    Fusion, Sample, ScoringQuery, ShardQueryResponse,
+    FusionInternal, SampleInternal, ScoringQuery, ShardQueryResponse,
 };
 
 pub enum FetchedSource {
@@ -58,6 +59,7 @@ impl LocalShard {
         request: PlannedQuery,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_counter_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
         let start_time = std::time::Instant::now();
         let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
@@ -68,6 +70,7 @@ impl LocalShard {
             }),
             search_runtime_handle,
             Some(timeout),
+            hw_counter_acc,
         );
 
         let scrolls_f =
@@ -87,6 +90,7 @@ impl LocalShard {
                 search_runtime_handle,
                 timeout,
                 0,
+                hw_counter_acc,
             )
         });
 
@@ -150,10 +154,12 @@ impl LocalShard {
         search_runtime_handle: &'shard Handle,
         timeout: Duration,
         depth: usize,
+        hw_counter_acc: &HwMeasurementAcc,
     ) -> BoxFuture<'query, CollectionResult<Vec<Vec<ScoredPoint>>>>
     where
         'shard: 'query,
     {
+        let hw_collector = hw_counter_acc.new_collector();
         async move {
             let start_time = std::time::Instant::now();
             let max_len = merge_plan.sources.len();
@@ -171,11 +177,12 @@ impl LocalShard {
                     Source::Prefetch(prefetch) => {
                         let merged = self
                             .recurse_prefetch(
-                                prefetch,
+                                *prefetch,
                                 prefetch_holder,
                                 search_runtime_handle,
                                 timeout,
                                 depth + 1,
+                                &hw_collector,
                             )
                             .await?
                             .into_iter();
@@ -190,7 +197,13 @@ impl LocalShard {
             // Rescore or return plain sources
             if let Some(rescore_params) = merge_plan.rescore_params {
                 let rescored = self
-                    .rescore(sources, rescore_params, search_runtime_handle, timeout)
+                    .rescore(
+                        sources,
+                        rescore_params,
+                        search_runtime_handle,
+                        timeout,
+                        &hw_collector,
+                    )
                     .await?;
 
                 Ok(vec![rescored])
@@ -205,12 +218,13 @@ impl LocalShard {
     }
 
     /// Rescore list of scored points
-    async fn rescore<'a>(
+    async fn rescore(
         &self,
         sources: Vec<Vec<ScoredPoint>>,
         rescore_params: RescoreParams,
         search_runtime_handle: &Handle,
         timeout: Duration,
+        hw_counter_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let RescoreParams {
             rescore,
@@ -218,6 +232,7 @@ impl LocalShard {
             limit,
             with_vector,
             with_payload,
+            params,
         } = rescore_params;
 
         match rescore {
@@ -267,14 +282,13 @@ impl LocalShard {
                 let search_request = CoreSearchRequest {
                     query: query_enum,
                     filter: Some(filter),
-                    params: None,
+                    params,
                     limit,
                     offset: 0,
                     with_payload: Some(with_payload),
                     with_vector: Some(with_vector),
                     score_threshold,
                 };
-
                 let rescoring_core_search_request = CoreSearchRequestBatch {
                     searches: vec![search_request],
                 };
@@ -283,6 +297,7 @@ impl LocalShard {
                     Arc::new(rescoring_core_search_request),
                     search_runtime_handle,
                     Some(timeout),
+                    hw_counter_acc,
                 )
                 .await?
                 // One search request is sent. We expect only one result
@@ -294,7 +309,7 @@ impl LocalShard {
                 })
             }
             ScoringQuery::Sample(sample) => match sample {
-                Sample::Random => {
+                SampleInternal::Random => {
                     // create single scroll request for rescoring query
                     let filter = filter_with_sources_ids(sources.into_iter());
 
@@ -325,10 +340,10 @@ impl LocalShard {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn fusion_rescore<'a>(
+    async fn fusion_rescore(
         &self,
         sources: impl Iterator<Item = Vec<ScoredPoint>>,
-        fusion: Fusion,
+        fusion: FusionInternal,
         score_threshold: Option<f32>,
         limit: usize,
         with_payload: WithPayloadInterface,
@@ -336,8 +351,8 @@ impl LocalShard {
         timeout: Duration,
     ) -> Result<Vec<ScoredPoint>, CollectionError> {
         let fused = match fusion {
-            Fusion::Rrf => rrf_scoring(sources),
-            Fusion::Dbsf => score_fusion(sources, ScoreFusion::dbsf()),
+            FusionInternal::Rrf => rrf_scoring(sources),
+            FusionInternal::Dbsf => score_fusion(sources, ScoreFusion::dbsf()),
         };
 
         let top_fused: Vec<_> = if let Some(score_threshold) = score_threshold {

@@ -161,6 +161,7 @@ fn test_prefix_search(#[case] immutable: bool) {
         min_token_len: None,
         max_token_len: None,
         lowercase: None,
+        on_disk: None,
     };
 
     let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
@@ -177,7 +178,7 @@ fn test_prefix_search(#[case] immutable: bool) {
     }
 
     if immutable {
-        index = FullTextIndex::new(db, config, "text", false);
+        index = FullTextIndex::new_memory(db, config, "text", false);
         index.load().unwrap();
     }
 

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::order_by::OrderBy;
 use segment::types::*;
@@ -30,7 +31,7 @@ pub trait ShardOperation {
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
         timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>>;
+    ) -> CollectionResult<Vec<RecordInternal>>;
 
     async fn info(&self) -> CollectionResult<CollectionInfo>;
 
@@ -39,6 +40,7 @@ pub trait ShardOperation {
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>>;
 
     async fn count(
@@ -46,6 +48,7 @@ pub trait ShardOperation {
         request: Arc<CountRequestInternal>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<CountResult>;
 
     async fn retrieve(
@@ -55,13 +58,14 @@ pub trait ShardOperation {
         with_vector: &WithVector,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-    ) -> CollectionResult<Vec<Record>>;
+    ) -> CollectionResult<Vec<RecordInternal>>;
 
     async fn query_batch(
         &self,
         requests: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>>;
 
     async fn facet(

@@ -1,11 +1,15 @@
+import json
+from logging import warning
 from typing import Any, Dict, List
 import jsonschema
 import requests
+import warnings
 from schemathesis.models import APIOperation
 from schemathesis.specs.openapi.references import ConvertingResolver
 from schemathesis.specs.openapi.schemas import OpenApi30
+from functools import lru_cache
 
-from .settings import QDRANT_HOST, SCHEMA
+from .settings import QDRANT_HOST, SCHEMA, QDRANT_HOST_HEADERS
 
 
 def get_api_string(host, api, path_params):
@@ -73,10 +77,15 @@ def request_with_validation(
     if not action:
         raise RuntimeError(f"Method {method} does not exists")
 
+    if api.endswith("/delete") and method == "POST" and "wait" not in query_params:
+        warnings.warn(f"Delete call for {api} missing wait=true param, adding it")
+        query_params["wait"] = "true"
+
     response = action(
         url=get_api_string(QDRANT_HOST, api, path_params),
         params=query_params,
-        json=body
+        json=body,
+        headers=qdrant_host_headers()
     )
 
     operation.validate_response(response)
@@ -140,5 +149,9 @@ def distribution_based_score_fusion(responses: List[List[Any]], limit: int = 10)
     sorted_points = sorted(points_map.values(), key=lambda item: item['score'], reverse=True)
     
     return sorted_points[:limit]
-    
-    
+
+
+@lru_cache
+def qdrant_host_headers():
+    headers = json.loads(QDRANT_HOST_HEADERS)
+    return headers

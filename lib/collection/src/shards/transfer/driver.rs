@@ -16,10 +16,9 @@ use crate::common::stoppable_task_async::{spawn_async_cancellable, CancellableAs
 use crate::operations::types::CollectionResult;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::remote_shard::RemoteShard;
-use crate::shards::replica_set::ReplicaState;
-use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard::ShardId;
 use crate::shards::shard_holder::{LockedShardHolder, ShardHolder};
-use crate::shards::CollectionId;
+use crate::shards::{await_consensus_sync, CollectionId};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 pub(crate) const MAX_RETRY_COUNT: usize = 3;
@@ -91,7 +90,7 @@ pub async fn transfer_shard(
                 progress,
                 local_shard_id,
                 remote_shard,
-                channel_service,
+                &channel_service,
                 consensus,
                 snapshots_path,
                 &collection_id,
@@ -108,7 +107,6 @@ pub async fn transfer_shard(
                 progress,
                 local_shard_id,
                 remote_shard,
-                channel_service,
                 consensus,
                 &collection_id,
             )
@@ -130,6 +128,12 @@ pub async fn transfer_shard(
         }
     }
 
+    // Synchronize all nodes
+    // Ensure all peers have reached a state where they'll start sending incoming updates to the
+    // remote shard. A lagging peer must not still have the target shard in dead/recovery state.
+    // Only then can we destruct the forward proxy.
+    await_consensus_sync(consensus, &channel_service).await;
+
     Ok(true)
 }
 
@@ -144,7 +148,7 @@ pub async fn transfer_shard_fallback_default(
 ) -> CollectionResult<bool> {
     // Do not attempt to fall back to the same method
     let old_method = transfer_config.method;
-    if old_method.map_or(false, |method| method == fallback_method) {
+    if old_method.is_some_and(|method| method == fallback_method) {
         log::warn!("Failed shard transfer fallback, because it would use the same transfer method: {fallback_method:?}");
         return Ok(false);
     }
@@ -167,7 +171,7 @@ pub async fn revert_proxy_shard_to_local(
     shard_holder: &ShardHolder,
     shard_id: ShardId,
 ) -> CollectionResult<bool> {
-    let replica_set = match shard_holder.get_shard(&shard_id) {
+    let replica_set = match shard_holder.get_shard(shard_id) {
         None => return Ok(false),
         Some(replica_set) => replica_set,
     };
@@ -177,89 +181,6 @@ pub async fn revert_proxy_shard_to_local(
 
     // Un-proxify local shard
     replica_set.un_proxify_local().await?;
-
-    Ok(true)
-}
-
-pub async fn change_remote_shard_route(
-    shard_holder: &ShardHolder,
-    from_shard_id: ShardId,
-    to_shard_id: ShardId,
-    old_peer_id: PeerId,
-    new_peer_id: PeerId,
-    state: ReplicaState,
-    sync: bool,
-) -> CollectionResult<bool> {
-    let from_replica_set = match shard_holder.get_shard(&from_shard_id) {
-        None => return Ok(false),
-        Some(replica_set) => replica_set,
-    };
-    let to_replica_set = match shard_holder.get_shard(&to_shard_id) {
-        None => return Ok(false),
-        Some(replica_set) => replica_set,
-    };
-
-    if to_replica_set.this_peer_id() != new_peer_id {
-        to_replica_set.add_remote(new_peer_id, state).await?;
-    }
-
-    if !sync {
-        // Transfer was a move, we need to remove the old peer
-        from_replica_set.remove_remote(old_peer_id).await?;
-    }
-    Ok(true)
-}
-
-/// Mark partial shard as ready
-///
-/// Returns `true` if the shard was promoted, `false` if the shard was not found.
-pub async fn finalize_partial_shard(
-    shard_holder: &ShardHolder,
-    shard_id: ShardId,
-) -> CollectionResult<bool> {
-    let replica_set = match shard_holder.get_shard(&shard_id) {
-        None => return Ok(false),
-        Some(replica_set) => replica_set,
-    };
-
-    if !replica_set.has_local_shard().await {
-        return Ok(false);
-    }
-
-    replica_set.set_replica_state(&replica_set.this_peer_id(), ReplicaState::Active)?;
-    Ok(true)
-}
-
-/// Promotes wrapped local shard to remote shard
-///
-/// Returns true if the shard was promoted, false if it was already handled
-pub async fn handle_transferred_shard_proxy(
-    shard_holder: &ShardHolder,
-    shard_id: ShardId,
-    to: PeerId,
-    activate_shard: bool,
-    sync: bool,
-) -> CollectionResult<bool> {
-    // TODO: Ensure cancel safety!
-
-    let replica_set = match shard_holder.get_shard(&shard_id) {
-        None => return Ok(false),
-        Some(replica_set) => replica_set,
-    };
-
-    if activate_shard {
-        replica_set.add_remote(to, ReplicaState::Active).await?;
-    }
-
-    if sync {
-        // Keep local shard in the replica set
-        replica_set.un_proxify_local().await?;
-    } else {
-        // Remove local proxy
-        //
-        // TODO: Ensure cancel safety!
-        replica_set.remove_local().await?;
-    }
 
     Ok(true)
 }
@@ -325,7 +246,7 @@ where
 
             if is_err || is_cancelled {
                 // Revert queue proxy if we still have any to prepare for the next attempt
-                if let Some(shard) = shards_holder.read().await.get_shard(&transfer.shard_id) {
+                if let Some(shard) = shards_holder.read().await.get_shard(transfer.shard_id) {
                     shard.revert_queue_proxy_local().await;
                 }
             }

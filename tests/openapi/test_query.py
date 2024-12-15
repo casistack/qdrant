@@ -4,14 +4,13 @@ import requests
 import os
 
 from .helpers.collection_setup import basic_collection_setup, drop_collection
-from .helpers.helpers import distribution_based_score_fusion, reciprocal_rank_fusion, request_with_validation
-
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost:6333")
-collection_name = "test_query"
+from .helpers.helpers import distribution_based_score_fusion, reciprocal_rank_fusion, request_with_validation, \
+    qdrant_host_headers
+from .helpers.settings import QDRANT_HOST
 
 
 @pytest.fixture(autouse=True, scope="module")
-def setup(on_disk_vectors):
+def setup(on_disk_vectors, collection_name):
     basic_collection_setup(collection_name=collection_name, on_disk_vectors=on_disk_vectors)
 
     response = request_with_validation(
@@ -25,7 +24,7 @@ def setup(on_disk_vectors):
     drop_collection(collection_name=collection_name)
 
 
-def test_query_validation():
+def test_query_validation(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/query",
         method="POST",
@@ -74,7 +73,8 @@ def test_query_validation():
 
 
     # raw query to bypass local validation
-    response = requests.post(f"http://{QDRANT_HOST}/collections/{collection_name}/points/query",
+    response = requests.post(f"{QDRANT_HOST}/collections/{collection_name}/points/query",
+        headers=qdrant_host_headers(),
         json={
             "query": {
                 "recommend": {
@@ -88,7 +88,7 @@ def test_query_validation():
     assert response.json()["status"]["error"] == ("Validation error in JSON body: [internal.limit: value 0 invalid, must be 1 or larger]")
 
 
-def root_and_rescored_query(query, limit=None, with_payload=None):
+def root_and_rescored_query(collection_name, query, limit=None, with_payload=None):
     response = request_with_validation(
         api="/collections/{collection_name}/points/query",
         method="POST",
@@ -121,7 +121,7 @@ def root_and_rescored_query(query, limit=None, with_payload=None):
     return root_query_result
 
 
-def test_basic_search():
+def test_basic_search(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/search",
         method="POST",
@@ -134,15 +134,46 @@ def test_basic_search():
     assert response.ok
     search_result = response.json()["result"]
 
-    default_query_result = root_and_rescored_query([0.1, 0.2, 0.3, 0.4])
+    default_query_result = root_and_rescored_query(collection_name, [0.1, 0.2, 0.3, 0.4])
 
-    nearest_query_result = root_and_rescored_query({"nearest": [0.1, 0.2, 0.3, 0.4]})
+    nearest_query_result = root_and_rescored_query(collection_name, {"nearest": [0.1, 0.2, 0.3, 0.4]})
 
     assert search_result == default_query_result
     assert search_result == nearest_query_result
 
 
-def test_basic_scroll():
+# Test basic search with huge limit, it must not panic with allocation failure
+# See: <https://github.com/qdrant/qdrant/issues/5483>
+def test_basic_search_high_limit(collection_name):
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/search",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "vector": [0.1, 0.2, 0.3, 0.4],
+            "limit": 18446744073709551615, # u64::MAX
+        },
+    )
+    assert response.ok
+    search_result = response.json()["result"]
+
+    default_query_result = root_and_rescored_query(
+        collection_name,
+        [0.1, 0.2, 0.3, 0.4],
+        limit=18446744073709551615, # u64::MAX
+    )
+
+    nearest_query_result = root_and_rescored_query(
+        collection_name,
+        {"nearest": [0.1, 0.2, 0.3, 0.4]},
+        limit=18446744073709551615, # u64::MAX
+    )
+
+    assert search_result == default_query_result
+    assert search_result == nearest_query_result
+
+
+def test_basic_scroll(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/scroll",
         method="POST",
@@ -167,7 +198,7 @@ def test_basic_scroll():
         assert record.get("id") == scored_point.get("id")
         assert record.get("payload") == scored_point.get("payload")
 
-def test_basic_scroll_offset():
+def test_basic_scroll_offset(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/scroll",
         method="POST",
@@ -195,7 +226,7 @@ def test_basic_scroll_offset():
         assert record.get("id") == scored_point.get("id")
         assert record.get("payload") == scored_point.get("payload")
 
-def test_basic_recommend_avg():
+def test_basic_recommend_avg(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/recommend",
         method="POST",
@@ -209,7 +240,7 @@ def test_basic_recommend_avg():
     assert response.ok
     recommend_result = response.json()["result"]
 
-    query_result = root_and_rescored_query(
+    query_result = root_and_rescored_query(collection_name,
         {
             "recommend": {"positive": [1, 2, 3, 4], "negative": [3]},  # ids
         }
@@ -218,7 +249,7 @@ def test_basic_recommend_avg():
     assert recommend_result == query_result
 
 
-def test_basic_recommend_best_score():
+def test_basic_recommend_best_score(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/recommend",
         method="POST",
@@ -253,7 +284,7 @@ def test_basic_recommend_best_score():
     assert recommend_result == query_result
 
 
-def test_basic_discover():
+def test_basic_discover(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/discover",
         method="POST",
@@ -267,7 +298,7 @@ def test_basic_discover():
     assert response.ok
     discover_result = response.json()["result"]
 
-    query_result = root_and_rescored_query(
+    query_result = root_and_rescored_query(collection_name,
         {
             "discover": {
                 "target": 2,
@@ -279,7 +310,7 @@ def test_basic_discover():
     assert discover_result == query_result
 
 
-def test_basic_context():
+def test_basic_context(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/discover",
         method="POST",
@@ -309,7 +340,7 @@ def test_basic_context():
     assert set([p["id"] for p in context_result]) == set([p["id"] for p in query_result])
 
 
-def test_basic_order_by():
+def test_basic_order_by(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/scroll",
         method="POST",
@@ -321,14 +352,14 @@ def test_basic_order_by():
     assert response.ok, response.text
     scroll_result = response.json()["result"]["points"]
 
-    query_result = root_and_rescored_query({"order_by": "price"}, with_payload=True)
+    query_result = root_and_rescored_query(collection_name, {"order_by": "price"}, with_payload=True)
 
     for record, scored_point in zip(scroll_result, query_result):
         assert record.get("id") == scored_point.get("id")
         assert record.get("payload") == scored_point.get("payload")
 
 
-def test_basic_random_query():
+def test_basic_random_query(collection_name):
     ids_lists = set()
     for _ in range(4):
         response = request_with_validation(
@@ -352,7 +383,7 @@ def test_basic_random_query():
     assert len(ids_lists) > 1
 
 
-def test_basic_rrf():
+def test_basic_rrf(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/search",
         method="POST",
@@ -404,7 +435,7 @@ def test_basic_rrf():
         assert isclose(expected["score"], result["score"], rel_tol=1e-5)
         
 
-def test_basic_dbsf():
+def test_basic_dbsf(collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/search",
         method="POST",
@@ -462,7 +493,8 @@ def test_basic_dbsf():
     },
     { "query": [0.1, 0.2, 0.3, 0.4] }
 ])
-def test_score_threshold(body):
+
+def test_score_threshold(body, collection_name):
     response = request_with_validation(
         api="/collections/{collection_name}/points/query",
         method="POST",

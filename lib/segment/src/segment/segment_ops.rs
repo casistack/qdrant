@@ -19,16 +19,15 @@ use crate::common::operation_error::{
 use crate::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
 use crate::common::{check_named_vectors, check_vector_name};
 use crate::data_types::named_vectors::NamedVectors;
-use crate::data_types::vectors::Vector;
+use crate::data_types::vectors::VectorInternal;
 use crate::entry::entry_point::SegmentEntry;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::{PayloadIndex, VectorIndex};
 use crate::types::{
     Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType, PointIdType,
-    SegmentState, SeqNumberType,
+    SegmentState, SeqNumberType, SnapshotFormat,
 };
 use crate::utils;
-use crate::utils::fs::find_symlink;
 use crate::vector_storage::VectorStorage;
 
 impl Segment {
@@ -48,10 +47,10 @@ impl Segment {
     pub(super) fn replace_all_vectors(
         &mut self,
         internal_id: PointOffsetType,
-        vectors: NamedVectors,
+        vectors: &NamedVectors,
     ) -> OperationResult<()> {
         debug_assert!(self.is_appendable());
-        check_named_vectors(&vectors, &self.segment_config)?;
+        check_named_vectors(vectors, &self.segment_config)?;
         for (vector_name, vector_data) in self.vector_data.iter_mut() {
             let vector = vectors.get(vector_name);
             let mut vector_index = vector_data.vector_index.borrow_mut();
@@ -73,6 +72,7 @@ impl Segment {
     /// # Warning
     ///
     /// Available for appendable segments only.
+    #[allow(clippy::needless_pass_by_ref_mut)] // ensure single access to AtomicRefCell vector_index
     pub(super) fn update_vectors(
         &mut self,
         internal_id: PointOffsetType,
@@ -96,10 +96,10 @@ impl Segment {
     pub(super) fn insert_new_vectors(
         &mut self,
         point_id: PointIdType,
-        vectors: NamedVectors,
+        vectors: &NamedVectors,
     ) -> OperationResult<PointOffsetType> {
         debug_assert!(self.is_appendable());
-        check_named_vectors(&vectors, &self.segment_config)?;
+        check_named_vectors(vectors, &self.segment_config)?;
         let new_index = self.id_tracker.borrow().total_point_count() as PointOffsetType;
         for (vector_name, vector_data) in self.vector_data.iter_mut() {
             let vector_opt = vectors.get(vector_name);
@@ -278,7 +278,7 @@ impl Segment {
                 .id_tracker
                 .borrow()
                 .internal_version(point_offset)
-                .map_or(false, |current_version| current_version > op_num)
+                .is_some_and(|current_version| current_version > op_num)
             {
                 return Ok(false);
             }
@@ -352,7 +352,7 @@ impl Segment {
         &self,
         vector_name: &str,
         point_offset: PointOffsetType,
-    ) -> OperationResult<Option<Vector>> {
+    ) -> OperationResult<Option<VectorInternal>> {
         check_vector_name(vector_name, &self.segment_config)?;
         let vector_data = &self.vector_data[vector_name];
         let is_vector_deleted = vector_data
@@ -409,7 +409,7 @@ impl Segment {
         &self,
         point_offset: PointOffsetType,
     ) -> OperationResult<Payload> {
-        self.payload_index.borrow().payload(point_offset)
+        self.payload_index.borrow().get_payload(point_offset)
     }
 
     pub fn save_current_state(&self) -> OperationResult<()> {
@@ -424,53 +424,20 @@ impl Segment {
         payload_index.infer_payload_type(key)
     }
 
-    pub fn restore_snapshot(snapshot_path: &Path, segment_id: &str) -> OperationResult<()> {
-        let segment_path = snapshot_path.parent().unwrap().join(segment_id);
-
-        let mut archive = open_snapshot_archive_with_validation(snapshot_path)?;
-
-        archive.unpack(&segment_path).map_err(|err| {
+    /// Unpacks and restores the segment snapshot in-place. The original
+    /// snapshot is destroyed in the process.
+    ///
+    /// Both of the following calls would result in a directory
+    /// `foo/bar/segment-id/` with the segment data:
+    ///
+    /// - `segment.restore_snapshot("foo/bar/segment-id.tar")`  (tar archive)
+    /// - `segment.restore_snapshot("foo/bar/segment-id")`      (directory)
+    pub fn restore_snapshot_in_place(snapshot_path: &Path) -> OperationResult<()> {
+        restore_snapshot_in_place(snapshot_path).map_err(|err| {
             OperationError::service_error(format!(
-                "failed to unpack segment snapshot archive {snapshot_path:?}: {err}"
+                "Failed to restore snapshot from {snapshot_path:?}: {err}",
             ))
-        })?;
-
-        let snapshot_path = segment_path.join(SNAPSHOT_PATH);
-
-        if snapshot_path.exists() {
-            let db_backup_path = snapshot_path.join(DB_BACKUP_PATH);
-            let payload_index_db_backup = snapshot_path.join(PAYLOAD_DB_BACKUP_PATH);
-
-            crate::rocksdb_backup::restore(&db_backup_path, &segment_path)?;
-
-            if payload_index_db_backup.is_dir() {
-                StructPayloadIndex::restore_database_snapshot(
-                    &payload_index_db_backup,
-                    &segment_path,
-                )?;
-            }
-
-            let files_path = snapshot_path.join(SNAPSHOT_FILES_PATH);
-
-            if let Some(symlink) = find_symlink(&files_path) {
-                return Err(OperationError::service_error(format!(
-                    "Snapshot is corrupted, can't read file: {symlink:?}"
-                )));
-            }
-
-            utils::fs::move_all(&files_path, &segment_path)?;
-
-            fs::remove_dir_all(&snapshot_path).map_err(|err| {
-                OperationError::service_error(format!(
-                    "failed to remove {snapshot_path:?} directory: {err}"
-                ))
-            })?;
-        } else {
-            log::info!("Attempt to restore legacy snapshot format");
-            // Do nothing, legacy format is just plain archive
-        }
-
-        Ok(())
+        })
     }
 
     // Joins flush thread if exists
@@ -518,7 +485,9 @@ impl Segment {
 
             for internal_id in &internal_ids_to_delete {
                 // Drop removed points from payload index
-                self.payload_index.borrow_mut().drop(*internal_id)?;
+                self.payload_index
+                    .borrow_mut()
+                    .clear_payload(*internal_id)?;
 
                 // Drop removed points from vector storage
                 for vector_data in self.vector_data.values() {
@@ -687,4 +656,69 @@ impl Segment {
     pub fn cleanup_versions(&mut self) -> OperationResult<()> {
         self.id_tracker.borrow_mut().cleanup_versions()
     }
+}
+
+fn restore_snapshot_in_place(snapshot_path: &Path) -> OperationResult<()> {
+    let segments_dir = snapshot_path
+        .parent()
+        .ok_or_else(|| OperationError::service_error("Cannot extract parent path"))?;
+
+    let file_name = snapshot_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            OperationError::service_error("Cannot extract segment ID from snapshot path")
+        })?;
+
+    let meta = fs::metadata(snapshot_path)?;
+    let (segment_id, is_tar) = match file_name.split_once('.') {
+        Some((segment_id, "tar")) if meta.is_file() => (segment_id, true),
+        None if meta.is_dir() => (file_name, false),
+        _ => {
+            return Err(OperationError::service_error(
+                "Invalid snapshot path, expected either a directory or a .tar file",
+            ))
+        }
+    };
+
+    if !is_tar {
+        log::info!("Snapshot format: {:?}", SnapshotFormat::Streamable);
+        unpack_snapshot(snapshot_path)?;
+    } else {
+        let segment_path = segments_dir.join(segment_id);
+        open_snapshot_archive_with_validation(snapshot_path)?.unpack(&segment_path)?;
+
+        let inner_path = segment_path.join(SNAPSHOT_PATH);
+        if inner_path.is_dir() {
+            log::info!("Snapshot format: {:?}", SnapshotFormat::Regular);
+            unpack_snapshot(&inner_path)?;
+            utils::fs::move_all(&inner_path, &segment_path)?;
+            std::fs::remove_dir(&inner_path)?;
+        } else {
+            log::info!("Snapshot format: {:?}", SnapshotFormat::Ancient);
+            // Do nothing, this format is just a plain archive.
+        }
+
+        std::fs::remove_file(snapshot_path)?;
+    }
+
+    Ok(())
+}
+
+fn unpack_snapshot(segment_path: &Path) -> OperationResult<()> {
+    let db_backup_path = segment_path.join(DB_BACKUP_PATH);
+    crate::rocksdb_backup::restore(&db_backup_path, segment_path)?;
+    std::fs::remove_dir_all(&db_backup_path)?;
+
+    let payload_index_db_backup = segment_path.join(PAYLOAD_DB_BACKUP_PATH);
+    if payload_index_db_backup.is_dir() {
+        StructPayloadIndex::restore_database_snapshot(&payload_index_db_backup, segment_path)?;
+        std::fs::remove_dir_all(&payload_index_db_backup)?;
+    }
+
+    let files_path = segment_path.join(SNAPSHOT_FILES_PATH);
+    utils::fs::move_all(&files_path, segment_path)?;
+    std::fs::remove_dir(&files_path)?;
+
+    Ok(())
 }

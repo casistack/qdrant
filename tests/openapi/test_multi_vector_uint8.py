@@ -4,13 +4,9 @@ import os
 from .helpers.collection_setup import drop_collection
 from .helpers.helpers import request_with_validation
 
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost:6333")
-
-collection_name = 'test_multi_vector_uint8_persistence'
-
 
 @pytest.fixture(autouse=True)
-def setup(on_disk_vectors):
+def setup(on_disk_vectors, collection_name):
     multivector_uint8_collection_setup(collection_name=collection_name, on_disk_vectors=on_disk_vectors)
     yield
     drop_collection(collection_name=collection_name)
@@ -49,7 +45,7 @@ def multivector_uint8_collection_setup(
     assert response.ok
 
 
-def test_multi_vector_uint8_persisted():
+def test_multi_vector_uint8_persisted(collection_name):
     # batch upsert
     response = request_with_validation(
         api='/collections/{collection_name}/points',
@@ -140,7 +136,7 @@ def test_multi_vector_uint8_persisted():
     assert not response.ok
 
 
-def test_multi_vector_unint8_truncation():
+def test_multi_vector_unint8_truncation(collection_name):
     response = request_with_validation(
         api='/collections/{collection_name}/points',
         method="PUT",

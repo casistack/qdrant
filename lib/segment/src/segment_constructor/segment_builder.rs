@@ -11,6 +11,7 @@ use bitvec::macros::internal::funty::Integral;
 use common::cpu::CpuPermit;
 use common::types::PointOffsetType;
 use io::storage_version::StorageVersion;
+use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::{
@@ -49,17 +50,17 @@ pub struct SegmentBuilder {
 
     // The path, where fully created segment will be moved
     destination_path: PathBuf,
-    // Path to the temporary segment directory
-    temp_path: PathBuf,
+    // The temporary segment directory
+    temp_dir: TempDir,
     indexed_fields: HashMap<PayloadKeyType, PayloadFieldSchema>,
 
-    // Payload key to deframent data to
+    // Payload key to defragment data to
     defragment_keys: Vec<PayloadKeyType>,
 }
 
 impl SegmentBuilder {
     pub fn new(
-        segment_path: &Path,
+        segments_path: &Path,
         temp_dir: &Path,
         segment_config: &SegmentConfig,
     ) -> OperationResult<Self> {
@@ -67,9 +68,9 @@ impl SegmentBuilder {
         // so we can ignore the `stopped` flag
         let stopped = AtomicBool::new(false);
 
-        let temp_path = new_segment_path(temp_dir);
+        let temp_dir = create_temp_dir(temp_dir)?;
 
-        let database = open_segment_db(&temp_path, segment_config)?;
+        let database = open_segment_db(temp_dir.path(), segment_config)?;
 
         let id_tracker = if segment_config.is_appendable() {
             IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(database.clone())?)
@@ -77,12 +78,13 @@ impl SegmentBuilder {
             IdTrackerEnum::InMemoryIdTracker(InMemoryIdTracker::new())
         };
 
-        let payload_storage = create_payload_storage(database.clone(), segment_config)?;
+        let payload_storage =
+            create_payload_storage(database.clone(), segment_config, temp_dir.path())?;
 
         let mut vector_storages = HashMap::new();
 
         for (vector_name, vector_config) in &segment_config.vector_data {
-            let vector_storage_path = get_vector_storage_path(&temp_path, vector_name);
+            let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
             let vector_storage = open_vector_storage(
                 &database,
                 vector_config,
@@ -94,17 +96,21 @@ impl SegmentBuilder {
             vector_storages.insert(vector_name.to_owned(), vector_storage);
         }
 
-        #[allow(clippy::for_kv_map)]
-        for (vector_name, _sparse_vector_config) in &segment_config.sparse_vector_data {
-            // `_sparse_vector_config` should be used, once we are able to initialize storage with
-            // different datatypes
+        for (vector_name, sparse_vector_config) in &segment_config.sparse_vector_data {
+            let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
 
-            let vector_storage =
-                create_sparse_vector_storage(database.clone(), vector_name, &stopped)?;
+            let vector_storage = create_sparse_vector_storage(
+                database.clone(),
+                &vector_storage_path,
+                vector_name,
+                &sparse_vector_config.storage_type,
+                &stopped,
+            )?;
+
             vector_storages.insert(vector_name.to_owned(), vector_storage);
         }
 
-        let destination_path = segment_path.join(temp_path.file_name().unwrap());
+        let destination_path = new_segment_path(segments_path);
 
         Ok(SegmentBuilder {
             version: Default::default(), // default version is 0
@@ -114,7 +120,7 @@ impl SegmentBuilder {
             segment_config: segment_config.clone(),
 
             destination_path,
-            temp_path,
+            temp_dir,
             indexed_fields: Default::default(),
             defragment_keys: vec![],
         })
@@ -210,7 +216,7 @@ impl SegmentBuilder {
                 }
                 FieldIndex::GeoIndex(_) => {}
                 FieldIndex::FullTextIndex(_) => {}
-                FieldIndex::BinaryIndex(_) => {}
+                FieldIndex::BoolIndex(_) => {}
             }
         }
         ordering
@@ -235,23 +241,22 @@ impl SegmentBuilder {
         for (segment_index, segment) in segments.iter().enumerate() {
             for external_id in segment.iter_points() {
                 let version = segment.point_version(external_id).unwrap_or(0);
+                let internal_id = segment.get_internal_id(external_id).unwrap();
                 merged_points
                     .entry(external_id)
                     .and_modify(|entry| {
                         if entry.version < version {
                             entry.segment_index = segment_index;
                             entry.version = version;
+                            entry.internal_id = internal_id;
                         }
                     })
-                    .or_insert_with(|| {
-                        let internal_id = segment.get_internal_id(external_id).unwrap();
-                        PositionedPointMetadata {
-                            segment_index,
-                            internal_id,
-                            external_id,
-                            version,
-                            ordering: 0,
-                        }
+                    .or_insert_with(|| PositionedPointMetadata {
+                        segment_index,
+                        internal_id,
+                        external_id,
+                        version,
+                        ordering: 0,
                     });
             }
         }
@@ -331,7 +336,8 @@ impl SegmentBuilder {
 
                 let old_internal_id = point_data.internal_id;
 
-                let other_payload = payloads[point_data.segment_index].payload(old_internal_id)?;
+                let other_payload =
+                    payloads[point_data.segment_index].get_payload(old_internal_id)?;
 
                 match self.id_tracker.internal_id(point_data.external_id) {
                     Some(existing_internal_id) => {
@@ -352,7 +358,7 @@ impl SegmentBuilder {
                                 .set_link(point_data.external_id, new_internal_id)?;
                             self.id_tracker
                                 .set_internal_version(new_internal_id, point_data.version)?;
-                            self.payload_storage.drop(existing_internal_id)?;
+                            self.payload_storage.clear(existing_internal_id)?;
 
                             existing_internal_id
                         } else {
@@ -374,8 +380,7 @@ impl SegmentBuilder {
 
                 // Propagate payload to new segment
                 if !other_payload.is_empty() {
-                    self.payload_storage
-                        .assign(new_internal_id, &other_payload)?;
+                    self.payload_storage.set(new_internal_id, &other_payload)?;
                 }
             }
         }
@@ -389,8 +394,12 @@ impl SegmentBuilder {
         Ok(true)
     }
 
-    pub fn build(self, permit: CpuPermit, stopped: &AtomicBool) -> Result<Segment, OperationError> {
-        let (temp_path, destination_path) = {
+    pub fn build(
+        self,
+        mut permit: CpuPermit,
+        stopped: &AtomicBool,
+    ) -> Result<Segment, OperationError> {
+        let (temp_dir, destination_path) = {
             let SegmentBuilder {
                 version,
                 id_tracker,
@@ -398,7 +407,7 @@ impl SegmentBuilder {
                 mut vector_storages,
                 segment_config,
                 destination_path,
-                temp_path,
+                temp_dir,
                 indexed_fields,
                 defragment_keys: _,
             } = self;
@@ -412,7 +421,7 @@ impl SegmentBuilder {
                 IdTrackerEnum::InMemoryIdTracker(in_memory_id_tracker) => {
                     let (versions, mappings) = in_memory_id_tracker.into_internal();
                     let immutable_id_tracker =
-                        ImmutableIdTracker::new(&temp_path, &versions, mappings)?;
+                        ImmutableIdTracker::new(temp_dir.path(), &versions, mappings)?;
                     IdTrackerEnum::ImmutableIdTracker(immutable_id_tracker)
                 }
                 IdTrackerEnum::MutableIdTracker(_) => id_tracker,
@@ -425,11 +434,50 @@ impl SegmentBuilder {
             id_tracker.versions_flusher()()?;
             let id_tracker_arc = Arc::new(AtomicRefCell::new(id_tracker));
 
-            let payload_index_path = get_payload_index_path(temp_path.as_path());
+            let mut quantized_vectors = Self::update_quantization(
+                &segment_config,
+                &vector_storages,
+                temp_dir.path(),
+                &permit,
+                stopped,
+            )?;
+
+            let mut vector_storages_arc = HashMap::new();
+
+            for vector_name in segment_config.vector_data.keys() {
+                let Some(vector_storage) = vector_storages.remove(vector_name) else {
+                    return Err(OperationError::service_error(format!(
+                        "Vector storage for vector name {vector_name} not found on segment build"
+                    )));
+                };
+
+                vector_storage.flusher()()?;
+
+                let vector_storage_arc = Arc::new(AtomicRefCell::new(vector_storage));
+
+                vector_storages_arc.insert(vector_name.to_owned(), vector_storage_arc);
+            }
+
+            for vector_name in segment_config.sparse_vector_data.keys() {
+                let Some(vector_storage) = vector_storages.remove(vector_name) else {
+                    return Err(OperationError::service_error(format!(
+                        "Vector storage for vector name {vector_name} not found on sparse segment build"
+                    )));
+                };
+
+                vector_storage.flusher()()?;
+
+                let vector_storage_arc = Arc::new(AtomicRefCell::new(vector_storage));
+
+                vector_storages_arc.insert(vector_name.to_owned(), vector_storage_arc);
+            }
+
+            let payload_index_path = get_payload_index_path(temp_dir.path());
 
             let mut payload_index = StructPayloadIndex::open(
                 payload_storage_arc,
                 id_tracker_arc.clone(),
+                vector_storages_arc.clone(),
                 &payload_index_path,
                 appendable_flag,
             )?;
@@ -442,30 +490,31 @@ impl SegmentBuilder {
             payload_index.flusher()()?;
             let payload_index_arc = Arc::new(AtomicRefCell::new(payload_index));
 
+            // Try to lock GPU device.
+            #[cfg(feature = "gpu")]
+            let gpu_devices_manager = crate::index::hnsw_index::gpu::GPU_DEVICES_MANAGER.read();
+            #[cfg(feature = "gpu")]
+            let gpu_device = gpu_devices_manager
+                .as_ref()
+                .map(|devices_manager| devices_manager.lock_device(stopped))
+                .transpose()?
+                .flatten();
+            #[cfg(not(feature = "gpu"))]
+            let gpu_device = None;
+
+            // If GPU is enabled, release all CPU cores except one.
+            if let Some(_gpu_device) = &gpu_device {
+                if permit.num_cpus > 1 {
+                    permit.release_count(permit.num_cpus - 1);
+                }
+            }
+
             // Arc permit to share it with each vector store
             let permit = Arc::new(permit);
 
-            let mut quantized_vectors = Self::update_quantization(
-                &segment_config,
-                &vector_storages,
-                temp_path.as_path(),
-                &permit,
-                stopped,
-            )?;
-
             for (vector_name, vector_config) in &segment_config.vector_data {
-                let vector_index_path = get_vector_index_path(&temp_path, vector_name);
-
-                let Some(vector_storage) = vector_storages.remove(vector_name) else {
-                    return Err(OperationError::service_error(format!(
-                        "Vector storage for vector name {vector_name} not found on segment build"
-                    )));
-                };
-
-                vector_storage.flusher()()?;
-
-                let vector_storage_arc = Arc::new(AtomicRefCell::new(vector_storage));
-
+                let vector_storage_arc = vector_storages_arc.remove(vector_name).unwrap();
+                let vector_index_path = get_vector_index_path(temp_dir.path(), vector_name);
                 let quantized_vectors = quantized_vectors.remove(vector_name);
                 let quantized_vectors_arc = Arc::new(AtomicRefCell::new(quantized_vectors));
 
@@ -477,22 +526,15 @@ impl SegmentBuilder {
                     payload_index_arc.clone(),
                     quantized_vectors_arc,
                     Some(permit.clone()),
+                    gpu_device.as_ref(),
                     stopped,
                 )?;
             }
 
             for (vector_name, sparse_vector_config) in &segment_config.sparse_vector_data {
-                let vector_index_path = get_vector_index_path(&temp_path, vector_name);
+                let vector_index_path = get_vector_index_path(temp_dir.path(), vector_name);
 
-                let Some(vector_storage) = vector_storages.remove(vector_name) else {
-                    return Err(OperationError::service_error(format!(
-                        "Vector storage for vector name {vector_name} not found on sparse segment build"
-                    )));
-                };
-
-                vector_storage.flusher()()?;
-
-                let vector_storage_arc = Arc::new(AtomicRefCell::new(vector_storage));
+                let vector_storage_arc = vector_storages_arc.remove(vector_name).unwrap();
 
                 create_sparse_vector_index(SparseVectorIndexOpenArgs {
                     config: sparse_vector_config.index,
@@ -519,17 +561,17 @@ impl SegmentBuilder {
                     version: Some(version),
                     config: segment_config,
                 },
-                &temp_path,
+                temp_dir.path(),
             )?;
 
             // After version is saved, segment can be loaded on restart
-            SegmentVersion::save(&temp_path)?;
+            SegmentVersion::save(temp_dir.path())?;
             // All temp data is evicted from RAM
-            (temp_path, destination_path)
+            (temp_dir, destination_path)
         };
 
         // Move fully constructed segment into collection directory and load back to RAM
-        std::fs::rename(temp_path, &destination_path)
+        std::fs::rename(temp_dir.into_path(), &destination_path)
             .describe("Moving segment data after optimization")?;
 
         let loaded_segment = load_segment(&destination_path, stopped)?.ok_or_else(|| {
@@ -609,6 +651,19 @@ where
             *hash = hash.wrapping_add(id as u64);
         }
     }
+}
+
+fn create_temp_dir(parent_path: &Path) -> Result<TempDir, OperationError> {
+    // Ensure parent path exists
+    std::fs::create_dir_all(parent_path)
+        .and_then(|_| TempDir::with_prefix_in("segment_builder_", parent_path))
+        .map_err(|err| {
+            OperationError::service_error(format!(
+                "Could not create temp directory in `{}`: {}",
+                parent_path.display(),
+                err
+            ))
+        })
 }
 
 /// Internal point ID and metadata of a point.

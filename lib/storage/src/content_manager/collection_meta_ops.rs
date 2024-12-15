@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use collection::config::{CollectionConfig, ShardingMethod};
+use collection::config::{CollectionConfigInternal, ShardingMethod};
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
-    StrictModeConfig, WalConfigDiff,
+    WalConfigDiff,
 };
 use collection::operations::types::{
     SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
@@ -14,8 +14,11 @@ use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
 use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
 use collection::shards::{replica_set, CollectionId};
 use schemars::JsonSchema;
-use segment::types::{PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey};
+use segment::types::{
+    PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use validator::Validate;
 
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
@@ -144,6 +147,8 @@ pub struct CreateCollection {
     /// It will be read from the disk every time it is requested.
     /// This setting saves RAM by (slightly) increasing the response time.
     /// Note: those payload values that are involved in filtering and are indexed - remain in RAM.
+    ///
+    /// Default: true
     #[serde(default)]
     pub on_disk_payload: Option<bool>,
     /// Custom params for HNSW index. If none - values from service configuration file are used.
@@ -168,8 +173,10 @@ pub struct CreateCollection {
     pub sparse_vectors: Option<BTreeMap<String, SparseVectorParams>>,
     /// Strict-mode config.
     #[validate(nested)]
-    #[schemars(skip)]
     pub strict_mode_config: Option<StrictModeConfig>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub uuid: Option<Uuid>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -227,6 +234,8 @@ pub struct UpdateCollection {
     /// Map of sparse vector data parameters to update for each sparse vector.
     #[validate(nested)]
     pub sparse_vectors: Option<SparseVectorsConfig>,
+    #[validate(nested)]
+    pub strict_mode_config: Option<StrictModeConfig>,
 }
 
 /// Operation for updating parameters of the existing collection
@@ -249,6 +258,7 @@ impl UpdateCollectionOperation {
                 optimizers_config: None,
                 quantization_config: None,
                 sparse_vectors: None,
+                strict_mode_config: None,
             },
             shard_replica_changes: None,
         }
@@ -387,8 +397,8 @@ pub enum CollectionMetaOperations {
 
 /// Use config of the existing collection to generate a create collection operation
 /// for the new collection
-impl From<CollectionConfig> for CreateCollection {
-    fn from(value: CollectionConfig) -> Self {
+impl From<CollectionConfigInternal> for CreateCollection {
+    fn from(value: CollectionConfigInternal) -> Self {
         Self {
             vectors: value.params.vectors,
             shard_number: Some(value.params.shard_number.get()),
@@ -403,6 +413,7 @@ impl From<CollectionConfig> for CreateCollection {
             quantization_config: value.quantization_config,
             sparse_vectors: value.params.sparse_vectors,
             strict_mode_config: value.strict_mode_config,
+            uuid: value.uuid,
         }
     }
 }

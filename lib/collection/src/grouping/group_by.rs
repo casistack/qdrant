@@ -3,6 +3,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use api::rest::{BaseGroupRequest, SearchGroupsRequestInternal, SearchRequestInternal};
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use fnv::FnvBuildHasher;
 use indexmap::IndexSet;
 use segment::json_path::JsonPath;
@@ -146,13 +147,14 @@ impl QueryGroupRequest {
         read_consistency: Option<ReadConsistency>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let mut request = self.source.clone();
 
         // Adjust limit to fetch enough points to fill groups
         request.limit = self.groups * self.group_size;
         request.prefetches.iter_mut().for_each(|prefetch| {
-            increase_limit_for_group(prefetch, self.groups);
+            increase_limit_for_group(prefetch, self.group_size);
         });
 
         let key_not_empty = Filter::new_must_not(Condition::IsEmpty(self.group_by.clone().into()));
@@ -165,7 +167,13 @@ impl QueryGroupRequest {
         request.with_vector = WithVector::Bool(false);
 
         collection
-            .query(request, read_consistency, shard_selection, timeout)
+            .query(
+                request,
+                read_consistency,
+                shard_selection,
+                timeout,
+                hw_measurement_acc,
+            )
             .await
     }
 }
@@ -305,6 +313,7 @@ pub async fn group_by(
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> CollectionResult<Vec<PointGroup>> {
     let start = std::time::Instant::now();
     let collection_params = collection.collection_config.read().await.params.clone();
@@ -329,7 +338,7 @@ pub async fn group_by(
         // Construct filter to exclude already found groups
         let full_groups = aggregator.keys_of_filled_groups();
         if !full_groups.is_empty() {
-            let except_any = except_on(&request.group_by, full_groups);
+            let except_any = except_on(&request.group_by, &full_groups);
             if !except_any.is_empty() {
                 let exclude_groups = Filter {
                     must: Some(except_any),
@@ -365,6 +374,7 @@ pub async fn group_by(
                 read_consistency,
                 shard_selection.clone(),
                 timeout,
+                hw_measurement_acc,
             )
             .await?;
 
@@ -392,7 +402,7 @@ pub async fn group_by(
 
             // Construct filter to only include unsatisfied groups
             let unsatisfied_groups = aggregator.keys_of_unfilled_best_groups();
-            let match_any = match_on(&request.group_by, unsatisfied_groups);
+            let match_any = match_on(&request.group_by, &unsatisfied_groups);
             if !match_any.is_empty() {
                 let include_groups = Filter {
                     must: Some(match_any),
@@ -427,6 +437,7 @@ pub async fn group_by(
                     read_consistency,
                     shard_selection.clone(),
                     timeout,
+                    hw_measurement_acc,
                 )
                 .await?;
 
@@ -482,7 +493,7 @@ pub async fn group_by(
 }
 
 /// Uses the set of values to create Match::Except's, if possible
-fn except_on(path: &JsonPath, values: Vec<Value>) -> Vec<Condition> {
+fn except_on(path: &JsonPath, values: &[Value]) -> Vec<Condition> {
     values_to_any_variants(values)
         .into_iter()
         .map(|v| {
@@ -495,7 +506,7 @@ fn except_on(path: &JsonPath, values: Vec<Value>) -> Vec<Condition> {
 }
 
 /// Uses the set of values to create Match::Any's, if possible
-fn match_on(path: &JsonPath, values: Vec<Value>) -> Vec<Condition> {
+fn match_on(path: &JsonPath, values: &[Value]) -> Vec<Condition> {
     values_to_any_variants(values)
         .into_iter()
         .map(|any_variants| {
@@ -507,7 +518,7 @@ fn match_on(path: &JsonPath, values: Vec<Value>) -> Vec<Condition> {
         .collect()
 }
 
-fn values_to_any_variants(values: Vec<Value>) -> Vec<AnyVariants> {
+fn values_to_any_variants(values: &[Value]) -> Vec<AnyVariants> {
     let mut any_variants = Vec::new();
 
     // gather int values
@@ -530,10 +541,10 @@ fn values_to_any_variants(values: Vec<Value>) -> Vec<AnyVariants> {
     any_variants
 }
 
-fn increase_limit_for_group(shard_prefetch: &mut ShardPrefetch, groups: usize) {
-    shard_prefetch.limit *= groups;
+fn increase_limit_for_group(shard_prefetch: &mut ShardPrefetch, group_size: usize) {
+    shard_prefetch.limit *= group_size;
     shard_prefetch.prefetches.iter_mut().for_each(|prefetch| {
-        increase_limit_for_group(prefetch, groups);
+        increase_limit_for_group(prefetch, group_size);
     });
 }
 

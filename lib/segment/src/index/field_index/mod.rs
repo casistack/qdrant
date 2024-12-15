@@ -4,6 +4,7 @@ use common::types::PointOffsetType;
 
 use crate::types::{FieldCondition, IsEmptyCondition, IsNullCondition};
 
+pub mod bool_index;
 pub(super) mod facet_index;
 mod field_index_base;
 pub mod full_text_index;
@@ -17,7 +18,6 @@ mod mmap_point_to_values;
 pub mod numeric_index;
 mod stat_tools;
 
-pub mod binary_index;
 #[cfg(test)]
 mod tests;
 mod utils;
@@ -25,12 +25,12 @@ mod utils;
 pub use field_index_base::*;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum PrimaryCondition {
-    Condition(FieldCondition),
+    Condition(Box<FieldCondition>),
     IsEmpty(IsEmptyCondition),
     IsNull(IsNullCondition),
     Ids(HashSet<PointOffsetType>),
+    HasVector(String),
 }
 
 #[derive(Debug, Clone)]

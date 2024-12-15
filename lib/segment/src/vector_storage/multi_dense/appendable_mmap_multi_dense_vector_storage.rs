@@ -15,6 +15,7 @@ use crate::data_types::vectors::{TypedMultiDenseVectorRef, VectorElementType, Ve
 use crate::types::{Distance, MultiVectorConfig, VectorStorageDatatype};
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
 use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::dense::dynamic_mmap_flags::DynamicMmapFlags;
 use crate::vector_storage::in_ram_persisted_vectors::InRamPersistedVectors;
 use crate::vector_storage::{MultiVectorStorage, VectorStorage, VectorStorageEnum};
@@ -54,7 +55,7 @@ impl<
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> OperationResult<bool> {
-        if self.vectors.len() <= key as usize {
+        if !deleted && self.vectors.len() <= key as usize {
             return Ok(false);
         }
 
@@ -103,6 +104,18 @@ impl<
             })
     }
 
+    fn get_batch_multi<'a>(
+        &'a self,
+        keys: &[PointOffsetType],
+        vectors: &mut [TypedMultiDenseVectorRef<'a, T>],
+    ) {
+        debug_assert_eq!(keys.len(), vectors.len());
+        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
+        for (idx, key) in keys.iter().enumerate() {
+            vectors[idx] = self.get_multi(*key);
+        }
+    }
+
     fn iterate_inner_vectors(&self) -> impl Iterator<Item = &[T]> + Clone + Send {
         (0..self.total_vector_count()).flat_map(|key| {
             let mmap_offset = self
@@ -146,7 +159,7 @@ impl<
         self.offsets.len()
     }
 
-    fn available_size_in_bytes(&self) -> usize {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
         if self.total_vector_count() > 0 {
             let total_size = self.vectors.len() * self.vector_dim() * std::mem::size_of::<T>();
             (total_size as u128 * self.available_vector_count() as u128
@@ -337,8 +350,20 @@ pub fn open_appendable_memmap_multi_vector_storage_impl<T: PrimitiveVectorElemen
     let offsets_path = path.join(OFFSETS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
-    let vectors = ChunkedMmapVectors::open(&vectors_path, dim, Some(false), AdviceSetting::Global)?;
-    let offsets = ChunkedMmapVectors::open(&offsets_path, 1, Some(false), AdviceSetting::Global)?;
+    let vectors = ChunkedMmapVectors::open(
+        &vectors_path,
+        dim,
+        Some(false),
+        AdviceSetting::Global,
+        Some(false),
+    )?;
+    let offsets = ChunkedMmapVectors::open(
+        &offsets_path,
+        1,
+        Some(false),
+        AdviceSetting::Global,
+        Some(false),
+    )?;
 
     let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
     let deleted_count = deleted.count_flags();

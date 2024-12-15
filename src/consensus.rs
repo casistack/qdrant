@@ -71,6 +71,7 @@ impl Consensus {
         telemetry_collector: Arc<parking_lot::Mutex<TonicTelemetryCollector>>,
         toc: Arc<TableOfContent>,
         runtime: Handle,
+        reinit: bool,
     ) -> anyhow::Result<JoinHandle<std::io::Result<()>>> {
         let tls_client_config = helpers::load_tls_client_config(&settings)?;
 
@@ -88,6 +89,7 @@ impl Consensus {
             tls_client_config,
             channel_service,
             runtime.clone(),
+            reinit,
         )?;
 
         let state_ref_clone = state_ref.clone();
@@ -104,7 +106,7 @@ impl Consensus {
                 }
 
                 if let Err(err) = consensus.start() {
-                    log::error!("Consensus stopped with error: {err}");
+                    log::error!("Consensus stopped with error: {err:#}");
                     state_ref_clone.on_consensus_thread_err(err);
                 } else {
                     log::info!("Consensus stopped");
@@ -179,7 +181,24 @@ impl Consensus {
         tls_config: Option<ClientTlsConfig>,
         channel_service: ChannelService,
         runtime: Handle,
+        reinit: bool,
     ) -> anyhow::Result<(Self, Sender<Message>)> {
+        // If we want to re-initialize consensus, we need to prevent other peers
+        // from re-playing consensus WAL operations, as they should already have them applied.
+        // Do ensure that we are forcing compacting WAL on the first re-initialized peer,
+        // which should trigger snapshot transferring instead of replaying WAL.
+        let force_compact_wal = reinit && bootstrap_peer.is_none();
+
+        // On the bootstrap-ed peers during reinit of the consensus
+        // we want to make sure only the bootstrap peer will hold the true state
+        // Therefore we clear the WAL on the bootstrap peer to force it to request a snapshot
+        let clear_wal = reinit && bootstrap_peer.is_some();
+
+        if clear_wal {
+            log::debug!("Clearing WAL on the bootstrap peer to force snapshot transfer");
+            state_ref.clear_wal()?;
+        }
+
         // raft will not return entries to the application smaller or equal to `applied`
         let last_applied = state_ref.last_applied_entry().unwrap_or_default();
         let raft_config = Config {
@@ -201,7 +220,7 @@ impl Consensus {
         // bounded channel for backpressure
         let (sender, receiver) = tokio::sync::mpsc::channel(config.max_message_queue_size);
         // State might be initialized but the node might be shutdown without actually syncing or committing anything.
-        if state_ref.is_new_deployment() {
+        if state_ref.is_new_deployment() || reinit {
             let leader_established_in_ms =
                 config.tick_period_ms * raft_config.max_election_tick() as u64;
             Self::init(
@@ -211,7 +230,7 @@ impl Consensus {
                 p2p_port,
                 &config,
                 tls_config.clone(),
-                runtime.clone(),
+                &runtime,
                 leader_established_in_ms,
             )
             .map_err(|err| anyhow!("Failed to initialize Consensus for new Raft state: {}", err))?;
@@ -244,6 +263,13 @@ impl Consensus {
         // They might have not been applied due to unplanned Qdrant shutdown
         let _stop_consensus = state_ref.apply_entries(&mut node)?;
 
+        if force_compact_wal {
+            // Making sure that the WAL will be compacted on start
+            state_ref.compact_wal(1)?;
+        } else {
+            state_ref.compact_wal(config.compact_wal_entries)?;
+        }
+
         let broker = RaftMessageBroker::new(
             runtime.clone(),
             bootstrap_peer,
@@ -261,6 +287,10 @@ impl Consensus {
             broker,
         };
 
+        if !state_ref.is_new_deployment() {
+            state_ref.recover_first_voter()?;
+        }
+
         Ok((consensus, sender))
     }
 
@@ -272,7 +302,7 @@ impl Consensus {
         p2p_port: u16,
         config: &ConsensusConfig,
         tls_config: Option<ClientTlsConfig>,
-        runtime: Handle,
+        runtime: &Handle,
         leader_established_in_ms: u64,
     ) -> anyhow::Result<()> {
         if let Some(bootstrap_peer) = bootstrap_peer {
@@ -442,14 +472,21 @@ impl Consensus {
         // Only first peer has itself as a voter in the initial conf state.
         // This needs to be propagated manually to other peers as it is not contained in any log entry.
         // So we skip the learner phase for the first peer.
-        state_ref.set_first_voter(all_peers.first_peer_id);
+        state_ref.set_first_voter(all_peers.first_peer_id)?;
         state_ref.set_conf_state(ConfState::from((vec![all_peers.first_peer_id], vec![])))?;
         Ok(())
     }
 
     pub fn start(&mut self) -> anyhow::Result<()> {
-        let tick_period = Duration::from_millis(self.config.tick_period_ms);
+        // If this is the only peer in the cluster, tick Raft node a few times to instantly
+        // self-elect itself as Raft leader
+        if self.node.store().peer_count() == 1 {
+            while !self.node.has_ready() {
+                self.node.tick();
+            }
+        }
 
+        let tick_period = Duration::from_millis(self.config.tick_period_ms);
         let mut previous_tick = Instant::now();
 
         loop {
@@ -489,6 +526,34 @@ impl Consensus {
     ) -> anyhow::Result<Option<usize>> {
         if previous_tick.elapsed() >= tick_period {
             return Ok(None);
+        }
+
+        match self.try_add_origin() {
+            // `try_add_origin` is not applicable:
+            // - either current peer is not an origin peer
+            // - or cluster is already established
+            Ok(false) => (),
+
+            // Successfully proposed origin peer to consensus, return to consensus loop to handle `on_ready`
+            Ok(true) => return Ok(Some(1)),
+
+            // Origin peer is not a leader yet, wait for the next tick and return to consensus loop
+            // to tick Raft node
+            Err(err @ TryAddOriginError::NotLeader) => {
+                log::debug!("{err}");
+
+                let next_tick = previous_tick + tick_period;
+                let duration_until_next_tick = next_tick.saturating_duration_since(Instant::now());
+                thread::sleep(duration_until_next_tick);
+
+                return Ok(None);
+            }
+
+            // Failed to propose origin peer ID to consensus (which should never happen!),
+            // log error and continue regular consensus loop
+            Err(err) => {
+                log::error!("{err}");
+            }
         }
 
         if self
@@ -639,7 +704,7 @@ impl Consensus {
         Ok(())
     }
 
-    fn try_sync_local_state(&mut self) -> anyhow::Result<()> {
+    fn try_sync_local_state(&self) -> anyhow::Result<()> {
         if !self.node.has_ready() {
             // No updates to process
             let store = self.node.store();
@@ -651,6 +716,65 @@ impl Consensus {
             }
         }
         Ok(())
+    }
+
+    /// Tries to propose "origin peer" (the very first peer, that starts new cluster) to consensus
+    fn try_add_origin(&mut self) -> Result<bool, TryAddOriginError> {
+        // We can determine origin peer from consensus state:
+        // - it should be the only peer in the cluster
+        // - and its commit index should be at 0 or 1
+        //
+        // When we add a new node to existing cluster, we have to bootstrap it from existing cluster
+        // node, and during bootstrap we explicitly add all current peers to consensus state. So,
+        // *all* peers added to the cluster after the origin will always have at least two peers.
+        //
+        // When origin peer starts new cluster, it self-elects itself as a leader and commits empty
+        // operation with index 1. It is impossible to commit anything to consensus before this
+        // operation is committed. And to add another (second/third/etc) peer to the cluster, we
+        // have to commit a conf-change operation. Which means that only origin peer can ever be at
+        // commit index 0 or 1.
+
+        // Check that we are the only peer in the cluster
+        if self.node.store().peer_count() > 1 {
+            return Ok(false);
+        }
+
+        let status = self.node.status();
+
+        // Check that we are at index 0 or 1
+        if status.hs.commit > 1 {
+            return Ok(false);
+        }
+
+        // If we reached this point, we are the origin peer, but it's impossible to propose anything
+        // to consensus, before leader is elected (`propose_conf_change` will return an error),
+        // so we have to wait for a few ticks for self-election
+        if status.ss.raft_state != StateRole::Leader {
+            return Err(TryAddOriginError::NotLeader);
+        }
+
+        // Propose origin peer to consensus
+        let mut change = ConfChangeV2::default();
+
+        change.set_changes(vec![raft_proto::new_conf_change_single(
+            status.id,
+            ConfChangeType::AddNode,
+        )]);
+
+        let peer_uri = self
+            .node
+            .store()
+            .persistent
+            .read()
+            .peer_address_by_id
+            .read()
+            .get(&status.id)
+            .ok_or_else(|| TryAddOriginError::UriNotFound)?
+            .to_string();
+
+        self.node.propose_conf_change(peer_uri.into(), change)?;
+
+        Ok(true)
     }
 
     /// Returns `true` if learner promotion was proposed, `false` otherwise.
@@ -717,17 +841,21 @@ impl Consensus {
         self.store().record_consensus_working();
         // Get the `Ready` with `RawNode::ready` interface.
         let ready = self.node.ready();
-        let (light_rd, role_change) = self.process_ready(ready)?;
-        if let Some(light_ready) = light_rd {
-            let result = self.process_light_ready(light_ready)?;
-            if let Some(role_change) = role_change {
-                self.process_role_change(role_change);
-            }
-            Ok(result)
-        } else {
+
+        let (Some(light_ready), role_change) = self.process_ready(ready)? else {
             // No light ready, so we need to stop consensus.
-            Ok(true)
+            return Ok(true);
+        };
+
+        let result = self.process_light_ready(light_ready)?;
+
+        if let Some(role_change) = role_change {
+            self.process_role_change(role_change);
         }
+
+        self.store().compact_wal(self.config.compact_wal_entries)?;
+
+        Ok(result)
     }
 
     fn process_role_change(&self, role_change: StateRole) {
@@ -798,8 +926,8 @@ impl Consensus {
         }
         // Should be done after Hard State is saved, so that `applied` index is never bigger than `commit`.
         let stop_consensus =
-            handle_committed_entries(ready.take_committed_entries(), &store, &mut self.node)
-                .map_err(|err| anyhow!("Failed to handle committed entries: {}", err))?;
+            handle_committed_entries(&ready.take_committed_entries(), &store, &mut self.node)
+                .context("Failed to handle committed entries")?;
         if stop_consensus {
             return Ok((None, None));
         }
@@ -827,8 +955,8 @@ impl Consensus {
         self.send_messages(light_rd.take_messages());
         // Apply all committed entries.
         let stop_consensus =
-            handle_committed_entries(light_rd.take_committed_entries(), &store, &mut self.node)
-                .map_err(|err| anyhow!("Failed to apply committed entries: {}", err))?;
+            handle_committed_entries(&light_rd.take_committed_entries(), &store, &mut self.node)
+                .context("Failed to apply committed entries")?;
         // Advance the apply index.
         self.node.advance_apply();
         Ok(stop_consensus)
@@ -857,11 +985,23 @@ enum TryRecvUpdateError {
     Closed,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum TryAddOriginError {
+    #[error("origin peer is not a leader")]
+    NotLeader,
+
+    #[error("origin peer URI not found")]
+    UriNotFound,
+
+    #[error("failed to propose origin peer URI to consensus: {0}")]
+    RaftError(#[from] raft::Error),
+}
+
 /// This function actually applies the committed entries to the state machine.
 /// Return `true` if consensus should be stopped.
 /// `false` otherwise.
 fn handle_committed_entries(
-    entries: Vec<Entry>,
+    entries: &[Entry],
     state: &ConsensusStateRef,
     raw_node: &mut RawNode<ConsensusStateRef>,
 ) -> anyhow::Result<bool> {
@@ -940,7 +1080,7 @@ impl RaftMessageBroker {
                 );
             };
 
-            match sender.send(message) {
+            match sender.send(message).map_err(|err| *err) {
                 Ok(()) => (),
 
                 Err(tokio::sync::mpsc::error::TrySendError::Full((_, message))) => {
@@ -996,14 +1136,15 @@ struct RaftMessageSenderHandle {
 }
 
 impl RaftMessageSenderHandle {
-    #[allow(clippy::result_large_err)]
-    pub fn send(&mut self, message: RaftMessage) -> RaftMessageSenderResult<()> {
+    fn send(&mut self, message: RaftMessage) -> RaftMessageSenderResult<()> {
         if !is_heartbeat(&message) {
-            self.messages.try_send((self.index, message))?;
+            self.messages
+                .try_send((self.index, message))
+                .map_err(Box::new)?;
         } else {
             self.heartbeat.send((self.index, message)).map_err(
-                |tokio::sync::watch::error::SendError(message)| {
-                    tokio::sync::mpsc::error::TrySendError::Closed(message)
+                |watch::error::SendError(message)| {
+                    Box::new(tokio::sync::mpsc::error::TrySendError::Closed(message))
                 },
             )?;
         }
@@ -1015,7 +1156,7 @@ impl RaftMessageSenderHandle {
 }
 
 type RaftMessageSenderResult<T, E = RaftMessageSenderError> = Result<T, E>;
-type RaftMessageSenderError = tokio::sync::mpsc::error::TrySendError<(usize, RaftMessage)>;
+type RaftMessageSenderError = Box<tokio::sync::mpsc::error::TrySendError<(usize, RaftMessage)>>;
 
 struct RaftMessageSender {
     messages: Receiver<(usize, RaftMessage)>,
@@ -1101,7 +1242,7 @@ impl RaftMessageSender {
         }
     }
 
-    async fn send(&mut self, message: &RaftMessage) {
+    async fn send(&self, message: &RaftMessage) {
         if let Err(err) = self.try_send(message).await {
             let peer_id = message.to;
 
@@ -1113,7 +1254,7 @@ impl RaftMessageSender {
         }
     }
 
-    async fn try_send(&mut self, message: &RaftMessage) -> anyhow::Result<()> {
+    async fn try_send(&self, message: &RaftMessage) -> anyhow::Result<()> {
         let peer_id = message.to;
 
         let uri = self.uri(peer_id).await?;
@@ -1175,7 +1316,7 @@ impl RaftMessageSender {
         Ok(())
     }
 
-    async fn uri(&mut self, peer_id: PeerId) -> anyhow::Result<Uri> {
+    async fn uri(&self, peer_id: PeerId) -> anyhow::Result<Uri> {
         let uri = self
             .consensus_state
             .peer_address_by_id()
@@ -1188,7 +1329,7 @@ impl RaftMessageSender {
         }
     }
 
-    async fn who_is(&mut self, peer_id: PeerId) -> anyhow::Result<Uri> {
+    async fn who_is(&self, peer_id: PeerId) -> anyhow::Result<Uri> {
         let bootstrap_uri = self
             .bootstrap_uri
             .clone()
@@ -1265,7 +1406,7 @@ mod tests {
         let handle = general_runtime.handle().clone();
         let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
         let persistent_state =
-            Persistent::load_or_init(&settings.storage.storage_path, true).unwrap();
+            Persistent::load_or_init(&settings.storage.storage_path, true, false).unwrap();
         let operation_sender = OperationSender::new(propose_sender);
         let toc = TableOfContent::new(
             &settings.storage,
@@ -1298,6 +1439,7 @@ mod tests {
             None,
             ChannelService::new(settings.service.http_port, None),
             handle.clone(),
+            false,
         )
         .unwrap();
 
@@ -1316,8 +1458,8 @@ mod tests {
         });
         // Wait for Raft to establish the leader
         is_leader_established.await_ready();
-        // Leader election produces a raft log entry
-        assert_eq!(consensus_state.hard_state().commit, 1);
+        // Leader election produces a raft log entry, and then origin peer adds itself to consensus
+        assert_eq!(consensus_state.hard_state().commit, 2);
         // Initially there are 0 collections
         assert_eq!(toc_arc.all_collections_sync().len(), 0);
 
@@ -1345,6 +1487,7 @@ mod tests {
                             quantization_config: None,
                             sharding_method: None,
                             strict_mode_config: None,
+                            uuid: None,
                         },
                     )),
                     Access::full("For test"),
@@ -1354,7 +1497,7 @@ mod tests {
             .unwrap();
 
         // Then
-        assert_eq!(consensus_state.hard_state().commit, 4); // Collection + 2 of shard activations
+        assert_eq!(consensus_state.hard_state().commit, 5); // first peer self-election + add first peer + create collection + activate shard x2
         assert_eq!(toc_arc.all_collections_sync(), vec!["test"]);
     }
 }

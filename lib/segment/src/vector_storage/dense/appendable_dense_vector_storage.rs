@@ -16,6 +16,7 @@ use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
 use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::dense::dynamic_mmap_flags::DynamicMmapFlags;
 use crate::vector_storage::in_ram_persisted_vectors::InRamPersistedVectors;
 use crate::vector_storage::{DenseVectorStorage, VectorStorage, VectorStorageEnum};
@@ -36,7 +37,7 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> AppendableMmapDenseV
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> OperationResult<bool> {
-        if self.vectors.len() <= key as usize {
+        if !deleted && self.vectors.len() <= key as usize {
             return Ok(false);
         }
 
@@ -65,6 +66,18 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> DenseVectorStorage<T
             .get(key as VectorOffsetType)
             .expect("mmap vector not found")
     }
+
+    fn get_dense_batch<'a>(&'a self, keys: &[PointOffsetType], vectors: &mut [&'a [T]]) {
+        debug_assert!(keys.len() == vectors.len());
+        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
+
+        let mut vector_offsets = [0; VECTOR_READ_BATCH_SIZE];
+        for (i, key) in keys.iter().enumerate() {
+            vector_offsets[i] = *key as VectorOffsetType;
+        }
+        self.vectors
+            .get_batch(&vector_offsets[..keys.len()], vectors);
+    }
 }
 
 impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
@@ -79,14 +92,14 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
     }
 
     fn is_on_disk(&self) -> bool {
-        true
+        self.vectors.is_on_disk()
     }
 
     fn total_vector_count(&self) -> usize {
         self.vectors.len()
     }
 
-    fn available_size_in_bytes(&self) -> usize {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
         self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
     }
 
@@ -206,8 +219,13 @@ pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
     let vectors_path = path.join(VECTORS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
-    let vectors =
-        ChunkedMmapVectors::<T>::open(&vectors_path, dim, Some(false), AdviceSetting::Global)?;
+    let vectors = ChunkedMmapVectors::<T>::open(
+        &vectors_path,
+        dim,
+        Some(false),
+        AdviceSetting::Global,
+        Some(false),
+    )?;
 
     let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
     let deleted_count = deleted.count_flags();

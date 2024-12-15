@@ -4,9 +4,10 @@ use std::path::Path;
 
 use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
-use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
-    PointInsertOperationsInternal, PointOperations, PointStruct, WriteOrdering,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+    WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
@@ -15,6 +16,7 @@ use collection::operations::types::{
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::recommendations::recommend_by;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{NamedVector, VectorStructInternal};
 use segment::types::{Distance, WithPayloadInterface, WithVector};
@@ -52,13 +54,14 @@ pub async fn multi_vec_collection_fixture(collection_path: &Path, shard_number: 
         ..CollectionParams::empty()
     };
 
-    let collection_config = CollectionConfig {
+    let collection_config = CollectionConfigInternal {
         params: collection_params,
         optimizer_config: TEST_OPTIMIZERS_CONFIG.clone(),
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
+        uuid: None,
     };
 
     let snapshot_path = collection_path.join("snapshots");
@@ -89,9 +92,9 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         vectors.insert(VEC_NAME1.to_string(), vec![i as f32, 0.0, 0.0, 0.0].into());
         vectors.insert(VEC_NAME2.to_string(), vec![0.0, i as f32, 0.0, 0.0].into());
 
-        points.push(PointStruct {
+        points.push(PointStructPersisted {
             id: i.into(),
-            vector: VectorStructInternal::from(vectors).into(),
+            vector: VectorStructPersisted::from(VectorStructInternal::from(vectors)),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
@@ -120,15 +123,18 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let result = collection
         .search(
             full_search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await
         .unwrap();
+    hw_acc.discard();
 
     for hit in result {
         match hit.vector.unwrap() {
@@ -154,14 +160,17 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let result = collection
         .search(
             failed_search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await;
+    hw_acc.discard();
 
     assert!(
         matches!(result, Err(CollectionError::BadInput { .. })),
@@ -183,15 +192,18 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let result = collection
         .search(
             full_search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await
         .unwrap();
+    hw_acc.discard();
 
     for hit in result {
         match hit.vector.unwrap() {
@@ -228,6 +240,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         }
     }
 
+    let hw_acc = HwMeasurementAcc::new();
     let recommend_result = recommend_by(
         RecommendRequestInternal {
             positive: vec![6.into()],
@@ -241,8 +254,10 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         None,
         ShardSelectorInternal::All,
         None,
+        &hw_acc,
     )
     .await;
+    hw_acc.discard();
 
     match recommend_result {
         Ok(_) => panic!("Error expected"),
@@ -253,6 +268,7 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         },
     }
 
+    let hw_acc = HwMeasurementAcc::new();
     let recommend_result = recommend_by(
         RecommendRequestInternal {
             positive: vec![6.into()],
@@ -267,9 +283,11 @@ async fn test_multi_vec_with_shards(shard_number: u32) {
         None,
         ShardSelectorInternal::All,
         None,
+        &hw_acc,
     )
     .await
     .unwrap();
+    hw_acc.discard();
 
     assert_eq!(recommend_result.len(), 10);
     for hit in recommend_result {

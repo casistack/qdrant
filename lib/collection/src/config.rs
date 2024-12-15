@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -13,14 +13,15 @@ use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, Spars
 use segment::types::{
     default_replication_factor_const, default_shard_number_const,
     default_write_consistency_factor_const, Distance, HnswConfig, Indexes, PayloadStorageType,
-    QuantizationConfig, SparseVectorDataConfig, VectorDataConfig, VectorStorageDatatype,
-    VectorStorageType,
+    QuantizationConfig, SparseVectorDataConfig, StrictModeConfig, VectorDataConfig,
+    VectorStorageDatatype, VectorStorageType,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use validator::Validate;
 use wal::WalOptions;
 
-use crate::operations::config_diff::{DiffConfig, QuantizationConfigDiff, StrictModeConfig};
+use crate::operations::config_diff::{DiffConfig, QuantizationConfigDiff};
 use crate::operations::types::{
     CollectionError, CollectionResult, SparseVectorParams, SparseVectorsConfig, VectorParams,
     VectorParamsDiff, VectorsConfig, VectorsConfigDiff,
@@ -100,8 +101,17 @@ pub struct CollectionParams {
     /// It will be read from the disk every time it is requested.
     /// This setting saves RAM by (slightly) increasing the response time.
     /// Note: those payload values that are involved in filtering and are indexed - remain in RAM.
+    ///
+    /// Default: true
     #[serde(default = "default_on_disk_payload")]
     pub on_disk_payload: bool,
+    /// Temporary setting to enable/disable the use of mmap for on-disk payload storage.
+    // TODO: remove this setting after integration is finished
+    #[serde(skip)]
+    pub on_disk_payload_uses_mmap: bool,
+    // TODO: remove this setting after integration is finished
+    #[serde(skip)]
+    pub on_disk_sparse_vectors_uses_mmap: bool,
     /// Configuration of the sparse vector storage
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
@@ -111,10 +121,63 @@ pub struct CollectionParams {
 impl CollectionParams {
     pub fn payload_storage_type(&self) -> PayloadStorageType {
         if self.on_disk_payload {
+            if self.on_disk_payload_uses_mmap {
+                return PayloadStorageType::Mmap;
+            }
             PayloadStorageType::OnDisk
         } else {
             PayloadStorageType::InMemory
         }
+    }
+
+    pub fn check_compatible(&self, other: &CollectionParams) -> CollectionResult<()> {
+        let CollectionParams {
+            vectors,
+            shard_number: _, // Maybe be updated by resharding, assume local shards needs to be dropped
+            sharding_method, // Not changeable
+            replication_factor: _, // May be changed
+            write_consistency_factor: _, // May be changed
+            read_fan_out_factor: _, // May be changed
+            on_disk_payload: _, // May be changed
+            on_disk_payload_uses_mmap: _, // Temporary
+            on_disk_sparse_vectors_uses_mmap: _, // Temporary
+            sparse_vectors,  // Parameters may be changes, but not the structure
+        } = other;
+
+        self.vectors.check_compatible(vectors)?;
+
+        let this_sparse_vectors: HashSet<_> = if let Some(sparse_vectors) = &self.sparse_vectors {
+            sparse_vectors.keys().collect()
+        } else {
+            HashSet::new()
+        };
+
+        let other_sparse_vectors: HashSet<_> = if let Some(sparse_vectors) = sparse_vectors {
+            sparse_vectors.keys().collect()
+        } else {
+            HashSet::new()
+        };
+
+        if this_sparse_vectors != other_sparse_vectors {
+            return Err(CollectionError::bad_input(format!(
+                "sparse vectors are incompatible: \
+                 origin sparse vectors: {this_sparse_vectors:?}, \
+                 while other sparse vectors: {other_sparse_vectors:?}",
+            )));
+        }
+
+        let this_sharding_method = self.sharding_method.unwrap_or_default();
+        let other_sharding_method = sharding_method.unwrap_or_default();
+
+        if this_sharding_method != other_sharding_method {
+            return Err(CollectionError::bad_input(format!(
+                "sharding method is incompatible: \
+                 origin sharding method: {this_sharding_method:?}, \
+                 while other sharding method: {other_sharding_method:?}",
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -128,6 +191,8 @@ impl Anonymize for CollectionParams {
             write_consistency_factor: self.write_consistency_factor,
             read_fan_out_factor: self.read_fan_out_factor,
             on_disk_payload: self.on_disk_payload,
+            on_disk_payload_uses_mmap: self.on_disk_payload_uses_mmap,
+            on_disk_sparse_vectors_uses_mmap: self.on_disk_sparse_vectors_uses_mmap,
             sparse_vectors: self.sparse_vectors.anonymize(),
         }
     }
@@ -145,12 +210,12 @@ pub fn default_write_consistency_factor() -> NonZeroU32 {
     NonZeroU32::new(default_write_consistency_factor_const()).unwrap()
 }
 
-const fn default_on_disk_payload() -> bool {
-    false
+pub const fn default_on_disk_payload() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
-pub struct CollectionConfig {
+pub struct CollectionConfigInternal {
     #[validate(nested)]
     pub params: CollectionParams,
     #[validate(nested)]
@@ -161,13 +226,17 @@ pub struct CollectionConfig {
     pub wal_config: WalConfig,
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
-    #[serde(default)]
-    #[schemars(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_mode_config: Option<StrictModeConfig>,
+    #[serde(default)]
+    pub uuid: Option<Uuid>,
 }
 
-impl CollectionConfig {
+impl CollectionConfigInternal {
+    pub fn to_bytes(&self) -> CollectionResult<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|err| CollectionError::service_error(err.to_string()))
+    }
+
     pub fn save(&self, path: &Path) -> CollectionResult<()> {
         let config_path = path.join(COLLECTION_CONFIG_FILE);
         let af = AtomicFile::new(&config_path, AllowOverwrite);
@@ -209,7 +278,57 @@ impl CollectionParams {
             write_consistency_factor: default_write_consistency_factor(),
             read_fan_out_factor: None,
             on_disk_payload: default_on_disk_payload(),
+            on_disk_payload_uses_mmap: false,
+            on_disk_sparse_vectors_uses_mmap: false,
             sparse_vectors: None,
+        }
+    }
+
+    fn missing_vector_error(&self, vector_name: &str) -> CollectionError {
+        let mut available_names = vec![];
+
+        match &self.vectors {
+            VectorsConfig::Single(_) => {
+                available_names.push(DEFAULT_VECTOR_NAME.to_string());
+            }
+            VectorsConfig::Multi(vectors) => {
+                for name in vectors.keys() {
+                    available_names.push(name.clone());
+                }
+            }
+        }
+
+        if let Some(sparse_vectors) = &self.sparse_vectors {
+            for name in sparse_vectors.keys() {
+                available_names.push(name.clone());
+            }
+        }
+
+        if available_names.is_empty() {
+            CollectionError::BadInput {
+                description: "Vectors are not configured in this collection".into(),
+            }
+        } else if available_names == vec![DEFAULT_VECTOR_NAME] {
+            return CollectionError::BadInput {
+                description: format!(
+                    "Vector with name {vector_name} is not configured in this collection"
+                ),
+            };
+        } else {
+            let available_names = available_names.join(", ");
+            if vector_name == DEFAULT_VECTOR_NAME {
+                return CollectionError::BadInput {
+                    description: format!(
+                        "Collection requires specified vector name in the request, available names: {available_names}"
+                    ),
+                };
+            }
+
+            CollectionError::BadInput {
+                description: format!(
+                    "Vector with name `{vector_name}` is not configured in this collection, available names: {available_names}"
+                ),
+            }
         }
     }
 
@@ -218,21 +337,11 @@ impl CollectionParams {
             Some(params) => Ok(params.distance),
             None => {
                 if let Some(sparse_vectors) = &self.sparse_vectors {
-                    sparse_vectors
-                        .get(vector_name)
-                        .ok_or_else(|| CollectionError::BadInput {
-                            description: format!(
-                                "Vector params for {vector_name} are not specified in config"
-                            ),
-                        })
-                        .map(|_params| Distance::Dot)
-                } else {
-                    Err(CollectionError::BadInput {
-                        description: format!(
-                            "Vector params for {vector_name} are not specified in config"
-                        ),
-                    })
+                    if let Some(_params) = sparse_vectors.get(vector_name) {
+                        return Ok(Distance::Dot);
+                    }
                 }
+                Err(self.missing_vector_error(vector_name))
             }
         }
     }
@@ -262,11 +371,15 @@ impl CollectionParams {
         self.sparse_vectors
             .as_mut()
             .ok_or_else(|| CollectionError::BadInput {
-                description: format!("Vector params for {vector_name} are not specified in config"),
+                description: format!(
+                    "Sparse vector `{vector_name}` is not specified in collection config"
+                ),
             })?
             .get_mut(vector_name)
             .ok_or_else(|| CollectionError::BadInput {
-                description: format!("Vector params for {vector_name} are not specified in config"),
+                description: format!(
+                    "Sparse vector `{vector_name}` is not specified in collection config"
+                ),
             })
     }
 
@@ -328,9 +441,9 @@ impl CollectionParams {
 
             if let Some(index) = index {
                 if let Some(existing_index) = &mut sparse_vector_params.index {
-                    existing_index.update_from_other(&index);
+                    existing_index.update_from_other(index);
                 } else {
-                    sparse_vector_params.index = Some(index);
+                    sparse_vector_params.index.replace(index);
                 }
             }
         }
@@ -359,7 +472,7 @@ impl CollectionParams {
                         storage_type: if params.on_disk.unwrap_or_default() {
                             VectorStorageType::ChunkedMmap
                         } else {
-                            VectorStorageType::Memory
+                            VectorStorageType::InRamChunkedMmap
                         },
                         multivector_config: params.multivector_config,
                         datatype: params.datatype.map(VectorStorageDatatype::from),
@@ -393,6 +506,9 @@ impl CollectionParams {
                                     .and_then(|index| index.datatype)
                                     .map(VectorStorageDatatype::from),
                             },
+                            // Not configurable by user (at this point). When we switch the default, it will be switched here too.
+                            storage_type: params
+                                .storage_type(self.on_disk_sparse_vectors_uses_mmap),
                         },
                     ))
                 })

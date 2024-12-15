@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::types::PointOffsetType;
@@ -52,30 +53,14 @@ impl OnDiskPayloadStorage {
             .transpose()
             .map_err(OperationError::from)
     }
-
-    pub fn iter<F>(&self, mut callback: F) -> OperationResult<()>
-    where
-        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
-    {
-        for (key, val) in self.db_wrapper.lock_db().iter()? {
-            let do_continue = callback(
-                serde_cbor::from_slice(&key)?,
-                &serde_cbor::from_slice(&val)?,
-            )?;
-            if !do_continue {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
 }
 
 impl PayloadStorage for OnDiskPayloadStorage {
-    fn assign_all(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
+    fn overwrite(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
         self.update_storage(point_id, payload)
     }
 
-    fn assign(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
+    fn set(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
         let stored_payload = self.read_payload(point_id)?;
         match stored_payload {
             Some(mut point_payload) => {
@@ -87,7 +72,7 @@ impl PayloadStorage for OnDiskPayloadStorage {
         Ok(())
     }
 
-    fn assign_by_key(
+    fn set_by_key(
         &mut self,
         point_id: PointOffsetType,
         payload: &Payload,
@@ -96,18 +81,18 @@ impl PayloadStorage for OnDiskPayloadStorage {
         let stored_payload = self.read_payload(point_id)?;
         match stored_payload {
             Some(mut point_payload) => {
-                point_payload.merge_by_key(payload, key)?;
+                point_payload.merge_by_key(payload, key);
                 self.update_storage(point_id, &point_payload)
             }
             None => {
                 let mut dest_payload = Payload::default();
-                dest_payload.merge_by_key(payload, key)?;
+                dest_payload.merge_by_key(payload, key);
                 self.update_storage(point_id, &dest_payload)
             }
         }
     }
 
-    fn payload(&self, point_id: PointOffsetType) -> OperationResult<Payload> {
+    fn get(&self, point_id: PointOffsetType) -> OperationResult<Payload> {
         let payload = self.read_payload(point_id)?;
         match payload {
             Some(payload) => Ok(payload),
@@ -130,7 +115,7 @@ impl PayloadStorage for OnDiskPayloadStorage {
         }
     }
 
-    fn drop(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
+    fn clear(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
         let payload = self.read_payload(point_id)?;
         self.remove_from_storage(point_id)?;
         Ok(payload)
@@ -142,5 +127,29 @@ impl PayloadStorage for OnDiskPayloadStorage {
 
     fn flusher(&self) -> Flusher {
         self.db_wrapper.flusher()
+    }
+
+    fn iter<F>(&self, mut callback: F) -> OperationResult<()>
+    where
+        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
+    {
+        for (key, val) in self.db_wrapper.lock_db().iter()? {
+            let do_continue = callback(
+                serde_cbor::from_slice(&key)?,
+                &serde_cbor::from_slice(&val)?,
+            )?;
+            if !do_continue {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+
+    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        self.db_wrapper.get_storage_size_bytes()
     }
 }

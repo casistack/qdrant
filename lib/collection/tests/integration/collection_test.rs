@@ -3,7 +3,10 @@ use std::fs::File;
 
 use api::rest::{OrderByInterface, SearchRequestInternal};
 use collection::operations::payload_ops::{PayloadOps, SetPayloadOp};
-use collection::operations::point_ops::{Batch, PointOperations, PointStruct, WriteOrdering};
+use collection::operations::point_ops::{
+    BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
+    PointStructPersisted, VectorStructPersisted, WriteOrdering,
+};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     CountRequestInternal, PointRequestInternal, RecommendRequestInternal, ScrollRequestInternal,
@@ -12,9 +15,10 @@ use collection::operations::types::{
 use collection::operations::CollectionUpdateOperations;
 use collection::recommendations::recommend_by;
 use collection::shards::replica_set::{ReplicaSetState, ReplicaState};
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::data_types::order_by::{Direction, OrderBy};
-use segment::data_types::vectors::{BatchVectorStructInternal, VectorStructInternal};
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     Condition, ExtendedPointId, FieldCondition, Filter, HasIdCondition, Payload,
     PayloadFieldSchema, PayloadSchemaType, PointIdType, WithPayloadInterface,
@@ -35,24 +39,24 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
 
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
-    let insert_points = CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids: vec![0, 1, 2, 3, 4]
-                .into_iter()
-                .map(|x| x.into())
-                .collect_vec(),
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![1.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 1.0, 0.0],
-                vec![1.0, 1.0, 1.0, 1.0],
-                vec![1.0, 1.0, 0.0, 1.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-            ])
-            .into(),
-            payloads: None,
-        }
-        .into(),
-    );
+    let batch = BatchPersisted {
+        ids: vec![0, 1, 2, 3, 4]
+            .into_iter()
+            .map(|x| x.into())
+            .collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![1.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 1.0, 0.0],
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![1.0, 1.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+        ]),
+        payloads: None,
+    };
+
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
 
     let insert_result = collection
         .update_from_client_simple(insert_points, true, WriteOrdering::default())
@@ -76,14 +80,17 @@ async fn test_collection_updater_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let search_res = collection
         .search(
             search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await;
+    hw_acc.discard();
 
     match search_res {
         Ok(res) => {
@@ -106,21 +113,21 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
 
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
-    let insert_points = CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids: vec![0.into(), 1.into()],
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![1.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 1.0, 0.0],
-            ])
-            .into(),
-            payloads: serde_json::from_str(
-                r#"[{ "k": { "type": "keyword", "value": "v1" } }, { "k": "v2" , "v": "v3"}]"#,
-            )
-            .unwrap(),
-        }
-        .into(),
-    );
+    let batch = BatchPersisted {
+        ids: vec![0.into(), 1.into()],
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![1.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 1.0, 0.0],
+        ]),
+        payloads: serde_json::from_str(
+            r#"[{ "k": { "type": "keyword", "value": "v1" } }, { "k": "v2" , "v": "v3"}]"#,
+        )
+        .unwrap(),
+    };
+
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
 
     let insert_result = collection
         .update_from_client_simple(insert_points, true, WriteOrdering::default())
@@ -144,14 +151,17 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let search_res = collection
         .search(
             search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await;
+    hw_acc.discard();
 
     match search_res {
         Ok(res) => {
@@ -177,11 +187,19 @@ async fn test_collection_search_with_payload_and_vector_with_shards(shard_number
         exact: true,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let count_res = collection
-        .count(count_request, None, &ShardSelectorInternal::All, None)
+        .count(
+            count_request,
+            None,
+            &ShardSelectorInternal::All,
+            None,
+            &hw_acc,
+        )
         .await
         .unwrap();
     assert_eq!(count_res.count, 1);
+    hw_acc.discard();
 }
 
 // FIXME: does not work
@@ -196,23 +214,24 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
 
     {
         let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
+
+        let batch = BatchPersisted {
+            ids: vec![0, 1, 2, 3, 4]
+                .into_iter()
+                .map(|x| x.into())
+                .collect_vec(),
+            vectors: BatchVectorStructPersisted::Single(vec![
+                vec![1.0, 0.0, 1.0, 1.0],
+                vec![1.0, 0.0, 1.0, 0.0],
+                vec![1.0, 1.0, 1.0, 1.0],
+                vec![1.0, 1.0, 0.0, 1.0],
+                vec![1.0, 0.0, 0.0, 0.0],
+            ]),
+            payloads: None,
+        };
+
         let insert_points = CollectionUpdateOperations::PointOperation(
-            Batch {
-                ids: vec![0, 1, 2, 3, 4]
-                    .into_iter()
-                    .map(|x| x.into())
-                    .collect_vec(),
-                vectors: BatchVectorStructInternal::from(vec![
-                    vec![1.0, 0.0, 1.0, 1.0],
-                    vec![1.0, 0.0, 1.0, 0.0],
-                    vec![1.0, 1.0, 1.0, 1.0],
-                    vec![1.0, 1.0, 0.0, 1.0],
-                    vec![1.0, 0.0, 0.0, 0.0],
-                ])
-                .into(),
-                payloads: None,
-            }
-            .into(),
+            PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
         );
 
         collection
@@ -267,18 +286,18 @@ async fn test_collection_loading_with_shards(shard_number: u32) {
 
 #[test]
 fn test_deserialization() {
-    let insert_points = CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids: vec![0.into(), 1.into()],
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![1.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 1.0, 0.0],
-            ])
-            .into(),
-            payloads: None,
-        }
-        .into(),
-    );
+    let batch = BatchPersisted {
+        ids: vec![0.into(), 1.into()],
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![1.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 1.0, 0.0],
+        ]),
+        payloads: None,
+    };
+
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
     let json_str = serde_json::to_string_pretty(&insert_points).unwrap();
 
     let _read_obj: CollectionUpdateOperations = serde_json::from_str(&json_str).unwrap();
@@ -290,21 +309,22 @@ fn test_deserialization() {
 
 #[test]
 fn test_deserialization2() {
-    let insert_points = CollectionUpdateOperations::PointOperation(
-        vec![
-            PointStruct {
-                id: 0.into(),
-                vector: VectorStructInternal::from(vec![1.0, 0.0, 1.0, 1.0]).into(),
-                payload: None,
-            },
-            PointStruct {
-                id: 1.into(),
-                vector: VectorStructInternal::from(vec![1.0, 0.0, 1.0, 0.0]).into(),
-                payload: None,
-            },
-        ]
-        .into(),
-    );
+    let points = vec![
+        PointStructPersisted {
+            id: 0.into(),
+            vector: VectorStructPersisted::from(vec![1.0, 0.0, 1.0, 1.0]),
+            payload: None,
+        },
+        PointStructPersisted {
+            id: 1.into(),
+            vector: VectorStructPersisted::from(vec![1.0, 0.0, 1.0, 0.0]),
+            payload: None,
+        },
+    ];
+
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(points),
+    ));
 
     let json_str = serde_json::to_string_pretty(&insert_points).unwrap();
 
@@ -326,29 +346,30 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
     let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
-    let insert_points = CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
-                .into_iter()
-                .map(|x| x.into())
-                .collect_vec(),
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![0.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 0.0, 1.0],
-                vec![0.0, 0.0, 0.0, 1.0],
-            ])
-            .into(),
-            payloads: None,
-        }
-        .into(),
-    );
+    let batch = BatchPersisted {
+        ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
+            .into_iter()
+            .map(|x| x.into())
+            .collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ]),
+        payloads: None,
+    };
 
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
+
+    let hw_acc = HwMeasurementAcc::new();
     collection
         .update_from_client_simple(insert_points, true, WriteOrdering::default())
         .await
@@ -365,11 +386,13 @@ async fn test_recommendation_api_with_shards(shard_number: u32) {
         None,
         ShardSelectorInternal::All,
         None,
+        &hw_acc,
     )
     .await
     .unwrap();
     assert!(!result.is_empty());
     let top1 = &result[0];
+    hw_acc.discard();
 
     assert!(top1.id == 5.into() || top1.id == 6.into());
 }
@@ -384,27 +407,27 @@ async fn test_read_api_with_shards(shard_number: u32) {
     let collection_dir = Builder::new().prefix("collection").tempdir().unwrap();
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
+    let batch = BatchPersisted {
+        ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
+            .into_iter()
+            .map(|x| x.into())
+            .collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ]),
+        payloads: None,
+    };
+
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-        Batch {
-            ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
-                .into_iter()
-                .map(|x| x.into())
-                .collect_vec(),
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![0.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 0.0, 1.0],
-                vec![0.0, 0.0, 0.0, 1.0],
-            ])
-            .into(),
-            payloads: None,
-        }
-        .into(),
+        PointInsertOperationsInternal::from(batch),
     ));
 
     collection
@@ -475,32 +498,32 @@ async fn test_ordered_scroll_api_with_shards(shard_number: u32) {
         get_payload(1.0),
     ];
 
+    let batch = BatchPersisted {
+        ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            .into_iter()
+            .map(|x| x.into())
+            .collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 1.0, 1.0, 1.0],
+            vec![1.0, 1.0, 1.0, 1.0],
+        ]),
+        payloads: Some(payloads),
+    };
+
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-        Batch {
-            ids: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-                .into_iter()
-                .map(|x| x.into())
-                .collect_vec(),
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![0.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-                vec![0.0, 0.0, 0.0, 1.0],
-                vec![0.0, 0.0, 0.0, 1.0],
-                vec![0.0, 1.0, 1.0, 1.0],
-                vec![0.0, 1.0, 1.0, 1.0],
-                vec![0.0, 1.0, 1.0, 1.0],
-                vec![0.0, 1.0, 1.0, 1.0],
-                vec![1.0, 1.0, 1.0, 1.0],
-            ])
-            .into(),
-            payloads: Some(payloads),
-        }
-        .into(),
+        PointInsertOperationsInternal::from(batch),
     ));
 
     collection
@@ -730,24 +753,24 @@ async fn test_collection_delete_points_by_filter_with_shards(shard_number: u32) 
 
     let collection = simple_collection_fixture(collection_dir.path(), shard_number).await;
 
-    let insert_points = CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids: vec![0, 1, 2, 3, 4]
-                .into_iter()
-                .map(|x| x.into())
-                .collect_vec(),
-            vectors: BatchVectorStructInternal::from(vec![
-                vec![1.0, 0.0, 1.0, 1.0],
-                vec![1.0, 0.0, 1.0, 0.0],
-                vec![1.0, 1.0, 1.0, 1.0],
-                vec![1.0, 1.0, 0.0, 1.0],
-                vec![1.0, 0.0, 0.0, 0.0],
-            ])
-            .into(),
-            payloads: None,
-        }
-        .into(),
-    );
+    let batch = BatchPersisted {
+        ids: vec![0, 1, 2, 3, 4]
+            .into_iter()
+            .map(|x| x.into())
+            .collect_vec(),
+        vectors: BatchVectorStructPersisted::Single(vec![
+            vec![1.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 1.0, 0.0],
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![1.0, 1.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+        ]),
+        payloads: None,
+    };
+
+    let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::from(batch),
+    ));
 
     let insert_result = collection
         .update_from_client_simple(insert_points, true, WriteOrdering::default())

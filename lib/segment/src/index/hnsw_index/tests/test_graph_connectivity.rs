@@ -83,9 +83,10 @@ fn test_graph_connectivity() {
             .vector_storage
             .clone(),
         quantized_vectors: Default::default(),
-        payload_index: payload_index_ptr.clone(),
+        payload_index: payload_index_ptr,
         hnsw_config,
         permit: Some(permit),
+        gpu_device: None,
         stopped: &stopped,
     })
     .unwrap();
@@ -96,9 +97,9 @@ fn test_graph_connectivity() {
         let links = hnsw_index
             .graph()
             .links
-            .links(point_id as PointOffsetType, 0);
+            .links_vec(point_id as PointOffsetType, 0);
         for link in links {
-            reverse_links[*link as usize].push(point_id);
+            reverse_links[link as usize].push(point_id);
         }
     }
 

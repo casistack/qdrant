@@ -8,7 +8,7 @@ use collection::shards::collection_shard_distribution::CollectionShardDistributi
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::transfer::ShardTransfer;
 use collection::shards::{transfer, CollectionId};
-use uuid::Uuid;
+use tempfile::Builder;
 
 use super::TableOfContent;
 use crate::content_manager::collection_meta_ops::*;
@@ -126,6 +126,7 @@ impl TableOfContent {
             optimizers_config,
             quantization_config,
             sparse_vectors,
+            strict_mode_config: strict_mode,
         } = operation.update_collection;
         let collection = self
             .get_collection_unchecked(&operation.collection_name)
@@ -161,6 +162,9 @@ impl TableOfContent {
         if let Some(changes) = replica_changes {
             collection.handle_replica_changes(changes).await?;
         }
+        if let Some(strict_mode) = strict_mode {
+            collection.update_strict_mode_config(strict_mode).await?;
+        }
 
         // Recreate optimizers
         if recreate_optimizers {
@@ -195,13 +199,21 @@ impl TableOfContent {
             drop(removed);
 
             // Move collection to ".deleted" folder to prevent accidental reuse
-            let uuid = Uuid::new_v4().to_string();
+            // the original collection path will be moved atomically within this
+            // directory.
             let removed_collections_path =
                 Path::new(&self.storage_config.storage_path).join(".deleted");
             tokio::fs::create_dir_all(&removed_collections_path).await?;
-            let deleted_path = removed_collections_path
-                .join(collection_name)
-                .with_extension(uuid);
+
+            let deleted_path = Builder::new()
+                // Limit the file name to be on a lower side to avoid running into too-long
+                // file names.
+                // Even if the chosen randomness factor poses chances of collision, the library
+                // prevents creation of duplicate files within the chosen directory.
+                .rand_bytes(8)
+                .prefix("")
+                .tempdir_in(removed_collections_path)?;
+
             tokio::fs::rename(path, &deleted_path).await?;
 
             // Solve all issues related to this collection
@@ -216,7 +228,7 @@ impl TableOfContent {
                 if let Err(error) = tokio::fs::remove_dir_all(&deleted_path).await {
                     log::error!(
                         "Can't delete collection {} from disk. Error: {}",
-                        deleted_path.display(),
+                        deleted_path.as_ref().display(),
                         error
                     );
                 }
@@ -255,12 +267,8 @@ impl TableOfContent {
                             alias_name,
                         },
                 }) => {
-                    collection_lock
-                        .validate_collection_exists(&collection_name)
-                        .await?;
-                    collection_lock
-                        .validate_collection_not_exists(&alias_name)
-                        .await?;
+                    collection_lock.validate_collection_exists(&collection_name)?;
+                    collection_lock.validate_collection_not_exists(&alias_name)?;
 
                     alias_lock.insert(alias_name, collection_name)?;
                 }
@@ -297,7 +305,7 @@ impl TableOfContent {
 
         match operation {
             ReshardingOperation::Start(key) => {
-                let consensus = match self.shard_transfer_dispatcher.lock().as_ref() {
+                let consensus = match self.toc_dispatcher.lock().as_ref() {
                     Some(consensus) => Box::new(consensus.clone()),
                     None => {
                         return Err(StorageError::service_error(
@@ -336,11 +344,11 @@ impl TableOfContent {
             }
 
             ReshardingOperation::CommitRead(key) => {
-                collection.commit_read_hashring(key).await?;
+                collection.commit_read_hashring(&key).await?;
             }
 
             ReshardingOperation::CommitWrite(key) => {
-                collection.commit_write_hashring(key).await?;
+                collection.commit_write_hashring(&key).await?;
             }
 
             ReshardingOperation::Finish(key) => {
@@ -395,7 +403,7 @@ impl TableOfContent {
         };
         let key = resharding_state.key();
 
-        let consensus = match self.shard_transfer_dispatcher.lock().as_ref() {
+        let consensus = match self.toc_dispatcher.lock().as_ref() {
             Some(consensus) => Box::new(consensus.clone()),
             None => {
                 return Err(StorageError::service_error(
@@ -512,7 +520,7 @@ impl TableOfContent {
                     }
                 };
 
-                let shard_consensus = match self.shard_transfer_dispatcher.lock().as_ref() {
+                let shard_consensus = match self.toc_dispatcher.lock().as_ref() {
                     Some(consensus) => Box::new(consensus.clone()),
                     None => {
                         return Err(StorageError::service_error(
@@ -586,6 +594,7 @@ impl TableOfContent {
                     &transfer.key(),
                     &collection.state().await.transfers,
                 )?;
+
                 collection.finish_shard_transfer(transfer, None).await?;
             }
             ShardTransferOperations::RecoveryToPartial(transfer)

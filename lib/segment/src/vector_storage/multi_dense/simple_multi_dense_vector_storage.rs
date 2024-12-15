@@ -20,7 +20,7 @@ use crate::types::{Distance, MultiVectorConfig, VectorStorageDatatype};
 use crate::vector_storage::bitvec::bitvec_set_deleted;
 use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
-use crate::vector_storage::common::{StoredRecord, CHUNK_SIZE};
+use crate::vector_storage::common::{StoredRecord, CHUNK_SIZE, VECTOR_READ_BATCH_SIZE};
 use crate::vector_storage::{MultiVectorStorage, VectorStorage, VectorStorageEnum};
 
 type StoredMultiDenseVector<T> = StoredRecord<TypedMultiDenseVector<T>>;
@@ -184,7 +184,7 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> bool {
-        if key as usize >= self.vectors.len() {
+        if !deleted && key as usize >= self.vectors.len() {
             return false;
         }
         let was_deleted = bitvec_set_deleted(&mut self.deleted, key, deleted);
@@ -199,7 +199,7 @@ impl<T: PrimitiveVectorElement> SimpleMultiDenseVectorStorage<T> {
     }
 
     fn update_stored(
-        &mut self,
+        &self,
         key: PointOffsetType,
         deleted: bool,
         vector: Option<TypedMultiDenseVectorRef<T>>,
@@ -300,6 +300,19 @@ impl<T: PrimitiveVectorElement> MultiVectorStorage<T> for SimpleMultiDenseVector
         })
     }
 
+    fn get_batch_multi<'a>(
+        &'a self,
+        keys: &[PointOffsetType],
+        vectors: &mut [TypedMultiDenseVectorRef<'a, T>],
+    ) {
+        debug_assert_eq!(keys.len(), vectors.len());
+        debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
+
+        for (i, key) in keys.iter().enumerate() {
+            vectors[i] = self.get_multi(*key);
+        }
+    }
+
     fn iterate_inner_vectors(&self) -> impl Iterator<Item = &[T]> + Clone + Send {
         (0..self.total_vector_count()).flat_map(|key| {
             let metadata = &self.vectors_metadata[key];
@@ -329,7 +342,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleMultiDenseVectorStorage<
         self.vectors_metadata.len()
     }
 
-    fn available_size_in_bytes(&self) -> usize {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
         if self.total_vector_count() > 0 {
             let total_size = self.vectors.len() * self.vector_dim() * std::mem::size_of::<T>();
             (total_size as u128 * self.available_vector_count() as u128

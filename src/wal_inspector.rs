@@ -30,7 +30,10 @@ fn print_consensus_wal(wal_path: &Path) {
     println!("First entry: {first_index:?}");
     let last_index = wal.last_entry().unwrap();
     println!("Last entry: {last_index:?}");
-    println!("Offset of first entry: {:?}", wal.index_offset().unwrap());
+    println!(
+        "Offset of first entry: {:?}",
+        wal.index_offset().unwrap().wal_to_raft_offset
+    );
     let entries = wal
         .entries(
             first_index.map(|f| f.index).unwrap_or(1),
@@ -63,13 +66,12 @@ fn print_collection_wal(wal_path: &Path) {
         Ok(wal) => {
             // print all entries
             let mut count = 0;
-            for (idx, op) in wal.read_all(false) {
+            for (idx, op) in wal.read_all(true) {
                 println!("==========================");
-                println!("Entry: {idx}");
-                println!("Operation: {:?}", op.operation);
-                if let Some(clock_tag) = op.clock_tag {
-                    println!("Clock: {clock_tag:?}");
-                }
+                println!(
+                    "Entry: {idx} Operation: {:?} Clock: {:?}",
+                    op.operation, op.clock_tag
+                );
                 count += 1;
             }
             println!("==========================");

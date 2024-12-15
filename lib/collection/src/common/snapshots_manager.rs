@@ -1,13 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use actix_web::HttpRequest;
+use common::tempfile_ext::MaybeTempPath;
 use object_store::aws::AmazonS3Builder;
 use serde::Deserialize;
 use tempfile::TempPath;
 use tokio::io::AsyncWriteExt;
 
-use super::snapshot_stream::{SnapShotStreamCloudStrage, SnapShotStreamLocalFS, SnapshotStream};
+use super::snapshot_stream::{SnapShotStreamLocalFS, SnapshotStream};
 use crate::common::file_utils::move_file;
 use crate::common::sha_256::hash_file;
 use crate::operations::snapshot_ops::{
@@ -15,8 +14,6 @@ use crate::operations::snapshot_ops::{
 };
 use crate::operations::snapshot_storage_ops::{self};
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::shard::ShardId;
-use crate::shards::shard_holder::LockedShardHolder;
 
 #[derive(Clone, Deserialize, Debug, Default)]
 pub struct SnapShotsConfig {
@@ -56,8 +53,8 @@ pub enum SnapshotStorageManager {
 }
 
 impl SnapshotStorageManager {
-    pub fn new(snapshots_config: SnapShotsConfig) -> CollectionResult<Self> {
-        match snapshots_config.clone().snapshots_storage {
+    pub fn new(snapshots_config: &SnapShotsConfig) -> CollectionResult<Self> {
+        match snapshots_config.snapshots_storage {
             SnapshotsStorageConfig::Local => {
                 Ok(SnapshotStorageManager::LocalFS(SnapshotStorageLocalFS))
             }
@@ -102,6 +99,7 @@ impl SnapshotStorageManager {
             }
         }
     }
+
     pub async fn list_snapshots(
         &self,
         directory: &Path,
@@ -115,11 +113,18 @@ impl SnapshotStorageManager {
             }
         }
     }
+
+    /// Store file in the snapshot storage.
+    /// On success, the `source_path` is deleted.
     pub async fn store_file(
         &self,
         source_path: &Path,
         target_path: &Path,
     ) -> CollectionResult<SnapshotDescription> {
+        debug_assert_ne!(
+            source_path, target_path,
+            "Source and target paths must be different"
+        );
         match self {
             SnapshotStorageManager::LocalFS(storage_impl) => {
                 storage_impl.store_file(source_path, target_path).await
@@ -145,83 +150,60 @@ impl SnapshotStorageManager {
         }
     }
 
-    pub async fn get_snapshot_path(
+    pub fn get_snapshot_path(
         &self,
         snapshots_path: &Path,
         snapshot_name: &str,
     ) -> CollectionResult<PathBuf> {
         match self {
-            SnapshotStorageManager::LocalFS(storage_impl) => {
-                storage_impl
-                    .get_snapshot_path(snapshots_path, snapshot_name)
-                    .await
+            SnapshotStorageManager::LocalFS(_storage_impl) => {
+                SnapshotStorageLocalFS::get_snapshot_path(snapshots_path, snapshot_name)
             }
-            SnapshotStorageManager::S3(storage_impl) => {
-                storage_impl
-                    .get_snapshot_path(snapshots_path, snapshot_name)
-                    .await
-            }
+            SnapshotStorageManager::S3(_storage_impl) => Ok(
+                SnapshotStorageCloud::get_snapshot_path(snapshots_path, snapshot_name),
+            ),
         }
     }
 
-    pub async fn get_full_snapshot_path(
+    pub fn get_full_snapshot_path(
         &self,
         snapshots_path: &str,
         snapshot_name: &str,
     ) -> CollectionResult<PathBuf> {
         match self {
-            SnapshotStorageManager::LocalFS(storage_impl) => {
-                storage_impl
-                    .get_full_snapshot_path(snapshots_path, snapshot_name)
-                    .await
+            SnapshotStorageManager::LocalFS(_storage_impl) => {
+                SnapshotStorageLocalFS::get_full_snapshot_path(snapshots_path, snapshot_name)
             }
-            SnapshotStorageManager::S3(storage_impl) => {
-                storage_impl
-                    .get_full_snapshot_path(snapshots_path, snapshot_name)
-                    .await
-            }
+            SnapshotStorageManager::S3(_storage_impl) => Ok(
+                SnapshotStorageCloud::get_full_snapshot_path(snapshots_path, snapshot_name),
+            ),
         }
     }
 
-    pub async fn get_shard_snapshot_path(
+    pub async fn get_snapshot_file(
         &self,
-        shards_holder: Arc<LockedShardHolder>,
-        shard_id: ShardId,
-        snapshots_path: &Path,
-        snapshot_file_name: impl AsRef<Path>,
-    ) -> CollectionResult<PathBuf> {
+        snapshot_path: &Path,
+        temp_dir: &Path,
+    ) -> CollectionResult<MaybeTempPath> {
         match self {
-            SnapshotStorageManager::LocalFS(storage_impl) => {
-                storage_impl
-                    .get_shard_snapshot_path(
-                        shards_holder,
-                        shard_id,
-                        snapshots_path,
-                        snapshot_file_name,
-                    )
-                    .await
+            SnapshotStorageManager::LocalFS(_storage_impl) => {
+                SnapshotStorageLocalFS::get_snapshot_file(snapshot_path, temp_dir)
             }
             SnapshotStorageManager::S3(storage_impl) => {
                 storage_impl
-                    .get_shard_snapshot_path(
-                        shards_holder,
-                        shard_id,
-                        snapshots_path,
-                        snapshot_file_name,
-                    )
+                    .get_snapshot_file(snapshot_path, temp_dir)
                     .await
             }
         }
     }
 
     pub async fn get_snapshot_stream(
-        self,
-        req: HttpRequest,
+        &self,
         snapshot_path: &Path,
     ) -> CollectionResult<SnapshotStream> {
         match self {
-            SnapshotStorageManager::LocalFS(storage_impl) => {
-                storage_impl.get_snapshot_stream(req, snapshot_path).await
+            SnapshotStorageManager::LocalFS(_storage_impl) => {
+                Ok(SnapshotStorageLocalFS::get_snapshot_stream(snapshot_path))
             }
             SnapshotStorageManager::S3(storage_impl) => {
                 storage_impl.get_snapshot_stream(snapshot_path).await
@@ -238,7 +220,12 @@ impl SnapshotStorageLocalFS {
             tokio::fs::remove_file(checksum_path),
         );
 
-        delete_snapshot?;
+        delete_snapshot.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                CollectionError::not_found(format!("Snapshot {snapshot_path:?}"))
+            }
+            _ => e.into(),
+        })?;
 
         // We might not have a checksum file for the snapshot, ignore deletion errors in that case
         if let Err(err) = delete_checksum {
@@ -249,13 +236,17 @@ impl SnapshotStorageLocalFS {
     }
 
     async fn list_snapshots(&self, directory: &Path) -> CollectionResult<Vec<SnapshotDescription>> {
-        let mut entries = tokio::fs::read_dir(directory).await?;
+        let mut entries = match tokio::fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
         let mut snapshots = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
-            if !path.is_dir() && path.extension().map_or(false, |ext| ext == "snapshot") {
+            if !path.is_dir() && path.extension().is_some_and(|ext| ext == "snapshot") {
                 snapshots.push(get_snapshot_description(&path).await?);
             }
         }
@@ -277,18 +268,14 @@ impl SnapshotStorageLocalFS {
         // 5. Move the temporary file to the target file. (move is atomic, copy is not)
 
         if let Some(target_dir) = target_path.parent() {
-            if !target_dir.exists() {
-                std::fs::create_dir_all(target_dir)?;
-            }
+            std::fs::create_dir_all(target_dir)?;
         }
 
         // Move snapshot to permanent location.
         // We can't move right away, because snapshot folder can be on another mounting point.
         // We can't copy to the target location directly, because copy is not atomic.
         // So we copy to the final location with a temporary name and then rename atomically.
-        let target_path_tmp_move = target_path.with_extension("tmp");
-        // Ensure that the temporary file is deleted on error
-        let _temp_path = TempPath::from_path(&target_path_tmp_move);
+        let target_path_tmp = TempPath::from_path(target_path.with_extension("tmp"));
 
         // compute and store the file's checksum before the final snapshot file is saved
         // to avoid making snapshot available without checksum
@@ -298,10 +285,8 @@ impl SnapshotStorageLocalFS {
         let mut file = tokio::fs::File::create(checksum_path.as_path()).await?;
         file.write_all(checksum.as_bytes()).await?;
 
-        if target_path != source_path {
-            move_file(&source_path, &target_path_tmp_move).await?;
-            tokio::fs::rename(&target_path_tmp_move, &target_path).await?;
-        }
+        move_file(&source_path, &target_path_tmp).await?;
+        target_path_tmp.persist(target_path).map_err(|e| e.error)?;
 
         checksum_file.keep()?;
         get_snapshot_description(target_path).await
@@ -327,8 +312,7 @@ impl SnapshotStorageLocalFS {
     /// Get absolute file path for a full snapshot by name
     ///
     /// This enforces the file to be inside the snapshots directory
-    async fn get_full_snapshot_path(
-        &self,
+    fn get_full_snapshot_path(
         snapshots_path: &str,
         snapshot_name: &str,
     ) -> CollectionResult<PathBuf> {
@@ -359,11 +343,7 @@ impl SnapshotStorageLocalFS {
     /// Get absolute file path for a collection snapshot by name
     ///
     /// This enforces the file to be inside the snapshots directory
-    async fn get_snapshot_path(
-        &self,
-        snapshots_path: &Path,
-        snapshot_name: &str,
-    ) -> CollectionResult<PathBuf> {
+    fn get_snapshot_path(snapshots_path: &Path, snapshot_name: &str) -> CollectionResult<PathBuf> {
         let absolute_snapshot_dir = snapshots_path.canonicalize().map_err(|_| {
             CollectionError::not_found(format!("Snapshot directory: {}", snapshots_path.display()))
         })?;
@@ -388,29 +368,22 @@ impl SnapshotStorageLocalFS {
         Ok(absolute_snapshot_path)
     }
 
-    async fn get_shard_snapshot_path(
-        &self,
-        shards_holder: Arc<LockedShardHolder>,
-        shard_id: ShardId,
-        snapshots_path: &Path,
-        snapshot_file_name: impl AsRef<Path>,
-    ) -> CollectionResult<PathBuf> {
-        shards_holder
-            .read()
-            .await
-            .get_shard_snapshot_path(snapshots_path, shard_id, snapshot_file_name)
-            .await
+    fn get_snapshot_file(
+        snapshot_path: &Path,
+        _temp_dir: &Path,
+    ) -> CollectionResult<MaybeTempPath> {
+        if !snapshot_path.exists() {
+            return Err(CollectionError::not_found(format!(
+                "Snapshot {snapshot_path:?}"
+            )));
+        }
+        Ok(MaybeTempPath::Persistent(snapshot_path.to_path_buf()))
     }
 
-    async fn get_snapshot_stream(
-        &self,
-        req: HttpRequest,
-        snapshot_path: &Path,
-    ) -> CollectionResult<SnapshotStream> {
-        Ok(SnapshotStream::LocalFS(SnapShotStreamLocalFS {
-            req,
+    fn get_snapshot_stream(snapshot_path: &Path) -> SnapshotStream {
+        SnapshotStream::LocalFS(SnapShotStreamLocalFS {
             snapshot_path: snapshot_path.to_path_buf(),
-        }))
+        })
     }
 }
 
@@ -429,6 +402,7 @@ impl SnapshotStorageCloud {
         target_path: &Path,
     ) -> CollectionResult<SnapshotDescription> {
         snapshot_storage_ops::multipart_upload(&self.client, source_path, target_path).await?;
+        tokio::fs::remove_file(source_path).await?;
         snapshot_storage_ops::get_snapshot_description(&self.client, target_path).await
     }
 
@@ -449,36 +423,34 @@ impl SnapshotStorageCloud {
         Ok(())
     }
 
-    async fn get_snapshot_path(
-        &self,
-        snapshots_path: &Path,
-        snapshot_name: &str,
-    ) -> CollectionResult<PathBuf> {
+    fn get_snapshot_path(snapshots_path: &Path, snapshot_name: &str) -> PathBuf {
         let absolute_snapshot_dir = snapshots_path;
-        let absolute_snapshot_path = absolute_snapshot_dir.join(snapshot_name);
-        Ok(absolute_snapshot_path)
+        absolute_snapshot_dir.join(snapshot_name)
     }
 
-    async fn get_full_snapshot_path(
-        &self,
-        snapshots_path: &str,
-        snapshot_name: &str,
-    ) -> CollectionResult<PathBuf> {
+    fn get_full_snapshot_path(snapshots_path: &str, snapshot_name: &str) -> PathBuf {
         let absolute_snapshot_dir = PathBuf::from(snapshots_path);
-        let absolute_snapshot_path = absolute_snapshot_dir.join(snapshot_name);
-        Ok(absolute_snapshot_path)
+        absolute_snapshot_dir.join(snapshot_name)
     }
 
-    async fn get_shard_snapshot_path(
+    async fn get_snapshot_file(
         &self,
-        _shards_holder: Arc<LockedShardHolder>,
-        shard_id: u32,
-        snapshots_path: &Path,
-        snapshot_file_name: impl AsRef<Path>,
-    ) -> CollectionResult<PathBuf> {
-        Ok(snapshots_path
-            .join(format!("shards/{shard_id}"))
-            .join(snapshot_file_name))
+        snapshot_path: &Path,
+        temp_dir: &Path,
+    ) -> CollectionResult<MaybeTempPath> {
+        let temp_path = tempfile::Builder::new()
+            .prefix(
+                snapshot_path
+                    .file_stem()
+                    .ok_or_else(|| CollectionError::bad_request("Invalid snapshot path"))?,
+            )
+            .suffix(".snapshot")
+            .tempfile_in(temp_dir)?
+            .into_temp_path();
+
+        snapshot_storage_ops::download_snapshot(&self.client, snapshot_path, &temp_path).await?;
+
+        Ok(MaybeTempPath::Temporary(temp_path))
     }
 
     pub async fn get_snapshot_stream(
@@ -492,8 +464,6 @@ impl SnapshotStorageCloud {
             }
             _ => CollectionError::service_error(format!("Failed to get {snapshot_path}: {e}")),
         })?;
-        Ok(SnapshotStream::CloudStorage(SnapShotStreamCloudStrage {
-            streamer: Box::pin(download.into_stream()),
-        }))
+        Ok(SnapshotStream::new_stream(download.into_stream(), None))
     }
 }

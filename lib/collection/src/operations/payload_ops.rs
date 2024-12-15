@@ -30,7 +30,7 @@ pub struct SetPayload {
 ///
 /// Unlike `SetPayload` it does not contain `shard_key` field
 /// as individual shard does not need to know about shard key
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SetPayloadOp {
     pub payload: Payload,
     /// Assigns payload to each point in this list
@@ -98,7 +98,7 @@ pub struct DeletePayload {
 ///
 /// Unlike `DeletePayload` it does not contain `shard_key` field
 /// as individual shard does not need to know about shard key
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct DeletePayloadOp {
     /// List of payload keys to remove from payload
     pub keys: Vec<PayloadKeyType>,
@@ -160,17 +160,37 @@ impl PayloadOps {
             PayloadOps::OverwritePayload(_) => true,
         }
     }
+
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
+        match self {
+            Self::SetPayload(op) => op.points.clone(),
+            Self::DeletePayload(op) => op.points.clone(),
+            Self::ClearPayload { points } => Some(points.clone()),
+            Self::ClearPayloadByFilter(_) => None,
+            Self::OverwritePayload(op) => op.points.clone(),
+        }
+    }
+
+    pub fn retain_point_ids<F>(&mut self, filter: F)
+    where
+        F: Fn(&PointIdType) -> bool,
+    {
+        match self {
+            Self::SetPayload(op) => retain_opt(op.points.as_mut(), filter),
+            Self::DeletePayload(op) => retain_opt(op.points.as_mut(), filter),
+            Self::ClearPayload { points } => points.retain(filter),
+            Self::ClearPayloadByFilter(_) => (),
+            Self::OverwritePayload(op) => retain_opt(op.points.as_mut(), filter),
+        }
+    }
 }
 
-impl Validate for PayloadOps {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            PayloadOps::SetPayload(operation) => operation.validate(),
-            PayloadOps::DeletePayload(operation) => operation.validate(),
-            PayloadOps::ClearPayload { .. } => Ok(()),
-            PayloadOps::ClearPayloadByFilter(_) => Ok(()),
-            PayloadOps::OverwritePayload(operation) => operation.validate(),
-        }
+fn retain_opt<T, F>(vec: Option<&mut Vec<T>>, filter: F)
+where
+    F: Fn(&T) -> bool,
+{
+    if let Some(vec) = vec {
+        vec.retain(filter);
     }
 }
 

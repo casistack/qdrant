@@ -7,7 +7,7 @@ use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
-use super::{IdRefIter, MapIndex, MapIndexKey};
+use super::{IdIter, IdRefIter, MapIndex, MapIndexKey};
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
@@ -103,17 +103,19 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
                 OperationError::service_error("Index load error: UTF8 error while DB parsing")
             })?;
             let (value, idx) = MapIndex::<N>::decode_db_record(record)?;
+
             if self.point_to_values.len() <= idx as usize {
                 self.point_to_values.resize_with(idx as usize + 1, Vec::new)
             }
-            if self.point_to_values[idx as usize].is_empty() {
+            let point_values = &mut self.point_to_values[idx as usize];
+
+            if point_values.is_empty() {
                 self.indexed_points += 1;
             }
             self.values_count += 1;
 
-            let entry = self.map.entry(value);
-            self.point_to_values[idx as usize].push(entry.key().clone());
-            entry.or_default().insert(idx);
+            point_values.push(value.clone());
+            self.map.entry(value).or_default().insert(idx);
         }
         Ok(true)
     }
@@ -158,13 +160,10 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
         self.map.iter().map(|(k, v)| (k.borrow(), v.len()))
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdRefIter<'_>)> + '_ {
-        self.map.iter().map(|(k, v)| {
-            (
-                k.borrow(),
-                Box::new(v.iter()) as Box<dyn Iterator<Item = &PointOffsetType>>,
-            )
-        })
+    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter<'_>)> + '_ {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.borrow(), Box::new(v.iter().copied()) as IdIter))
     }
 
     pub fn get_iterator(&self, value: &N) -> IdRefIter<'_> {

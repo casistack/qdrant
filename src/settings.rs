@@ -10,6 +10,7 @@ use storage::types::StorageConfig;
 use validator::Validate;
 
 use crate::common::debugger::DebuggerConfig;
+use crate::common::inference::config::InferenceConfig;
 use crate::tracing;
 
 const DEFAULT_CONFIG: &str = include_str!("../config/config.yaml");
@@ -34,6 +35,9 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub jwt_rbac: Option<bool>,
 
+    #[serde(default)]
+    pub hide_jwt_dashboard: Option<bool>,
+
     /// Directory where static files are served from.
     /// For example, the Web-UI should be placed here.
     #[serde(default)]
@@ -46,6 +50,16 @@ pub struct ServiceConfig {
 
     /// How much time is considered too long for a query to execute.
     pub slow_query_secs: Option<f32>,
+
+    /// Whether to enable reporting of measured hardware utilization in API responses.
+    #[serde(default)]
+    pub hardware_reporting: Option<bool>,
+}
+
+impl ServiceConfig {
+    pub fn hardware_reporting(&self) -> bool {
+        self.hardware_reporting.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
@@ -100,6 +114,9 @@ pub struct ConsensusConfig {
     #[validate(range(min = 1))]
     #[serde(default = "default_message_timeout_tics")]
     pub message_timeout_ticks: u64,
+    #[allow(dead_code)] // `schema_generator` complains about this 🙄
+    #[serde(default)]
+    pub compact_wal_entries: u64, // compact WAL when it grows to enough applied entries
 }
 
 impl Default for ConsensusConfig {
@@ -109,6 +126,7 @@ impl Default for ConsensusConfig {
             tick_period_ms: default_tick_period_ms(),
             bootstrap_timeout_sec: default_bootstrap_timeout_sec(),
             message_timeout_ticks: default_message_timeout_tics(),
+            compact_wal_entries: 0,
         }
     }
 }
@@ -121,6 +139,51 @@ pub struct TlsConfig {
     #[serde(default = "default_tls_cert_ttl")]
     #[validate(range(min = 1))]
     pub cert_ttl: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize, Validate)]
+pub struct GpuConfig {
+    /// Enable GPU indexing.
+    #[serde(default)]
+    pub indexing: bool,
+    /// Force half precision for `f32` values while indexing.
+    /// `f16` conversion will take place only inside GPU memory and won't affect storage type.
+    #[serde(default)]
+    pub force_half_precision: bool,
+    /// Used vulkan "groups" of GPU. In other words, how many parallel points can be indexed by GPU.
+    /// Optimal value might depend on the GPU model.
+    /// Proportional, but doesn't necessary equal to the physical number of warps.
+    /// Do not change this value unless you know what you are doing.
+    /// Default: 512
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub groups_count: Option<usize>,
+    /// Filter for GPU devices by hardware name. Case insensitive.
+    /// Comma-separated list of substrings to match against the gpu device name.
+    /// Example: "nvidia"
+    /// Default: "" - all devices are accepted.
+    #[serde(default)]
+    pub device_filter: String,
+    /// List of explicit GPU devices to use.
+    /// If host has multiple GPUs, this option allows to select specific devices
+    /// by their index in the list of found devices.
+    /// If `device_filter` is set, indexes are applied after filtering.
+    /// By default, all devices are accepted.
+    #[serde(default)]
+    pub devices: Option<Vec<usize>>,
+    /// How many parallel indexing processes are allowed to run.
+    /// Default: 1
+    #[serde(default)]
+    pub parallel_indexes: Option<usize>,
+    /// Allow to use integrated GPUs.
+    /// Default: false
+    #[serde(default)]
+    pub allow_integrated: bool,
+    /// Allow to use emulated GPUs like LLVMpipe. Useful for CI.
+    /// Default: false
+    #[serde(default)]
+    pub allow_emulated: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Validate)]
@@ -148,6 +211,11 @@ pub struct Settings {
     /// We therefore need to log these messages later, after the logger is ready.
     #[serde(default, skip)]
     pub load_errors: Vec<LogMsg>,
+    #[serde(default)]
+    pub inference: Option<InferenceConfig>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub gpu: Option<GpuConfig>,
 }
 
 impl Settings {
@@ -219,6 +287,27 @@ impl Settings {
 
     #[allow(dead_code)]
     pub fn validate_and_warn(&self) {
+        //
+        // JWT RBAC
+        //
+        // Using HMAC-SHA256, recommended secret size is 32 bytes
+        const JWT_RECOMMENDED_SECRET_LENGTH: usize = 256 / 8;
+
+        // Log if JWT RBAC is enabled but no API key is set
+        if self.service.jwt_rbac.unwrap_or_default() {
+            if self.service.api_key.clone().unwrap_or_default().is_empty() {
+                log::warn!("JWT RBAC configured but no API key set, JWT RBAC is not enabled")
+            // Log if JWT RAC is enabled, API key is set but smaller than recommended size for JWT secret
+            } else if self.service.api_key.clone().unwrap_or_default().len()
+                < JWT_RECOMMENDED_SECRET_LENGTH
+            {
+                log::warn!(
+                "It is highly recommended to use an API key of {} bytes when JWT RBAC is enabled",
+                JWT_RECOMMENDED_SECRET_LENGTH
+            )
+            }
+        }
+
         // Print any load error messages we had
         self.load_errors.iter().for_each(LogMsg::log);
 

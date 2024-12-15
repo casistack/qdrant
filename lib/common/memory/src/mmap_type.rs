@@ -23,11 +23,15 @@
 //! behavior. Problems caused by this are very hard to debug.
 
 use std::ops::{Deref, DerefMut};
+use std::path::Path;
 use std::sync::Arc;
 use std::{fmt, mem, slice};
 
 use bitvec::slice::BitSlice;
 use memmap2::MmapMut;
+
+use crate::madvise::{Advice, AdviceSetting};
+use crate::mmap_ops;
 
 /// Result for mmap errors.
 type Result<T> = std::result::Result<T, Error>;
@@ -95,7 +99,7 @@ where
     ///
     /// - panics when the size of the mmap doesn't match size `T`
     /// - panics when the mmap data is not correctly aligned for type `T`
-    /// - See: [`mmap_to_type_unbounded`]
+    /// - See: [`mmap_prefix_to_type_unbounded`]
     pub unsafe fn from(mmap_with_type: MmapMut) -> Self {
         Self::try_from(mmap_with_type).unwrap()
     }
@@ -112,9 +116,9 @@ where
     /// # Panics
     ///
     /// - panics when the mmap data is not correctly aligned for type `T`
-    /// - See: [`mmap_to_type_unbounded`]
+    /// - See: [`mmap_prefix_to_type_unbounded`]
     pub unsafe fn try_from(mut mmap_with_type: MmapMut) -> Result<Self> {
-        let r#type = mmap_to_type_unbounded(&mut mmap_with_type)?;
+        let r#type = mmap_prefix_to_type_unbounded(&mut mmap_with_type)?;
         let mmap = Arc::new(mmap_with_type);
         Ok(Self { r#type, mmap })
     }
@@ -266,6 +270,26 @@ impl<T> MmapSlice<T> {
     pub fn flusher(&self) -> MmapFlusher {
         self.mmap.flusher()
     }
+
+    pub fn create(path: &Path, mut iter: impl ExactSizeIterator<Item = T>) -> Result<()> {
+        let file_len = iter.len() * mem::size_of::<T>();
+
+        let _file = mmap_ops::create_and_ensure_length(path, file_len)?;
+
+        let mmap = mmap_ops::open_write_mmap(
+            path,
+            AdviceSetting::Advice(Advice::Normal), // We only write sequentially
+            false,
+        )?;
+
+        let mut mmap_slice = unsafe { Self::try_from(mmap)? };
+
+        mmap_slice.fill_with(|| iter.next().expect("iterator size mismatch"));
+
+        mmap_slice.flusher()()?;
+
+        Ok(())
+    }
 }
 
 impl<T> Deref for MmapSlice<T> {
@@ -291,6 +315,9 @@ pub struct MmapBitSlice {
 }
 
 impl MmapBitSlice {
+    /// Minimum file size for the mmap file, in bytes.
+    const MIN_FILE_SIZE: usize = mem::size_of::<usize>();
+
     /// Transform a mmap into a [`BitSlice`].
     ///
     /// A (non-zero) header size in bytes may be provided to omit from the BitSlice data.
@@ -333,6 +360,35 @@ impl MmapBitSlice {
     pub fn flusher(&self) -> MmapFlusher {
         self.mmap.flusher()
     }
+
+    pub fn create(path: &Path, bitslice: &BitSlice) -> Result<()> {
+        let bits_count = bitslice.len();
+        let bytes_count = bits_count
+            .div_ceil(u8::BITS as usize)
+            .next_multiple_of(Self::MIN_FILE_SIZE);
+
+        let _file = mmap_ops::create_and_ensure_length(path, bytes_count)?;
+
+        let mmap = mmap_ops::open_write_mmap(
+            path,
+            AdviceSetting::Advice(Advice::Normal), // We only write sequentially
+            false,
+        )?;
+
+        let mut mmap_bitslice = MmapBitSlice::try_from(mmap, 0)?;
+
+        mmap_bitslice.fill_with(|idx| {
+            bitslice
+                .get(idx)
+                .map(|bitref| bitref.as_ref().to_owned())
+                // mmap bitslice can be bigger than bitslice because it must align with size of `usize`
+                .unwrap_or(false)
+        });
+
+        mmap_bitslice.flusher()()?;
+
+        Ok(())
+    }
 }
 
 impl Deref for MmapBitSlice {
@@ -354,6 +410,8 @@ impl DerefMut for MmapBitSlice {
 pub enum Error {
     #[error("Mmap length must be {0} to match the size of type, but it is {1}")]
     SizeExact(usize, usize),
+    #[error("Mmap length must be at least {0} to match the size of type, but it is {1}")]
+    SizeLess(usize, usize),
     #[error("Mmap length must be multiple of {0} to match the size of type, but it is {1}")]
     SizeMultiple(usize, usize),
     #[error("{0}")]
@@ -376,26 +434,36 @@ pub enum Error {
 /// # Panics
 ///
 /// - panics when the mmap data is not correctly aligned for type `T`
-unsafe fn mmap_to_type_unbounded<'unbnd, T>(mmap: &mut MmapMut) -> Result<&'unbnd mut T>
+unsafe fn mmap_prefix_to_type_unbounded<'unbnd, T>(mmap: &mut MmapMut) -> Result<&'unbnd mut T>
 where
     T: Sized,
 {
     let size_t = mem::size_of::<T>();
 
     // Assert size
-    if mmap.len() != size_t {
-        return Err(Error::SizeExact(size_t, mmap.len()));
+    if mmap.len() < size_t {
+        return Err(Error::SizeLess(size_t, mmap.len()));
     }
 
     // Obtain unbounded bytes slice into mmap
     let bytes: &'unbnd mut [u8] = {
         let slice = mmap.deref_mut();
-        slice::from_raw_parts_mut(slice.as_mut_ptr(), slice.len())
+        slice::from_raw_parts_mut(slice.as_mut_ptr(), size_t)
     };
 
     // Assert alignment and size
     assert_alignment::<_, T>(bytes);
-    debug_assert_eq!(mmap.len(), bytes.len());
+
+    #[cfg(debug_assertions)]
+    if mmap.len() != size_t {
+        log::warn!(
+            "Mmap length {} is not equal to size of type {}",
+            mmap.len(),
+            size_t,
+        );
+    }
+
+    #[cfg(debug_assertions)]
     if bytes.len() != mem::size_of::<T>() {
         return Err(Error::SizeExact(mem::size_of::<T>(), bytes.len()));
     }
@@ -511,7 +579,8 @@ mod tests {
     fn check_open_zero_type<T: Sized + PartialEq + Debug + 'static>(zero: T) {
         let bytes = mem::size_of::<T>();
         let tempfile = create_temp_mmap_file(bytes);
-        let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+        let mmap =
+            mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
 
         let mmap_type: MmapType<T> = unsafe { MmapType::from(mmap) };
         assert_eq!(mmap_type.deref(), &zero);
@@ -541,7 +610,8 @@ mod tests {
     fn check_open_zero_slice<T: Sized + PartialEq + Debug + 'static>(len: usize, zero: T) {
         let bytes = mem::size_of::<T>() * len;
         let tempfile = create_temp_mmap_file(bytes);
-        let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+        let mmap =
+            mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
 
         let mmap_slice: MmapSlice<T> = unsafe { MmapSlice::from(mmap) };
         assert_eq!(mmap_slice.len(), len);
@@ -575,7 +645,8 @@ mod tests {
 
         // Write random values from template into mmap
         {
-            let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+            let mmap =
+                mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
             let mut mmap_slice: MmapSlice<T> = unsafe { MmapSlice::from(mmap) };
             assert_eq!(mmap_slice.len(), len);
             mmap_slice.copy_from_slice(&template);
@@ -583,7 +654,8 @@ mod tests {
 
         // Reopen and assert values from template
         {
-            let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+            let mmap =
+                mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
             let mmap_slice: MmapSlice<T> = unsafe { MmapSlice::from(mmap) };
             assert_eq!(mmap_slice.as_ref(), template);
         }
@@ -605,7 +677,8 @@ mod tests {
         // Fill bitslice
         {
             let mut rng = StdRng::seed_from_u64(42);
-            let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+            let mmap =
+                mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
             let mut mmap_bitslice = MmapBitSlice::from(mmap, header_size);
             (0..bits).for_each(|i| mmap_bitslice.set(i, rng.gen()));
         }
@@ -613,7 +686,8 @@ mod tests {
         // Reopen and assert contents
         {
             let mut rng = StdRng::seed_from_u64(42);
-            let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+            let mmap =
+                mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
             let mmap_bitslice = MmapBitSlice::from(mmap, header_size);
             (0..bits).for_each(|i| assert_eq!(mmap_bitslice[i], rng.gen::<bool>()));
         }
@@ -623,17 +697,41 @@ mod tests {
     fn test_zero_sized_type() {
         {
             let tempfile = create_temp_mmap_file(0);
-            let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+            let mmap =
+                mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
             let result = unsafe { MmapType::<()>::try_from(mmap).unwrap() };
             assert_eq!(result.deref(), &());
         }
 
         {
             let tempfile = create_temp_mmap_file(0);
-            let mmap = mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global).unwrap();
+            let mmap =
+                mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
             let result = unsafe { MmapSlice::<()>::try_from(mmap).unwrap() };
             assert_eq!(result.as_ref(), &[]);
             assert_alignment::<_, ()>(result.as_ref());
         }
+    }
+
+    #[test]
+    fn test_double_read_mmap() {
+        // Create and open a tmp file
+        // Mmap it with write access
+        // then mmap it with read access
+        // Check that the data is synchronized
+
+        let tempfile = create_temp_mmap_file(1024);
+        let mut mmap_write =
+            mmap_ops::open_write_mmap(tempfile.path(), AdviceSetting::Global, false).unwrap();
+        let mmap_read = mmap_ops::open_read_mmap(
+            tempfile.path(),
+            AdviceSetting::Advice(Advice::Sequential),
+            false,
+        )
+        .unwrap();
+
+        mmap_write[333] = 42;
+
+        assert_eq!(mmap_read[333], 42);
     }
 }

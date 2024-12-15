@@ -1,9 +1,11 @@
+//! Handlers for transferring data from one collection into another within single cluster
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use collection::collection::Collection;
 use collection::operations::point_ops::{
-    PointInsertOperationsInternal, PointOperations, PointStruct, WriteOrdering,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{CollectionError, CollectionResult, ScrollRequestInternal};
@@ -18,8 +20,6 @@ use crate::content_manager::collections_ops::Collections;
 
 const MIGRATION_BATCH_SIZE: usize = 1000;
 const COLLECTION_INITIATION_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Handlers for transferring data from one collection into another within single cluster
 
 /// Get a list of local shards, which can be used for migration
 ///
@@ -107,18 +107,14 @@ async fn replicate_shard_data(
             break;
         }
 
-        let records = scroll_result
+        let records: Result<_, _> = scroll_result
             .points
             .into_iter()
-            .map(|point| PointStruct {
-                id: point.id,
-                vector: point.vector.unwrap(),
-                payload: point.payload,
-            })
+            .map(PointStructPersisted::try_from)
             .collect();
 
         let upsert_request = CollectionUpdateOperations::PointOperation(
-            PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(records)),
+            PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(records?)),
         );
 
         let target_collection =

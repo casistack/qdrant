@@ -189,9 +189,10 @@ fn test_multi_filterable_hnsw(
         id_tracker: segment.id_tracker.clone(),
         vector_storage: vector_storage.clone(),
         quantized_vectors: quantized_vectors.clone(),
-        payload_index: payload_index_ptr.clone(),
+        payload_index: payload_index_ptr,
         hnsw_config,
         permit: Some(permit),
+        gpu_device: None,
         stopped: &stopped,
     })
     .unwrap();

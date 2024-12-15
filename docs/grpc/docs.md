@@ -139,6 +139,8 @@
     - [DiscoverInput](#qdrant-DiscoverInput)
     - [DiscoverPoints](#qdrant-DiscoverPoints)
     - [DiscoverResponse](#qdrant-DiscoverResponse)
+    - [Document](#qdrant-Document)
+    - [Document.OptionsEntry](#qdrant-Document-OptionsEntry)
     - [FacetCounts](#qdrant-FacetCounts)
     - [FacetHit](#qdrant-FacetHit)
     - [FacetResponse](#qdrant-FacetResponse)
@@ -154,7 +156,13 @@
     - [GetResponse](#qdrant-GetResponse)
     - [GroupId](#qdrant-GroupId)
     - [GroupsResult](#qdrant-GroupsResult)
+    - [HardwareUsage](#qdrant-HardwareUsage)
     - [HasIdCondition](#qdrant-HasIdCondition)
+    - [HasVectorCondition](#qdrant-HasVectorCondition)
+    - [Image](#qdrant-Image)
+    - [Image.OptionsEntry](#qdrant-Image-OptionsEntry)
+    - [InferenceObject](#qdrant-InferenceObject)
+    - [InferenceObject.OptionsEntry](#qdrant-InferenceObject-OptionsEntry)
     - [IsEmptyCondition](#qdrant-IsEmptyCondition)
     - [IsNullCondition](#qdrant-IsNullCondition)
     - [LookupLocation](#qdrant-LookupLocation)
@@ -163,6 +171,8 @@
     - [MultiDenseVector](#qdrant-MultiDenseVector)
     - [NamedVectors](#qdrant-NamedVectors)
     - [NamedVectors.VectorsEntry](#qdrant-NamedVectors-VectorsEntry)
+    - [NamedVectorsOutput](#qdrant-NamedVectorsOutput)
+    - [NamedVectorsOutput.VectorsEntry](#qdrant-NamedVectorsOutput-VectorsEntry)
     - [NestedCondition](#qdrant-NestedCondition)
     - [OrderBy](#qdrant-OrderBy)
     - [OrderValue](#qdrant-OrderValue)
@@ -216,6 +226,12 @@
     - [SearchBatchPoints](#qdrant-SearchBatchPoints)
     - [SearchBatchResponse](#qdrant-SearchBatchResponse)
     - [SearchGroupsResponse](#qdrant-SearchGroupsResponse)
+    - [SearchMatrixOffsets](#qdrant-SearchMatrixOffsets)
+    - [SearchMatrixOffsetsResponse](#qdrant-SearchMatrixOffsetsResponse)
+    - [SearchMatrixPair](#qdrant-SearchMatrixPair)
+    - [SearchMatrixPairs](#qdrant-SearchMatrixPairs)
+    - [SearchMatrixPairsResponse](#qdrant-SearchMatrixPairsResponse)
+    - [SearchMatrixPoints](#qdrant-SearchMatrixPoints)
     - [SearchParams](#qdrant-SearchParams)
     - [SearchPointGroups](#qdrant-SearchPointGroups)
     - [SearchPoints](#qdrant-SearchPoints)
@@ -236,7 +252,9 @@
     - [Vector](#qdrant-Vector)
     - [VectorExample](#qdrant-VectorExample)
     - [VectorInput](#qdrant-VectorInput)
+    - [VectorOutput](#qdrant-VectorOutput)
     - [Vectors](#qdrant-Vectors)
+    - [VectorsOutput](#qdrant-VectorsOutput)
     - [VectorsSelector](#qdrant-VectorsSelector)
     - [WithLookup](#qdrant-WithLookup)
     - [WithPayloadSelector](#qdrant-WithPayloadSelector)
@@ -816,6 +834,11 @@
 
 
 
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| on_disk | [bool](#bool) | optional | If true - store index on disk. |
+
+
 
 
 
@@ -1058,7 +1081,7 @@ It is recommended to select the default number of segments as a factor of the nu
 | max_segment_size | [uint64](#uint64) | optional | Do not create segments larger this size (in kilobytes). Large segments might require disproportionately long indexation times, therefore it makes sense to limit the size of segments.
 
 If indexing speed is more important - make this parameter lower. If search speed is more important - make this parameter higher. Note: 1Kb = 1 vector of size 256 If not set, will be automatically selected considering the number of available CPUs. |
-| memmap_threshold | [uint64](#uint64) | optional | Maximum size (in kilobytes) of vectors to store in-memory per segment. Segments larger than this threshold will be stored as read-only memmaped file.
+| memmap_threshold | [uint64](#uint64) | optional | Maximum size (in kilobytes) of vectors to store in-memory per segment. Segments larger than this threshold will be stored as read-only memmapped file.
 
 Memmap storage is disabled by default, to enable it, set this threshold to a reasonable value.
 
@@ -1407,6 +1430,10 @@ Note: 1kB = 1 vector of size 256. |
 | search_max_hnsw_ef | [uint32](#uint32) | optional |  |
 | search_allow_exact | [bool](#bool) | optional |  |
 | search_max_oversampling | [float](#float) | optional |  |
+| upsert_max_batchsize | [uint64](#uint64) | optional |  |
+| max_collection_vector_size_bytes | [uint64](#uint64) | optional |  |
+| read_rate_limit_per_sec | [uint32](#uint32) | optional |  |
+| write_rate_limit_per_sec | [uint32](#uint32) | optional |  |
 
 
 
@@ -1425,6 +1452,7 @@ Note: 1kB = 1 vector of size 256. |
 | lowercase | [bool](#bool) | optional | If true - all tokens will be lowercase |
 | min_token_len | [uint64](#uint64) | optional | Minimal token length |
 | max_token_len | [uint64](#uint64) | optional | Maximal token length |
+| on_disk | [bool](#bool) | optional | If true - store index on disk. |
 
 
 
@@ -1447,6 +1475,7 @@ Note: 1kB = 1 vector of size 256. |
 | vectors_config | [VectorsConfigDiff](#qdrant-VectorsConfigDiff) | optional | New vector parameters |
 | quantization_config | [QuantizationConfigDiff](#qdrant-QuantizationConfigDiff) | optional | Quantization configuration of vector |
 | sparse_vectors_config | [SparseVectorConfig](#qdrant-SparseVectorConfig) | optional | New sparse vector parameters |
+| strict_mode_config | [StrictModeConfig](#qdrant-StrictModeConfig) | optional | New strict mode configuration |
 
 
 
@@ -2110,6 +2139,7 @@ The JSON representation for `Value` is a JSON value.
 | filter | [Filter](#qdrant-Filter) |  |  |
 | is_null | [IsNullCondition](#qdrant-IsNullCondition) |  |  |
 | nested | [NestedCondition](#qdrant-NestedCondition) |  |  |
+| has_vector | [HasVectorCondition](#qdrant-HasVectorCondition) |  |  |
 
 
 
@@ -2193,6 +2223,7 @@ The JSON representation for `Value` is a JSON value.
 | ----- | ---- | ----- | ----------- |
 | result | [CountResult](#qdrant-CountResult) |  |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -2372,6 +2403,7 @@ The JSON representation for `Value` is a JSON value.
 | ----- | ---- | ----- | ----------- |
 | result | [BatchResult](#qdrant-BatchResult) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -2432,6 +2464,40 @@ The JSON representation for `Value` is a JSON value.
 | ----- | ---- | ----- | ----------- |
 | result | [ScoredPoint](#qdrant-ScoredPoint) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-Document"></a>
+
+### Document
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| text | [string](#string) |  | Text of the document |
+| model | [string](#string) |  | Model name |
+| options | [Document.OptionsEntry](#qdrant-Document-OptionsEntry) | repeated | Model options |
+
+
+
+
+
+
+<a name="qdrant-Document-OptionsEntry"></a>
+
+### Document.OptionsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [Value](#qdrant-Value) |  |  |
 
 
 
@@ -2502,6 +2568,7 @@ The JSON representation for `Value` is a JSON value.
 | ----- | ---- | ----- | ----------- |
 | string_value | [string](#string) |  | String value from the facet |
 | integer_value | [int64](#int64) |  | Integer value from the facet |
+| bool_value | [bool](#bool) |  | Boolean value from the facet |
 
 
 
@@ -2697,6 +2764,21 @@ Additionally, the first and last points of each GeoLineString must be the same.
 
 
 
+<a name="qdrant-HardwareUsage"></a>
+
+### HardwareUsage
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| cpu | [uint64](#uint64) |  |  |
+
+
+
+
+
+
 <a name="qdrant-HasIdCondition"></a>
 
 ### HasIdCondition
@@ -2706,6 +2788,87 @@ Additionally, the first and last points of each GeoLineString must be the same.
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | has_id | [PointId](#qdrant-PointId) | repeated |  |
+
+
+
+
+
+
+<a name="qdrant-HasVectorCondition"></a>
+
+### HasVectorCondition
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| has_vector | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="qdrant-Image"></a>
+
+### Image
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| image | [Value](#qdrant-Value) |  | Image data, either base64 encoded or URL |
+| model | [string](#string) |  | Model name |
+| options | [Image.OptionsEntry](#qdrant-Image-OptionsEntry) | repeated | Model options |
+
+
+
+
+
+
+<a name="qdrant-Image-OptionsEntry"></a>
+
+### Image.OptionsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [Value](#qdrant-Value) |  |  |
+
+
+
+
+
+
+<a name="qdrant-InferenceObject"></a>
+
+### InferenceObject
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| object | [Value](#qdrant-Value) |  | Object to infer |
+| model | [string](#string) |  | Model name |
+| options | [InferenceObject.OptionsEntry](#qdrant-InferenceObject-OptionsEntry) | repeated | Model options |
+
+
+
+
+
+
+<a name="qdrant-InferenceObject-OptionsEntry"></a>
+
+### InferenceObject.OptionsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [Value](#qdrant-Value) |  |  |
 
 
 
@@ -2837,6 +3000,37 @@ Additionally, the first and last points of each GeoLineString must be the same.
 | ----- | ---- | ----- | ----------- |
 | key | [string](#string) |  |  |
 | value | [Vector](#qdrant-Vector) |  |  |
+
+
+
+
+
+
+<a name="qdrant-NamedVectorsOutput"></a>
+
+### NamedVectorsOutput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| vectors | [NamedVectorsOutput.VectorsEntry](#qdrant-NamedVectorsOutput-VectorsEntry) | repeated |  |
+
+
+
+
+
+
+<a name="qdrant-NamedVectorsOutput-VectorsEntry"></a>
+
+### NamedVectorsOutput.VectorsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [VectorOutput](#qdrant-VectorOutput) |  |  |
 
 
 
@@ -3333,6 +3527,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [BatchResult](#qdrant-BatchResult) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3349,6 +3544,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [GroupsResult](#qdrant-GroupsResult) |  |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3425,6 +3621,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [ScoredPoint](#qdrant-ScoredPoint) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3493,6 +3690,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [BatchResult](#qdrant-BatchResult) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3509,6 +3707,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [GroupsResult](#qdrant-GroupsResult) |  |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3608,6 +3807,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [ScoredPoint](#qdrant-ScoredPoint) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3654,7 +3854,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | id | [PointId](#qdrant-PointId) |  |  |
 | payload | [RetrievedPoint.PayloadEntry](#qdrant-RetrievedPoint-PayloadEntry) | repeated |  |
-| vectors | [Vectors](#qdrant-Vectors) | optional |  |
+| vectors | [VectorsOutput](#qdrant-VectorsOutput) | optional |  |
 | shard_key | [ShardKey](#qdrant-ShardKey) | optional | Shard key |
 | order_value | [OrderValue](#qdrant-OrderValue) | optional | Order-by value |
 
@@ -3691,7 +3891,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | payload | [ScoredPoint.PayloadEntry](#qdrant-ScoredPoint-PayloadEntry) | repeated | Payload |
 | score | [float](#float) |  | Similarity score |
 | version | [uint64](#uint64) |  | Last update operation applied to this point |
-| vectors | [Vectors](#qdrant-Vectors) | optional | Vectors to search |
+| vectors | [VectorsOutput](#qdrant-VectorsOutput) | optional | Vectors to search |
 | shard_key | [ShardKey](#qdrant-ShardKey) | optional | Shard key |
 | order_value | [OrderValue](#qdrant-OrderValue) | optional | Order by value |
 
@@ -3785,6 +3985,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [BatchResult](#qdrant-BatchResult) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -3801,6 +4002,113 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [GroupsResult](#qdrant-GroupsResult) |  |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-SearchMatrixOffsets"></a>
+
+### SearchMatrixOffsets
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| offsets_row | [uint64](#uint64) | repeated | Row indices of the matrix |
+| offsets_col | [uint64](#uint64) | repeated | Column indices of the matrix |
+| scores | [float](#float) | repeated | Scores associated with matrix coordinates |
+| ids | [PointId](#qdrant-PointId) | repeated | Ids of the points in order |
+
+
+
+
+
+
+<a name="qdrant-SearchMatrixOffsetsResponse"></a>
+
+### SearchMatrixOffsetsResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| result | [SearchMatrixOffsets](#qdrant-SearchMatrixOffsets) |  |  |
+| time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-SearchMatrixPair"></a>
+
+### SearchMatrixPair
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| a | [PointId](#qdrant-PointId) |  | first id of the pair |
+| b | [PointId](#qdrant-PointId) |  | second id of the pair |
+| score | [float](#float) |  | score of the pair |
+
+
+
+
+
+
+<a name="qdrant-SearchMatrixPairs"></a>
+
+### SearchMatrixPairs
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| pairs | [SearchMatrixPair](#qdrant-SearchMatrixPair) | repeated | List of pairs of points with scores |
+
+
+
+
+
+
+<a name="qdrant-SearchMatrixPairsResponse"></a>
+
+### SearchMatrixPairsResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| result | [SearchMatrixPairs](#qdrant-SearchMatrixPairs) |  |  |
+| time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
+
+
+
+
+
+
+<a name="qdrant-SearchMatrixPoints"></a>
+
+### SearchMatrixPoints
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| collection_name | [string](#string) |  | Name of the collection |
+| filter | [Filter](#qdrant-Filter) | optional | Filter conditions - return only those points that satisfy the specified conditions. |
+| sample | [uint64](#uint64) | optional | How many points to select and search within. Default is 10. |
+| limit | [uint64](#uint64) | optional | How many neighbours per sample to find. Default is 3. |
+| using | [string](#string) | optional | Define which vector to use for querying. If missing, the default vector is is used. |
+| timeout | [uint64](#uint64) | optional | If set, overrides global timeout setting for this request. Unit is seconds. |
+| read_consistency | [ReadConsistency](#qdrant-ReadConsistency) | optional | Options for specifying read consistency guarantees |
+| shard_key_selector | [ShardKeySelector](#qdrant-ShardKeySelector) | optional | Specify in which shards to look for the points, if not specified - look in all shards |
 
 
 
@@ -3893,6 +4201,7 @@ For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will 
 | ----- | ---- | ----- | ----------- |
 | result | [ScoredPoint](#qdrant-ScoredPoint) | repeated |  |
 | time | [double](#double) |  | Time spent to process |
+| usage | [HardwareUsage](#qdrant-HardwareUsage) | optional |  |
 
 
 
@@ -4129,9 +4438,15 @@ Legacy vector format, which determines the vector type by the configuration of i
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| data | [float](#float) | repeated | Vector data (flatten for multi vectors) |
-| indices | [SparseIndices](#qdrant-SparseIndices) | optional | Sparse indices for sparse vectors |
-| vectors_count | [uint32](#uint32) | optional | Number of vectors per multi vector |
+| data | [float](#float) | repeated | Vector data (flatten for multi vectors), deprecated |
+| indices | [SparseIndices](#qdrant-SparseIndices) | optional | Sparse indices for sparse vectors, deprecated |
+| vectors_count | [uint32](#uint32) | optional | Number of vectors per multi vector, deprecated |
+| dense | [DenseVector](#qdrant-DenseVector) |  | Dense vector |
+| sparse | [SparseVector](#qdrant-SparseVector) |  | Sparse vector |
+| multi_dense | [MultiDenseVector](#qdrant-MultiDenseVector) |  | Multi dense vector |
+| document | [Document](#qdrant-Document) |  |  |
+| image | [Image](#qdrant-Image) |  |  |
+| object | [InferenceObject](#qdrant-InferenceObject) |  |  |
 
 
 
@@ -4166,6 +4481,29 @@ Vector type to be used in queries. Ids will be substituted with their correspond
 | dense | [DenseVector](#qdrant-DenseVector) |  |  |
 | sparse | [SparseVector](#qdrant-SparseVector) |  |  |
 | multi_dense | [MultiDenseVector](#qdrant-MultiDenseVector) |  |  |
+| document | [Document](#qdrant-Document) |  |  |
+| image | [Image](#qdrant-Image) |  |  |
+| object | [InferenceObject](#qdrant-InferenceObject) |  |  |
+
+
+
+
+
+
+<a name="qdrant-VectorOutput"></a>
+
+### VectorOutput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| data | [float](#float) | repeated | Vector data (flatten for multi vectors), deprecated |
+| indices | [SparseIndices](#qdrant-SparseIndices) | optional | Sparse indices for sparse vectors, deprecated |
+| vectors_count | [uint32](#uint32) | optional | Number of vectors per multi vector, deprecated |
+| dense | [DenseVector](#qdrant-DenseVector) |  | Dense vector |
+| sparse | [SparseVector](#qdrant-SparseVector) |  | Sparse vector |
+| multi_dense | [MultiDenseVector](#qdrant-MultiDenseVector) |  | Multi dense vector |
 
 
 
@@ -4182,6 +4520,22 @@ Vector type to be used in queries. Ids will be substituted with their correspond
 | ----- | ---- | ----- | ----------- |
 | vector | [Vector](#qdrant-Vector) |  |  |
 | vectors | [NamedVectors](#qdrant-NamedVectors) |  |  |
+
+
+
+
+
+
+<a name="qdrant-VectorsOutput"></a>
+
+### VectorsOutput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| vector | [VectorOutput](#qdrant-VectorOutput) |  |  |
+| vectors | [NamedVectorsOutput](#qdrant-NamedVectorsOutput) |  |  |
 
 
 
@@ -4438,6 +4792,8 @@ When using target (with or without context), the score behaves a little differen
 | QueryBatch | [QueryBatchPoints](#qdrant-QueryBatchPoints) | [QueryBatchResponse](#qdrant-QueryBatchResponse) | Universally query points in a batch fashion. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries. |
 | QueryGroups | [QueryPointGroups](#qdrant-QueryPointGroups) | [QueryGroupsResponse](#qdrant-QueryGroupsResponse) | Universally query points in a group fashion. This endpoint covers all capabilities of search, recommend, discover, filters. But also enables hybrid and multi-stage queries. |
 | Facet | [FacetCounts](#qdrant-FacetCounts) | [FacetResponse](#qdrant-FacetResponse) | Perform facet counts. For each value in the field, count the number of points that have this value and match the conditions. |
+| SearchMatrixPairs | [SearchMatrixPoints](#qdrant-SearchMatrixPoints) | [SearchMatrixPairsResponse](#qdrant-SearchMatrixPairsResponse) | Compute distance matrix for sampled points with a pair based output format |
+| SearchMatrixOffsets | [SearchMatrixPoints](#qdrant-SearchMatrixPoints) | [SearchMatrixOffsetsResponse](#qdrant-SearchMatrixOffsetsResponse) | Compute distance matrix for sampled points with an offset based output format |
 
  
 

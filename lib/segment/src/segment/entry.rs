@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::thread::{self};
 
+use common::tar_ext;
 use common::types::TelemetryDetail;
 use io::storage_version::VERSION_FILE;
-use tar::Builder;
 use uuid::Uuid;
 
 use super::Segment;
@@ -17,11 +18,12 @@ use crate::data_types::facets::{FacetParams, FacetValue};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::order_by::{OrderBy, OrderValue};
 use crate::data_types::query_context::{QueryContext, SegmentQueryContext};
-use crate::data_types::vectors::{QueryVector, Vector};
+use crate::data_types::vectors::{QueryVector, VectorInternal};
 use crate::entry::entry_point::SegmentEntry;
 use crate::index::field_index::{CardinalityEstimation, FieldIndex};
 use crate::index::{PayloadIndex, VectorIndex};
 use crate::json_path::JsonPath;
+use crate::payload_storage::PayloadStorage;
 use crate::segment::{
     DB_BACKUP_PATH, PAYLOAD_DB_BACKUP_PATH, SEGMENT_STATE_FILE, SNAPSHOT_FILES_PATH, SNAPSHOT_PATH,
 };
@@ -29,9 +31,9 @@ use crate::telemetry::SegmentTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadIndexInfo, PayloadKeyType, PayloadKeyTypeRef,
     PointIdType, ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType,
-    VectorDataInfo, WithPayload, WithVector,
+    SnapshotFormat, VectorDataInfo, WithPayload, WithVector,
 };
-use crate::utils;
+use crate::utils::path::strip_prefix;
 use crate::vector_storage::VectorStorage;
 
 /// This is a basic implementation of `SegmentEntry`,
@@ -57,7 +59,7 @@ impl SegmentEntry for Segment {
         filter: Option<&Filter>,
         top: usize,
         params: Option<&SearchParams>,
-        query_context: SegmentQueryContext,
+        query_context: &SegmentQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>> {
         check_query_vectors(vector_name, query_vectors, &self.segment_config)?;
         let vector_data = &self.vector_data[vector_name];
@@ -72,14 +74,12 @@ impl SegmentEntry for Segment {
 
         check_stopped(&vector_query_context.is_stopped())?;
 
-        let res = internal_results
-            .iter()
+        internal_results
+            .into_iter()
             .map(|internal_result| {
                 self.process_search_result(internal_result, with_payload, with_vector)
             })
-            .collect();
-
-        res
+            .collect()
     }
 
     fn upsert_point(
@@ -94,10 +94,10 @@ impl SegmentEntry for Segment {
         let stored_internal_point = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, stored_internal_point, |segment| {
             if let Some(existing_internal_id) = stored_internal_point {
-                segment.replace_all_vectors(existing_internal_id, vectors)?;
+                segment.replace_all_vectors(existing_internal_id, &vectors)?;
                 Ok((true, Some(existing_internal_id)))
             } else {
-                let new_index = segment.insert_new_vectors(point_id, vectors)?;
+                let new_index = segment.insert_new_vectors(point_id, &vectors)?;
                 Ok((false, Some(new_index)))
             }
         })
@@ -115,7 +115,10 @@ impl SegmentEntry for Segment {
             Some(internal_id) => {
                 self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
                     // Mark point as deleted, drop mapping
-                    segment.payload_index.borrow_mut().drop(internal_id)?;
+                    segment
+                        .payload_index
+                        .borrow_mut()
+                        .clear_payload(internal_id)?;
                     segment.id_tracker.borrow_mut().drop(point_id)?;
 
                     // Before, we propagated point deletions to also delete its vectors. This turns
@@ -172,11 +175,11 @@ impl SegmentEntry for Segment {
             }),
             Some(internal_id) => {
                 self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
-                    let vector_data = segment.vector_data.get(vector_name).ok_or(
+                    let vector_data = segment.vector_data.get(vector_name).ok_or_else(|| {
                         OperationError::VectorNameNotExists {
                             received_name: vector_name.to_string(),
-                        },
-                    )?;
+                        }
+                    })?;
                     let mut vector_storage = vector_data.vector_storage.borrow_mut();
                     let is_deleted = vector_storage.delete_vector(internal_id)?;
                     Ok((is_deleted, Some(internal_id)))
@@ -197,7 +200,7 @@ impl SegmentEntry for Segment {
                 segment
                     .payload_index
                     .borrow_mut()
-                    .assign_all(internal_id, full_payload)?;
+                    .overwrite_payload(internal_id, full_payload)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -219,7 +222,7 @@ impl SegmentEntry for Segment {
                 segment
                     .payload_index
                     .borrow_mut()
-                    .assign(internal_id, payload, key)?;
+                    .set_payload(internal_id, payload, key)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -240,7 +243,7 @@ impl SegmentEntry for Segment {
                 segment
                     .payload_index
                     .borrow_mut()
-                    .delete(internal_id, key)?;
+                    .delete_payload(internal_id, key)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -257,7 +260,10 @@ impl SegmentEntry for Segment {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
-                segment.payload_index.borrow_mut().drop(internal_id)?;
+                segment
+                    .payload_index
+                    .borrow_mut()
+                    .clear_payload(internal_id)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -266,7 +272,11 @@ impl SegmentEntry for Segment {
         })
     }
 
-    fn vector(&self, vector_name: &str, point_id: PointIdType) -> OperationResult<Option<Vector>> {
+    fn vector(
+        &self,
+        vector_name: &str,
+        point_id: PointIdType,
+    ) -> OperationResult<Option<VectorInternal>> {
         check_vector_name(vector_name, &self.segment_config)?;
         let internal_id = self.lookup_internal_id(point_id)?;
         let vector_opt = self.vector_by_offset(vector_name, internal_id)?;
@@ -365,6 +375,10 @@ impl SegmentEntry for Segment {
         self.id_tracker.borrow().internal_id(point_id).is_some()
     }
 
+    fn is_empty(&self) -> bool {
+        self.id_tracker.borrow().total_point_count() == 0
+    }
+
     fn available_point_count(&self) -> usize {
         self.id_tracker.borrow().available_point_count()
     }
@@ -378,7 +392,7 @@ impl SegmentEntry for Segment {
         Ok(self.vector_data[vector_name]
             .vector_storage
             .borrow()
-            .available_size_in_bytes())
+            .size_of_available_vectors_in_bytes())
     }
 
     fn estimate_point_count<'a>(&'a self, filter: Option<&'a Filter>) -> CardinalityEstimation {
@@ -420,24 +434,16 @@ impl SegmentEntry for Segment {
         self.segment_type
     }
 
-    fn info(&self) -> SegmentInfo {
-        let payload_index = self.payload_index.borrow();
-        let schema = payload_index
-            .indexed_fields()
-            .into_iter()
-            .map(|(key, index_schema)| {
-                let points_count = payload_index.indexed_points(&key);
-                (key, PayloadIndexInfo::new(index_schema, points_count))
-            })
-            .collect();
-
+    fn size_info(&self) -> SegmentInfo {
         let num_vectors = self
             .vector_data
             .values()
             .map(|data| data.vector_storage.borrow().available_vector_count())
             .sum();
 
-        let vector_data_info = self
+        let mut total_average_vectors_size_bytes: usize = 0;
+
+        let vector_data_info: HashMap<_, _> = self
             .vector_data
             .iter()
             .map(|(key, vector_data)| {
@@ -445,6 +451,14 @@ impl SegmentEntry for Segment {
                 let num_vectors = vector_storage.available_vector_count();
                 let vector_index = vector_data.vector_index.borrow();
                 let is_indexed = vector_index.is_index();
+
+                let average_vector_size_bytes = if num_vectors > 0 {
+                    vector_storage.size_of_available_vectors_in_bytes() / num_vectors
+                } else {
+                    0
+                };
+                total_average_vectors_size_bytes += average_vector_size_bytes;
+
                 let vector_data_info = VectorDataInfo {
                     num_vectors,
                     num_indexed_vectors: if is_indexed {
@@ -467,18 +481,48 @@ impl SegmentEntry for Segment {
             0
         };
 
+        let num_points = self.available_point_count();
+
+        let vectors_size_bytes = total_average_vectors_size_bytes * num_points;
+
+        // Unwrap and default to 0 here because the RocksDB storage is the only faillible one, and we will remove it eventually.
+        let payloads_size_bytes = self
+            .payload_storage
+            .borrow()
+            .get_storage_size_bytes()
+            .unwrap_or(0);
+
         SegmentInfo {
             segment_type: self.segment_type,
             num_vectors,
             num_indexed_vectors,
             num_points: self.available_point_count(),
             num_deleted_vectors: self.deleted_point_count(),
+            vectors_size_bytes,  // Considers vector storage, but not indices
+            payloads_size_bytes, // Considers payload storage, but not indices
             ram_usage_bytes: 0,  // ToDo: Implement
             disk_usage_bytes: 0, // ToDo: Implement
             is_appendable: self.appendable_flag,
-            index_schema: schema,
+            index_schema: HashMap::new(),
             vector_data: vector_data_info,
         }
+    }
+
+    fn info(&self) -> SegmentInfo {
+        let payload_index = self.payload_index.borrow();
+        let schema = payload_index
+            .indexed_fields()
+            .into_iter()
+            .map(|(key, index_schema)| {
+                let points_count = payload_index.indexed_points(&key);
+                (key, PayloadIndexInfo::new(index_schema, points_count))
+            })
+            .collect();
+
+        let mut info = self.size_info();
+        info.index_schema = schema;
+
+        info
     }
 
     fn config(&self) -> &SegmentConfig {
@@ -724,140 +768,47 @@ impl SegmentEntry for Segment {
     fn take_snapshot(
         &self,
         temp_path: &Path,
-        snapshot_dir_path: &Path,
-    ) -> OperationResult<PathBuf> {
-        log::debug!(
-            "Taking snapshot of segment {:?} into {snapshot_dir_path:?}",
-            self.current_path,
-        );
-
-        if !snapshot_dir_path.exists() {
-            return Err(OperationError::service_error(format!(
-                "the snapshot path {snapshot_dir_path:?} does not exist"
-            )));
-        }
-
-        if !snapshot_dir_path.is_dir() {
-            return Err(OperationError::service_error(format!(
-                "the snapshot path {snapshot_dir_path:?} is not a directory",
-            )));
-        }
-
-        // flush segment to capture latest state
-        self.flush(true, false)?;
-
-        // use temp_path for intermediary files
-        let temp_path = temp_path.join(format!("segment-{}", Uuid::new_v4()));
-        let db_backup_path = temp_path.join(DB_BACKUP_PATH);
-        let payload_index_db_backup_path = temp_path.join(PAYLOAD_DB_BACKUP_PATH);
-
-        {
-            let db = self.database.read();
-            crate::rocksdb_backup::create(&db, &db_backup_path)?;
-        }
-
-        self.payload_index
-            .borrow()
-            .take_database_snapshot(&payload_index_db_backup_path)?;
-
+        tar: &tar_ext::BuilderExt,
+        format: SnapshotFormat,
+        snapshotted_segments: &mut HashSet<String>,
+    ) -> OperationResult<()> {
         let segment_id = self
             .current_path
             .file_stem()
             .and_then(|f| f.to_str())
             .unwrap();
 
-        let archive_path = snapshot_dir_path.join(format!("{segment_id}.tar"));
+        if !snapshotted_segments.insert(segment_id.to_string()) {
+            // Already snapshotted.
+            return Ok(());
+        }
 
-        // If `archive_path` exists, we still want to overwrite it
-        let file = File::create(&archive_path).map_err(|err| {
-            OperationError::service_error(format!(
-                "failed to create segment snapshot archive {archive_path:?}: {err}"
-            ))
-        })?;
+        log::debug!("Taking snapshot of segment {:?}", self.current_path);
 
-        let mut builder = Builder::new(file);
+        // flush segment to capture latest state
+        self.flush(true, false)?;
 
-        builder
-            .append_dir_all(SNAPSHOT_PATH, &temp_path)
-            .map_err(|err| utils::tar::failed_to_append_error(&temp_path, err))?;
-
-        let files = Path::new(SNAPSHOT_PATH).join(SNAPSHOT_FILES_PATH);
-
-        for vector_data in self.vector_data.values() {
-            for file in vector_data.vector_index.borrow().files() {
-                utils::tar::append_file_relative_to_base(
-                    &mut builder,
-                    &self.current_path,
-                    &file,
-                    &files,
-                )?;
+        match format {
+            SnapshotFormat::Ancient => {
+                debug_assert!(false, "Unsupported snapshot format: {format:?}");
+                return Err(OperationError::service_error(format!(
+                    "Unsupported snapshot format: {format:?}"
+                )));
             }
-
-            for file in vector_data.vector_storage.borrow().files() {
-                utils::tar::append_file_relative_to_base(
-                    &mut builder,
-                    &self.current_path,
-                    &file,
-                    &files,
-                )?;
+            SnapshotFormat::Regular => {
+                tar.blocking_write_fn(Path::new(&format!("{segment_id}.tar")), |writer| {
+                    let tar = tar_ext::BuilderExt::new_streaming_borrowed(writer);
+                    let tar = tar.descend(Path::new(SNAPSHOT_PATH))?;
+                    snapshot_files(self, temp_path, &tar)
+                })??;
             }
-
-            if let Some(quantized_vectors) = vector_data.quantized_vectors.borrow().as_ref() {
-                for file in quantized_vectors.files() {
-                    utils::tar::append_file_relative_to_base(
-                        &mut builder,
-                        &self.current_path,
-                        &file,
-                        &files,
-                    )?;
-                }
+            SnapshotFormat::Streamable => {
+                let tar = tar.descend(Path::new(&segment_id))?;
+                snapshot_files(self, temp_path, &tar)?;
             }
         }
 
-        for file in self.payload_index.borrow().files() {
-            utils::tar::append_file_relative_to_base(
-                &mut builder,
-                &self.current_path,
-                &file,
-                &files,
-            )?;
-        }
-
-        for file in self.id_tracker.borrow().files() {
-            utils::tar::append_file_relative_to_base(
-                &mut builder,
-                &self.current_path,
-                &file,
-                &files,
-            )?;
-        }
-
-        utils::tar::append_file(
-            &mut builder,
-            &self.current_path.join(SEGMENT_STATE_FILE),
-            &files.join(SEGMENT_STATE_FILE),
-        )?;
-
-        utils::tar::append_file(
-            &mut builder,
-            &self.current_path.join(VERSION_FILE),
-            &files.join(VERSION_FILE),
-        )?;
-
-        builder.finish()?;
-
-        // remove tmp directory in background
-        let _ = thread::spawn(move || {
-            let res = fs::remove_dir_all(&temp_path);
-            if let Err(err) = res {
-                log::error!(
-                    "Failed to remove tmp directory at {}: {err:?}",
-                    temp_path.display(),
-                );
-            }
-        });
-
-        Ok(archive_path)
+        Ok(())
     }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry {
@@ -888,4 +839,79 @@ impl SegmentEntry for Segment {
             }
         }
     }
+}
+
+fn snapshot_files(
+    segment: &Segment,
+    temp_path: &Path,
+    tar: &tar_ext::BuilderExt<impl Write + Seek>,
+) -> OperationResult<()> {
+    // use temp_path for intermediary files
+    let temp_path = temp_path.join(format!("segment-{}", Uuid::new_v4()));
+    let db_backup_path = temp_path.join(DB_BACKUP_PATH);
+    let payload_index_db_backup_path = temp_path.join(PAYLOAD_DB_BACKUP_PATH);
+
+    {
+        let db = segment.database.read();
+        crate::rocksdb_backup::create(&db, &db_backup_path)?;
+    }
+
+    segment
+        .payload_index
+        .borrow()
+        .take_database_snapshot(&payload_index_db_backup_path)?;
+
+    tar.blocking_append_dir_all(&temp_path, Path::new(""))?;
+
+    // remove tmp directory in background
+    let _ = thread::spawn(move || {
+        let res = fs::remove_dir_all(&temp_path);
+        if let Err(err) = res {
+            log::error!(
+                "Failed to remove tmp directory at {}: {err:?}",
+                temp_path.display(),
+            );
+        }
+    });
+
+    let tar = tar.descend(Path::new(SNAPSHOT_FILES_PATH))?;
+    for vector_data in segment.vector_data.values() {
+        for file in vector_data.vector_index.borrow().files() {
+            tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
+        }
+
+        for file in vector_data.vector_storage.borrow().files() {
+            tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
+        }
+
+        if let Some(quantized_vectors) = vector_data.quantized_vectors.borrow().as_ref() {
+            for file in quantized_vectors.files() {
+                tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
+            }
+        }
+    }
+
+    for file in segment.payload_index.borrow().files() {
+        tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
+    }
+
+    for file in segment.payload_storage.borrow().files() {
+        tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
+    }
+
+    for file in segment.id_tracker.borrow().files() {
+        tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
+    }
+
+    tar.blocking_append_file(
+        &segment.current_path.join(SEGMENT_STATE_FILE),
+        Path::new(SEGMENT_STATE_FILE),
+    )?;
+
+    tar.blocking_append_file(
+        &segment.current_path.join(VERSION_FILE),
+        Path::new(VERSION_FILE),
+    )?;
+
+    Ok(())
 }

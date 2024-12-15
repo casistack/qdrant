@@ -6,8 +6,8 @@ use sparse::common::sparse_vector::SparseVector;
 use super::primitive::PrimitiveVectorElement;
 use super::tiny_map;
 use super::vectors::{
-    DenseVector, MultiDenseVectorInternal, TypedMultiDenseVector, TypedMultiDenseVectorRef, Vector,
-    VectorElementType, VectorElementTypeByte, VectorElementTypeHalf, VectorRef,
+    DenseVector, MultiDenseVectorInternal, TypedMultiDenseVector, TypedMultiDenseVectorRef,
+    VectorElementType, VectorElementTypeByte, VectorElementTypeHalf, VectorInternal, VectorRef,
 };
 use crate::common::operation_error::OperationError;
 use crate::spaces::metric::Metric;
@@ -29,7 +29,7 @@ pub enum CowVector<'a> {
     MultiDense(CowMultiVector<'a, VectorElementType>),
 }
 
-impl<'a> Default for CowVector<'a> {
+impl Default for CowVector<'_> {
     fn default() -> Self {
         CowVector::Dense(Cow::Owned(Vec::new()))
     }
@@ -61,16 +61,16 @@ impl<'a, TElement: PrimitiveVectorElement> CowMultiVector<'a, TElement> {
     }
 }
 
-impl<'a> CowVector<'a> {
+impl CowVector<'_> {
     pub fn default_sparse() -> Self {
         CowVector::Sparse(Cow::Owned(SparseVector::default()))
     }
 
-    pub fn to_owned(self) -> Vector {
+    pub fn to_owned(self) -> VectorInternal {
         match self {
-            CowVector::Dense(v) => Vector::Dense(v.into_owned()),
-            CowVector::Sparse(v) => Vector::Sparse(v.into_owned()),
-            CowVector::MultiDense(v) => Vector::MultiDense(v.to_owned()),
+            CowVector::Dense(v) => VectorInternal::Dense(v.into_owned()),
+            CowVector::Sparse(v) => VectorInternal::Sparse(v.into_owned()),
+            CowVector::MultiDense(v) => VectorInternal::MultiDense(v.to_owned()),
         }
     }
 
@@ -92,29 +92,29 @@ impl<'a> From<Cow<'a, [VectorElementType]>> for CowVector<'a> {
     }
 }
 
-impl<'a> From<Vector> for CowVector<'a> {
-    fn from(v: Vector) -> Self {
+impl From<VectorInternal> for CowVector<'_> {
+    fn from(v: VectorInternal) -> Self {
         match v {
-            Vector::Dense(v) => CowVector::Dense(Cow::Owned(v)),
-            Vector::Sparse(v) => CowVector::Sparse(Cow::Owned(v)),
-            Vector::MultiDense(v) => CowVector::MultiDense(CowMultiVector::Owned(v)),
+            VectorInternal::Dense(v) => CowVector::Dense(Cow::Owned(v)),
+            VectorInternal::Sparse(v) => CowVector::Sparse(Cow::Owned(v)),
+            VectorInternal::MultiDense(v) => CowVector::MultiDense(CowMultiVector::Owned(v)),
         }
     }
 }
 
-impl<'a> From<SparseVector> for CowVector<'a> {
+impl From<SparseVector> for CowVector<'_> {
     fn from(v: SparseVector) -> Self {
         CowVector::Sparse(Cow::Owned(v))
     }
 }
 
-impl<'a> From<DenseVector> for CowVector<'a> {
+impl From<DenseVector> for CowVector<'_> {
     fn from(v: DenseVector) -> Self {
         CowVector::Dense(Cow::Owned(v))
     }
 }
 
-impl<'a> From<MultiDenseVectorInternal> for CowVector<'a> {
+impl From<MultiDenseVectorInternal> for CowVector<'_> {
     fn from(v: MultiDenseVectorInternal) -> Self {
         CowVector::MultiDense(CowMultiVector::Owned(v))
     }
@@ -211,7 +211,7 @@ impl<'a> NamedVectors<'a> {
         }
     }
 
-    pub fn from_map(map: HashMap<String, Vector>) -> Self {
+    pub fn from_map(map: HashMap<String, VectorInternal>) -> Self {
         Self {
             map: map
                 .into_iter()
@@ -235,7 +235,7 @@ impl<'a> NamedVectors<'a> {
         }
     }
 
-    pub fn insert(&mut self, name: String, vector: Vector) {
+    pub fn insert(&mut self, name: String, vector: VectorInternal) {
         self.map
             .insert(CowKey::Owned(name), CowVector::from(vector));
     }
@@ -261,7 +261,7 @@ impl<'a> NamedVectors<'a> {
         self.map.iter().map(|(k, _)| k.as_ref())
     }
 
-    pub fn into_owned_map(self) -> HashMap<String, Vector> {
+    pub fn into_owned_map(self) -> HashMap<String, VectorInternal> {
         self.map
             .into_iter()
             .map(|(k, v)| (k.into_owned(), v.to_owned()))

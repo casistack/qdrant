@@ -21,17 +21,16 @@ pub mod verification;
 use std::collections::HashMap;
 
 use segment::json_path::JsonPath;
-use segment::types::{ExtendedPointId, PayloadFieldSchema};
+use segment::types::{ExtendedPointId, PayloadFieldSchema, PointIdType};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
-use validator::Validate;
 
 use crate::hash_ring::{HashRingRouter, ShardIds};
 use crate::shards::shard::{PeerId, ShardId};
 
 pub type ClockToken = u64;
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateIndex {
     pub field_name: JsonPath,
@@ -146,6 +145,43 @@ pub enum CollectionUpdateOperations {
     FieldIndexOperation(FieldIndexOperations),
 }
 
+impl CollectionUpdateOperations {
+    pub fn is_upsert_points(&self) -> bool {
+        matches!(
+            self,
+            Self::PointOperation(point_ops::PointOperations::UpsertPoints(_))
+        )
+    }
+
+    pub fn is_delete_points(&self) -> bool {
+        matches!(
+            self,
+            Self::PointOperation(point_ops::PointOperations::DeletePoints { .. })
+        )
+    }
+
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
+        match self {
+            Self::PointOperation(op) => op.point_ids(),
+            Self::VectorOperation(op) => op.point_ids(),
+            Self::PayloadOperation(op) => op.point_ids(),
+            Self::FieldIndexOperation(_) => None,
+        }
+    }
+
+    pub fn retain_point_ids<F>(&mut self, filter: F)
+    where
+        F: Fn(&PointIdType) -> bool,
+    {
+        match self {
+            Self::PointOperation(op) => op.retain_point_ids(filter),
+            Self::VectorOperation(op) => op.retain_point_ids(filter),
+            Self::PayloadOperation(op) => op.retain_point_ids(filter),
+            Self::FieldIndexOperation(_) => (),
+        }
+    }
+}
+
 /// A mapping of operation to shard.
 /// Is a result of splitting one operation into several shards by corresponding PointIds
 pub enum OperationToShard<O> {
@@ -184,26 +220,6 @@ impl FieldIndexOperations {
         match self {
             FieldIndexOperations::CreateIndex(_) => true,
             FieldIndexOperations::DeleteIndex(_) => false,
-        }
-    }
-}
-
-impl Validate for FieldIndexOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            FieldIndexOperations::CreateIndex(create_index) => create_index.validate(),
-            FieldIndexOperations::DeleteIndex(_) => Ok(()),
-        }
-    }
-}
-
-impl Validate for CollectionUpdateOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            CollectionUpdateOperations::PointOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::VectorOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::PayloadOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::FieldIndexOperation(operation) => operation.validate(),
         }
     }
 }

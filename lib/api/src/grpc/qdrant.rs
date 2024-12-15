@@ -309,7 +309,7 @@ pub struct OptimizersConfigDiff {
     #[prost(uint64, optional, tag = "4")]
     pub max_segment_size: ::core::option::Option<u64>,
     /// Maximum size (in kilobytes) of vectors to store in-memory per segment.
-    /// Segments larger than this threshold will be stored as read-only memmaped file.
+    /// Segments larger than this threshold will be stored as read-only memmapped file.
     ///
     /// Memmap storage is disabled by default, to enable it, set this threshold to a reasonable value.
     ///
@@ -452,6 +452,14 @@ pub struct StrictModeConfig {
     pub search_allow_exact: ::core::option::Option<bool>,
     #[prost(float, optional, tag = "8")]
     pub search_max_oversampling: ::core::option::Option<f32>,
+    #[prost(uint64, optional, tag = "9")]
+    pub upsert_max_batchsize: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "10")]
+    pub max_collection_vector_size_bytes: ::core::option::Option<u64>,
+    #[prost(uint32, optional, tag = "11")]
+    pub read_rate_limit_per_sec: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "12")]
+    pub write_rate_limit_per_sec: ::core::option::Option<u32>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -549,6 +557,9 @@ pub struct UpdateCollection {
     /// New sparse vector parameters
     #[prost(message, optional, tag = "8")]
     pub sparse_vectors_config: ::core::option::Option<SparseVectorConfig>,
+    /// New strict mode configuration
+    #[prost(message, optional, tag = "9")]
+    pub strict_mode_config: ::core::option::Option<StrictModeConfig>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -693,7 +704,11 @@ pub struct FloatIndexParams {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GeoIndexParams {}
+pub struct GeoIndexParams {
+    /// If true - store index on disk.
+    #[prost(bool, optional, tag = "1")]
+    pub on_disk: ::core::option::Option<bool>,
+}
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -710,6 +725,9 @@ pub struct TextIndexParams {
     /// Maximal token length
     #[prost(uint64, optional, tag = "4")]
     pub max_token_len: ::core::option::Option<u64>,
+    /// If true - store index on disk.
+    #[prost(bool, optional, tag = "5")]
+    pub on_disk: ::core::option::Option<bool>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3817,20 +3835,120 @@ pub struct SparseIndices {
     #[prost(uint32, repeated, tag = "1")]
     pub data: ::prost::alloc::vec::Vec<u32>,
 }
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Document {
+    /// Text of the document
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// Model name
+    #[prost(string, tag = "3")]
+    pub model: ::prost::alloc::string::String,
+    /// Model options
+    #[prost(map = "string, message", tag = "4")]
+    pub options: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Image {
+    /// Image data, either base64 encoded or URL
+    #[prost(message, optional, tag = "1")]
+    pub image: ::core::option::Option<Value>,
+    /// Model name
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    /// Model options
+    #[prost(map = "string, message", tag = "3")]
+    pub options: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InferenceObject {
+    /// Object to infer
+    #[prost(message, optional, tag = "1")]
+    pub object: ::core::option::Option<Value>,
+    /// Model name
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    /// Model options
+    #[prost(map = "string, message", tag = "3")]
+    pub options: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+}
 /// Legacy vector format, which determines the vector type by the configuration of its fields.
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Vector {
-    /// Vector data (flatten for multi vectors)
+    /// Vector data (flatten for multi vectors), deprecated
     #[prost(float, repeated, tag = "1")]
     pub data: ::prost::alloc::vec::Vec<f32>,
-    /// Sparse indices for sparse vectors
+    /// Sparse indices for sparse vectors, deprecated
     #[prost(message, optional, tag = "2")]
     pub indices: ::core::option::Option<SparseIndices>,
-    /// Number of vectors per multi vector
+    /// Number of vectors per multi vector, deprecated
     #[prost(uint32, optional, tag = "3")]
     pub vectors_count: ::core::option::Option<u32>,
+    #[prost(oneof = "vector::Vector", tags = "101, 102, 103, 104, 105, 106")]
+    pub vector: ::core::option::Option<vector::Vector>,
+}
+/// Nested message and enum types in `Vector`.
+pub mod vector {
+    #[derive(serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Vector {
+        /// Dense vector
+        #[prost(message, tag = "101")]
+        Dense(super::DenseVector),
+        /// Sparse vector
+        #[prost(message, tag = "102")]
+        Sparse(super::SparseVector),
+        /// Multi dense vector
+        #[prost(message, tag = "103")]
+        MultiDense(super::MultiDenseVector),
+        #[prost(message, tag = "104")]
+        Document(super::Document),
+        #[prost(message, tag = "105")]
+        Image(super::Image),
+        #[prost(message, tag = "106")]
+        Object(super::InferenceObject),
+    }
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VectorOutput {
+    /// Vector data (flatten for multi vectors), deprecated
+    #[prost(float, repeated, tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<f32>,
+    /// Sparse indices for sparse vectors, deprecated
+    #[prost(message, optional, tag = "2")]
+    pub indices: ::core::option::Option<SparseIndices>,
+    /// Number of vectors per multi vector, deprecated
+    #[prost(uint32, optional, tag = "3")]
+    pub vectors_count: ::core::option::Option<u32>,
+    #[prost(oneof = "vector_output::Vector", tags = "101, 102, 103")]
+    pub vector: ::core::option::Option<vector_output::Vector>,
+}
+/// Nested message and enum types in `VectorOutput`.
+pub mod vector_output {
+    #[derive(serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Vector {
+        /// Dense vector
+        #[prost(message, tag = "101")]
+        Dense(super::DenseVector),
+        /// Sparse vector
+        #[prost(message, tag = "102")]
+        Sparse(super::SparseVector),
+        /// Multi dense vector
+        #[prost(message, tag = "103")]
+        MultiDense(super::MultiDenseVector),
+    }
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3860,7 +3978,7 @@ pub struct MultiDenseVector {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct VectorInput {
-    #[prost(oneof = "vector_input::Variant", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "vector_input::Variant", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub variant: ::core::option::Option<vector_input::Variant>,
 }
 /// Nested message and enum types in `VectorInput`.
@@ -3877,6 +3995,12 @@ pub mod vector_input {
         Sparse(super::SparseVector),
         #[prost(message, tag = "4")]
         MultiDense(super::MultiDenseVector),
+        #[prost(message, tag = "5")]
+        Document(super::Document),
+        #[prost(message, tag = "6")]
+        Image(super::Image),
+        #[prost(message, tag = "7")]
+        Object(super::InferenceObject),
     }
 }
 #[derive(serde::Serialize)]
@@ -4185,6 +4309,16 @@ pub struct NamedVectors {
     #[validate(nested)]
     pub vectors: ::std::collections::HashMap<::prost::alloc::string::String, Vector>,
 }
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NamedVectorsOutput {
+    #[prost(map = "string, message", tag = "1")]
+    pub vectors: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        VectorOutput,
+    >,
+}
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -4204,6 +4338,25 @@ pub mod vectors {
         Vector(super::Vector),
         #[prost(message, tag = "2")]
         Vectors(super::NamedVectors),
+    }
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VectorsOutput {
+    #[prost(oneof = "vectors_output::VectorsOptions", tags = "1, 2")]
+    pub vectors_options: ::core::option::Option<vectors_output::VectorsOptions>,
+}
+/// Nested message and enum types in `VectorsOutput`.
+pub mod vectors_output {
+    #[derive(serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum VectorsOptions {
+        #[prost(message, tag = "1")]
+        Vector(super::VectorOutput),
+        #[prost(message, tag = "2")]
+        Vectors(super::NamedVectorsOutput),
     }
 }
 #[derive(serde::Serialize)]
@@ -5073,6 +5226,7 @@ pub struct FacetCounts {
     pub key: ::prost::alloc::string::String,
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[prost(message, optional, tag = "3")]
+    #[validate(nested)]
     pub filter: ::core::option::Option<Filter>,
     /// Max number of facets. Default is 10.
     #[prost(uint64, optional, tag = "4")]
@@ -5095,7 +5249,7 @@ pub struct FacetCounts {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FacetValue {
-    #[prost(oneof = "facet_value::Variant", tags = "1, 2")]
+    #[prost(oneof = "facet_value::Variant", tags = "1, 2, 3")]
     pub variant: ::core::option::Option<facet_value::Variant>,
 }
 /// Nested message and enum types in `FacetValue`.
@@ -5110,6 +5264,9 @@ pub mod facet_value {
         /// Integer value from the facet
         #[prost(int64, tag = "2")]
         IntegerValue(i64),
+        /// Boolean value from the facet
+        #[prost(bool, tag = "3")]
+        BoolValue(bool),
     }
 }
 #[derive(serde::Serialize)]
@@ -5122,6 +5279,80 @@ pub struct FacetHit {
     /// Number of points with this value
     #[prost(uint64, tag = "2")]
     pub count: u64,
+}
+#[derive(validator::Validate)]
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchMatrixPoints {
+    /// Name of the collection
+    #[prost(string, tag = "1")]
+    #[validate(length(min = 1, max = 255))]
+    pub collection_name: ::prost::alloc::string::String,
+    /// Filter conditions - return only those points that satisfy the specified conditions.
+    #[prost(message, optional, tag = "2")]
+    #[validate(nested)]
+    pub filter: ::core::option::Option<Filter>,
+    /// How many points to select and search within. Default is 10.
+    #[prost(uint64, optional, tag = "3")]
+    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_2"))]
+    pub sample: ::core::option::Option<u64>,
+    /// How many neighbours per sample to find. Default is 3.
+    #[prost(uint64, optional, tag = "4")]
+    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    pub limit: ::core::option::Option<u64>,
+    /// Define which vector to use for querying. If missing, the default vector is is used.
+    #[prost(string, optional, tag = "5")]
+    pub using: ::core::option::Option<::prost::alloc::string::String>,
+    /// If set, overrides global timeout setting for this request. Unit is seconds.
+    #[prost(uint64, optional, tag = "6")]
+    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    pub timeout: ::core::option::Option<u64>,
+    /// Options for specifying read consistency guarantees
+    #[prost(message, optional, tag = "7")]
+    pub read_consistency: ::core::option::Option<ReadConsistency>,
+    /// Specify in which shards to look for the points, if not specified - look in all shards
+    #[prost(message, optional, tag = "8")]
+    pub shard_key_selector: ::core::option::Option<ShardKeySelector>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchMatrixPairs {
+    /// List of pairs of points with scores
+    #[prost(message, repeated, tag = "1")]
+    pub pairs: ::prost::alloc::vec::Vec<SearchMatrixPair>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchMatrixPair {
+    /// first id of the pair
+    #[prost(message, optional, tag = "1")]
+    pub a: ::core::option::Option<PointId>,
+    /// second id of the pair
+    #[prost(message, optional, tag = "2")]
+    pub b: ::core::option::Option<PointId>,
+    /// score of the pair
+    #[prost(float, tag = "3")]
+    pub score: f32,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchMatrixOffsets {
+    /// Row indices of the matrix
+    #[prost(uint64, repeated, tag = "1")]
+    pub offsets_row: ::prost::alloc::vec::Vec<u64>,
+    /// Column indices of the matrix
+    #[prost(uint64, repeated, tag = "2")]
+    pub offsets_col: ::prost::alloc::vec::Vec<u64>,
+    /// Scores associated with matrix coordinates
+    #[prost(float, repeated, tag = "3")]
+    pub scores: ::prost::alloc::vec::Vec<f32>,
+    /// Ids of the points in order
+    #[prost(message, repeated, tag = "4")]
+    pub ids: ::prost::alloc::vec::Vec<PointId>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5347,7 +5578,7 @@ pub struct ScoredPoint {
     pub version: u64,
     /// Vectors to search
     #[prost(message, optional, tag = "6")]
-    pub vectors: ::core::option::Option<Vectors>,
+    pub vectors: ::core::option::Option<VectorsOutput>,
     /// Shard key
     #[prost(message, optional, tag = "7")]
     pub shard_key: ::core::option::Option<ShardKey>,
@@ -5410,6 +5641,8 @@ pub struct SearchResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5420,6 +5653,8 @@ pub struct QueryResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5430,6 +5665,8 @@ pub struct QueryBatchResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5440,6 +5677,8 @@ pub struct QueryGroupsResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5457,6 +5696,8 @@ pub struct SearchBatchResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5467,6 +5708,8 @@ pub struct SearchGroupsResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5477,6 +5720,8 @@ pub struct CountResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5507,7 +5752,7 @@ pub struct RetrievedPoint {
     #[prost(map = "string, message", tag = "2")]
     pub payload: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
     #[prost(message, optional, tag = "4")]
-    pub vectors: ::core::option::Option<Vectors>,
+    pub vectors: ::core::option::Option<VectorsOutput>,
     /// Shard key
     #[prost(message, optional, tag = "5")]
     pub shard_key: ::core::option::Option<ShardKey>,
@@ -5534,6 +5779,8 @@ pub struct RecommendResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5544,6 +5791,8 @@ pub struct RecommendBatchResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5554,6 +5803,8 @@ pub struct DiscoverResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5564,6 +5815,8 @@ pub struct DiscoverBatchResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5574,6 +5827,8 @@ pub struct RecommendGroupsResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5594,6 +5849,30 @@ pub struct FacetResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchMatrixPairsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub result: ::core::option::Option<SearchMatrixPairs>,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchMatrixOffsetsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub result: ::core::option::Option<SearchMatrixOffsets>,
+    /// Time spent to process
+    #[prost(double, tag = "2")]
+    pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -5630,7 +5909,7 @@ pub struct MinShould {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Condition {
-    #[prost(oneof = "condition::ConditionOneOf", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "condition::ConditionOneOf", tags = "1, 2, 3, 4, 5, 6, 7")]
     #[validate(nested)]
     pub condition_one_of: ::core::option::Option<condition::ConditionOneOf>,
 }
@@ -5652,6 +5931,8 @@ pub mod condition {
         IsNull(super::IsNullCondition),
         #[prost(message, tag = "6")]
         Nested(super::NestedCondition),
+        #[prost(message, tag = "7")]
+        HasVector(super::HasVectorCondition),
     }
 }
 #[derive(serde::Serialize)]
@@ -5674,6 +5955,13 @@ pub struct IsNullCondition {
 pub struct HasIdCondition {
     #[prost(message, repeated, tag = "1")]
     pub has_id: ::prost::alloc::vec::Vec<PointId>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HasVectorCondition {
+    #[prost(string, tag = "1")]
+    pub has_vector: ::prost::alloc::string::String,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -5912,6 +6200,13 @@ pub struct GeoPoint {
     pub lon: f64,
     #[prost(double, tag = "2")]
     pub lat: f64,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HardwareUsage {
+    #[prost(uint64, tag = "1")]
+    pub cpu: u64,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -6896,6 +7191,58 @@ pub mod points_client {
             req.extensions_mut().insert(GrpcMethod::new("qdrant.Points", "Facet"));
             self.inner.unary(req, path, codec).await
         }
+        /// Compute distance matrix for sampled points with a pair based output format
+        pub async fn search_matrix_pairs(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SearchMatrixPoints>,
+        ) -> std::result::Result<
+            tonic::Response<super::SearchMatrixPairsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.Points/SearchMatrixPairs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("qdrant.Points", "SearchMatrixPairs"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Compute distance matrix for sampled points with an offset based output format
+        pub async fn search_matrix_offsets(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SearchMatrixPoints>,
+        ) -> std::result::Result<
+            tonic::Response<super::SearchMatrixOffsetsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/qdrant.Points/SearchMatrixOffsets",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("qdrant.Points", "SearchMatrixOffsets"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -7109,6 +7456,22 @@ pub mod points_server {
             &self,
             request: tonic::Request<super::FacetCounts>,
         ) -> std::result::Result<tonic::Response<super::FacetResponse>, tonic::Status>;
+        /// Compute distance matrix for sampled points with a pair based output format
+        async fn search_matrix_pairs(
+            &self,
+            request: tonic::Request<super::SearchMatrixPoints>,
+        ) -> std::result::Result<
+            tonic::Response<super::SearchMatrixPairsResponse>,
+            tonic::Status,
+        >;
+        /// Compute distance matrix for sampled points with an offset based output format
+        async fn search_matrix_offsets(
+            &self,
+            request: tonic::Request<super::SearchMatrixPoints>,
+        ) -> std::result::Result<
+            tonic::Response<super::SearchMatrixOffsetsResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct PointsServer<T: Points> {
@@ -8351,6 +8714,98 @@ pub mod points_server {
                     };
                     Box::pin(fut)
                 }
+                "/qdrant.Points/SearchMatrixPairs" => {
+                    #[allow(non_camel_case_types)]
+                    struct SearchMatrixPairsSvc<T: Points>(pub Arc<T>);
+                    impl<
+                        T: Points,
+                    > tonic::server::UnaryService<super::SearchMatrixPoints>
+                    for SearchMatrixPairsSvc<T> {
+                        type Response = super::SearchMatrixPairsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SearchMatrixPoints>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Points>::search_matrix_pairs(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = SearchMatrixPairsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/qdrant.Points/SearchMatrixOffsets" => {
+                    #[allow(non_camel_case_types)]
+                    struct SearchMatrixOffsetsSvc<T: Points>(pub Arc<T>);
+                    impl<
+                        T: Points,
+                    > tonic::server::UnaryService<super::SearchMatrixPoints>
+                    for SearchMatrixOffsetsSvc<T> {
+                        type Response = super::SearchMatrixOffsetsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SearchMatrixPoints>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Points>::search_matrix_offsets(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = SearchMatrixOffsetsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 _ => {
                     Box::pin(async move {
                         Ok(
@@ -8978,6 +9433,8 @@ pub struct QueryBatchResponseInternal {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "5")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[derive(validator::Validate)]
@@ -9005,7 +9462,7 @@ pub struct FacetCountsInternal {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FacetValueInternal {
-    #[prost(oneof = "facet_value_internal::Variant", tags = "1, 2, 3")]
+    #[prost(oneof = "facet_value_internal::Variant", tags = "1, 2, 3, 4")]
     pub variant: ::core::option::Option<facet_value_internal::Variant>,
 }
 /// Nested message and enum types in `FacetValueInternal`.
@@ -9020,6 +9477,8 @@ pub mod facet_value_internal {
         IntegerValue(i64),
         #[prost(bytes, tag = "3")]
         UuidValue(::prost::alloc::vec::Vec<u8>),
+        #[prost(bool, tag = "4")]
+        BoolValue(bool),
     }
 }
 #[derive(serde::Serialize)]

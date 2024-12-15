@@ -17,10 +17,12 @@ testing = []
 
 [dependencies]
 num_cpus = "1.16"
-ordered-float = "4.2"
+ordered-float = { workspace = true }
 ph = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+tap = { workspace = true }
+tar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 validator = { workspace = true }
@@ -28,14 +30,19 @@ lazy_static = "1.5.0"
 memmap2 = { workspace = true }
 semver = { workspace = true }
 zerocopy = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 common = { path = ".", features = ["testing"] }
-criterion = "0.5"
+criterion = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 thiserror = { workspace = true }
-thread-priority = "1.1"
+thread-priority = "1.2"
+
+[[bench]]
+name = "bitpacking"
+harness = false
 
 [[bench]]
 name = "mmap_hashmap"

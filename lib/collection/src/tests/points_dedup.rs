@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use api::rest::{OrderByInterface, VectorStruct};
+use api::rest::OrderByInterface;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::cpu::CpuBudget;
 use rand::{thread_rng, Rng};
 use segment::data_types::vectors::NamedVectorStruct;
@@ -13,8 +14,10 @@ use serde_json::{Map, Value};
 use tempfile::Builder;
 
 use crate::collection::{Collection, RequestShardTransfer};
-use crate::config::{CollectionConfig, CollectionParams, WalConfig};
-use crate::operations::point_ops::{PointInsertOperationsInternal, PointOperations, PointStruct};
+use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use crate::operations::point_ops::{
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+};
 use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
@@ -26,7 +29,7 @@ use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
-use crate::shards::replica_set::{AbortShardTransfer, ChangePeerState, ReplicaState};
+use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
 use crate::shards::shard::{PeerId, ShardId};
 
 const DIM: u64 = 4;
@@ -49,13 +52,14 @@ async fn fixture() -> Collection {
         ..CollectionParams::empty()
     };
 
-    let config = CollectionConfig {
+    let config = CollectionConfigInternal {
         params: collection_params,
         optimizer_config: OptimizersConfig::fixture(),
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
+        uuid: None,
     };
 
     let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
@@ -105,24 +109,24 @@ async fn fixture() -> Collection {
     for (shard_id, shard) in collection.shards_holder().write().await.get_shards() {
         let op = OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
-                PointStruct {
-                    id: u64::from(*shard_id).into(),
-                    vector: VectorStruct::Single(
+                PointStructPersisted {
+                    id: u64::from(shard_id).into(),
+                    vector: VectorStructPersisted::Single(
                         (0..DIM).map(|_| rng.gen_range(0.0..1.0)).collect(),
                     ),
                     payload: Some(Payload(Map::from_iter([(
                         "num".to_string(),
-                        Value::from(-(*shard_id as i32)),
+                        Value::from(-(shard_id as i32)),
                     )]))),
                 },
-                PointStruct {
+                PointStructPersisted {
                     id: DUPLICATE_POINT_ID,
-                    vector: VectorStruct::Single(
+                    vector: VectorStructPersisted::Single(
                         (0..DIM).map(|_| rng.gen_range(0.0..1.0)).collect(),
                     ),
                     payload: Some(Payload(Map::from_iter([(
                         "num".to_string(),
-                        Value::from(100 - *shard_id as i32),
+                        Value::from(100 - shard_id as i32),
                     )]))),
                 },
             ])),
@@ -136,7 +140,7 @@ async fn fixture() -> Collection {
     // Activate all shards
     for shard_id in 0..SHARD_COUNT {
         collection
-            .set_shard_replica_state(shard_id as ShardId, PEER_ID, ReplicaState::Active, None)
+            .set_shard_replica_state(shard_id, PEER_ID, ReplicaState::Active, None)
             .await
             .expect("failed to active shard");
     }
@@ -238,6 +242,7 @@ async fn test_retrieve_dedup() {
 async fn test_search_dedup() {
     let collection = fixture().await;
 
+    let hw_acc = HwMeasurementAcc::new();
     let points = collection
         .search(
             CoreSearchRequest {
@@ -256,10 +261,12 @@ async fn test_search_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await
         .expect("failed to search");
     assert!(!points.is_empty(), "expected some points");
+    hw_acc.discard();
 
     let mut seen = HashSet::new();
     for point_id in points.iter().map(|point| point.id) {
@@ -270,8 +277,8 @@ async fn test_search_dedup() {
     }
 }
 
-pub fn dummy_on_replica_failure() -> ChangePeerState {
-    Arc::new(move |_peer_id, _shard_id| {})
+pub fn dummy_on_replica_failure() -> ChangePeerFromState {
+    Arc::new(move |_peer_id, _shard_id, _from_state| {})
 }
 
 pub fn dummy_request_shard_transfer() -> RequestShardTransfer {

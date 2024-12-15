@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::rest::{SearchGroupsRequestInternal, ShardKeySelector};
+use api::rest::schema::{PointInsertOperations, PointsBatch, PointsList};
+use api::rest::{SearchGroupsRequestInternal, ShardKeySelector, UpdateVectors};
 use collection::collection::distance_matrix::{
     CollectionSearchMatrixRequest, CollectionSearchMatrixResponse,
 };
+use collection::collection::Collection;
 use collection::common::batching::batch_requests;
 use collection::grouping::group_by::GroupRequest;
 use collection::operations::consistency_params::ReadConsistency;
@@ -12,28 +14,30 @@ use collection::operations::payload_ops::{
     DeletePayload, DeletePayloadOp, PayloadOps, SetPayload, SetPayloadOp,
 };
 use collection::operations::point_ops::{
-    FilterSelector, PointIdsList, PointInsertOperations, PointOperations, PointsSelector,
+    FilterSelector, PointIdsList, PointInsertOperationsInternal, PointOperations, PointsSelector,
     WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
-    CoreSearchRequest, CoreSearchRequestBatch, CountRequestInternal, CountResult,
+    CollectionError, CoreSearchRequest, CoreSearchRequestBatch, CountRequestInternal, CountResult,
     DiscoverRequestBatch, GroupsResult, PointRequestInternal, RecommendGroupsRequestInternal,
-    Record, ScrollRequestInternal, ScrollResult, UpdateResult,
+    RecordInternal, ScrollRequestInternal, ScrollResult, UpdateResult,
 };
 use collection::operations::universal_query::collection_query::{
     CollectionQueryGroupsRequest, CollectionQueryRequest,
 };
-use collection::operations::vector_ops::{
-    DeleteVectors, UpdateVectors, UpdateVectorsOp, VectorOperations,
+use collection::operations::vector_ops::{DeleteVectors, UpdateVectorsOp, VectorOperations};
+use collection::operations::verification::{
+    new_unchecked_verification_pass, StrictModeVerification,
 };
 use collection::operations::{
     ClockTag, CollectionUpdateOperations, CreateIndex, FieldIndexOperations, OperationWithClockTag,
 };
 use collection::shards::shard::ShardId;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use schemars::JsonSchema;
 use segment::json_path::JsonPath;
-use segment::types::{PayloadFieldSchema, PayloadKeyType, ScoredPoint};
+use segment::types::{PayloadFieldSchema, PayloadKeyType, ScoredPoint, StrictModeConfig};
 use serde::{Deserialize, Serialize};
 use storage::content_manager::collection_meta_ops::{
     CollectionMetaOperations, CreatePayloadIndex, DropPayloadIndex,
@@ -43,6 +47,11 @@ use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 use validator::Validate;
+
+use crate::common::inference::service::InferenceType;
+use crate::common::inference::update_requests::{
+    convert_batch, convert_point_struct, convert_point_vectors,
+};
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate)]
 pub struct CreateFieldIndex {
@@ -133,6 +142,85 @@ impl Validate for UpdateOperation {
     }
 }
 
+impl StrictModeVerification for UpdateOperation {
+    fn query_limit(&self) -> Option<usize> {
+        None
+    }
+
+    fn indexed_filter_read(&self) -> Option<&segment::types::Filter> {
+        None
+    }
+
+    fn indexed_filter_write(&self) -> Option<&segment::types::Filter> {
+        None
+    }
+
+    fn request_exact(&self) -> Option<bool> {
+        None
+    }
+
+    fn request_search_params(&self) -> Option<&segment::types::SearchParams> {
+        None
+    }
+
+    async fn check_strict_mode(
+        &self,
+        collection: &Collection,
+        strict_mode_config: &StrictModeConfig,
+    ) -> Result<(), CollectionError> {
+        match self {
+            UpdateOperation::Delete(delete_op) => {
+                delete_op
+                    .delete
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::SetPayload(set_payload) => {
+                set_payload
+                    .set_payload
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::OverwritePayload(overwrite_payload) => {
+                overwrite_payload
+                    .overwrite_payload
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::DeletePayload(delete_payload) => {
+                delete_payload
+                    .delete_payload
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::ClearPayload(clear_payload) => {
+                clear_payload
+                    .clear_payload
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::DeleteVectors(delete_op) => {
+                delete_op
+                    .delete_vectors
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::Upsert(upsert_op) => {
+                upsert_op
+                    .upsert
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+            UpdateOperation::UpdateVectors(update) => {
+                update
+                    .update_vectors
+                    .check_strict_mode(collection, strict_mode_config)
+                    .await
+            }
+        }
+    }
+}
+
 /// Converts a pair of parameters into a shard selector
 /// suitable for update operations.
 ///
@@ -175,7 +263,19 @@ pub async fn do_upsert_points(
     ordering: WriteOrdering,
     access: Access,
 ) -> Result<UpdateResult, StorageError> {
-    let (shard_key, operation) = operation.decompose();
+    let (shard_key, operation) = match operation {
+        PointInsertOperations::PointsBatch(PointsBatch { batch, shard_key }) => (
+            shard_key,
+            PointInsertOperationsInternal::PointsBatch(convert_batch(batch).await?),
+        ),
+        PointInsertOperations::PointsList(PointsList { points, shard_key }) => (
+            shard_key,
+            PointInsertOperationsInternal::PointsList(
+                convert_point_struct(points, InferenceType::Update).await?,
+            ),
+        ),
+    };
+
     let collection_operation =
         CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(operation));
 
@@ -238,8 +338,12 @@ pub async fn do_update_vectors(
 ) -> Result<UpdateResult, StorageError> {
     let UpdateVectors { points, shard_key } = operation;
 
+    let persisted_points = convert_point_vectors(points, InferenceType::Update).await?;
+
     let collection_operation = CollectionUpdateOperations::VectorOperation(
-        VectorOperations::UpdateVectors(UpdateVectorsOp { points }),
+        VectorOperations::UpdateVectors(UpdateVectorsOp {
+            points: persisted_points,
+        }),
     );
 
     let shard_selector = get_shard_selector_for_update(shard_selection, shard_key);
@@ -659,7 +763,10 @@ pub async fn do_create_index(
     // Default consensus timeout will be used
     let wait_timeout = None; // ToDo: make it configurable
 
-    let toc = dispatcher.toc(&access).clone();
+    // Nothing to verify here.
+    let pass = new_unchecked_verification_pass();
+
+    let toc = dispatcher.toc(&access, &pass).clone();
 
     // TODO: Is `submit_collection_meta_op` cancel-safe!? Should be, I think?.. 🤔
     dispatcher
@@ -735,7 +842,10 @@ pub async fn do_delete_index(
     // Default consensus timeout will be used
     let wait_timeout = None; // ToDo: make it configurable
 
-    let toc = dispatcher.toc(&access).clone();
+    // Nothing to verify here.
+    let pass = new_unchecked_verification_pass();
+
+    let toc = dispatcher.toc(&access, &pass).clone();
 
     // TODO: Is `submit_collection_meta_op` cancel-safe!? Should be, I think?.. 🤔
     dispatcher
@@ -754,6 +864,7 @@ pub async fn do_delete_index(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_core_search_points(
     toc: &TableOfContent,
     collection_name: &str,
@@ -762,6 +873,7 @@ pub async fn do_core_search_points(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<Vec<ScoredPoint>, StorageError> {
     let batch_res = do_core_search_batch_points(
         toc,
@@ -773,6 +885,7 @@ pub async fn do_core_search_points(
         shard_selection,
         access,
         timeout,
+        hw_measurement_acc,
     )
     .await?;
     batch_res
@@ -788,6 +901,7 @@ pub async fn do_search_batch_points(
     read_consistency: Option<ReadConsistency>,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     let requests = batch_requests::<
         (CoreSearchRequest, ShardSelectorInternal),
@@ -817,6 +931,7 @@ pub async fn do_search_batch_points(
                 shard_selector,
                 access.clone(),
                 timeout,
+                hw_measurement_acc,
             );
             res.push(req);
             Ok(())
@@ -828,6 +943,7 @@ pub async fn do_search_batch_points(
     Ok(flatten_results)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_core_search_batch_points(
     toc: &TableOfContent,
     collection_name: &str,
@@ -836,6 +952,7 @@ pub async fn do_core_search_batch_points(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     toc.core_search_batch(
         collection_name,
@@ -844,10 +961,12 @@ pub async fn do_core_search_batch_points(
         shard_selection,
         access,
         timeout,
+        hw_measurement_acc,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_search_point_groups(
     toc: &TableOfContent,
     collection_name: &str,
@@ -856,6 +975,7 @@ pub async fn do_search_point_groups(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<GroupsResult, StorageError> {
     toc.group(
         collection_name,
@@ -864,10 +984,12 @@ pub async fn do_search_point_groups(
         shard_selection,
         access,
         timeout,
+        hw_measurement_acc,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_recommend_point_groups(
     toc: &TableOfContent,
     collection_name: &str,
@@ -876,6 +998,7 @@ pub async fn do_recommend_point_groups(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<GroupsResult, StorageError> {
     toc.group(
         collection_name,
@@ -884,6 +1007,7 @@ pub async fn do_recommend_point_groups(
         shard_selection,
         access,
         timeout,
+        hw_measurement_acc,
     )
     .await
 }
@@ -895,6 +1019,7 @@ pub async fn do_discover_batch_points(
     read_consistency: Option<ReadConsistency>,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     let requests = request
         .searches
@@ -909,10 +1034,18 @@ pub async fn do_discover_batch_points(
         })
         .collect();
 
-    toc.discover_batch(collection_name, requests, read_consistency, access, timeout)
-        .await
+    toc.discover_batch(
+        collection_name,
+        requests,
+        read_consistency,
+        access,
+        timeout,
+        hw_measurement_acc,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_count_points(
     toc: &TableOfContent,
     collection_name: &str,
@@ -921,6 +1054,7 @@ pub async fn do_count_points(
     timeout: Option<Duration>,
     shard_selection: ShardSelectorInternal,
     access: Access,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<CountResult, StorageError> {
     toc.count(
         collection_name,
@@ -929,6 +1063,7 @@ pub async fn do_count_points(
         timeout,
         shard_selection,
         access,
+        hw_measurement_acc,
     )
     .await
 }
@@ -941,7 +1076,7 @@ pub async fn do_get_points(
     timeout: Option<Duration>,
     shard_selection: ShardSelectorInternal,
     access: Access,
-) -> Result<Vec<Record>, StorageError> {
+) -> Result<Vec<RecordInternal>, StorageError> {
     toc.retrieve(
         collection_name,
         request,
@@ -973,6 +1108,7 @@ pub async fn do_scroll_points(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_query_points(
     toc: &TableOfContent,
     collection_name: &str,
@@ -981,10 +1117,18 @@ pub async fn do_query_points(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<Vec<ScoredPoint>, StorageError> {
     let requests = vec![(request, shard_selection)];
     let batch_res = toc
-        .query_batch(collection_name, requests, read_consistency, access, timeout)
+        .query_batch(
+            collection_name,
+            requests,
+            read_consistency,
+            access,
+            timeout,
+            hw_measurement_acc,
+        )
         .await?;
     batch_res
         .into_iter()
@@ -992,6 +1136,7 @@ pub async fn do_query_points(
         .ok_or_else(|| StorageError::service_error("Empty query result"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_query_batch_points(
     toc: &TableOfContent,
     collection_name: &str,
@@ -999,11 +1144,20 @@ pub async fn do_query_batch_points(
     read_consistency: Option<ReadConsistency>,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
-    toc.query_batch(collection_name, requests, read_consistency, access, timeout)
-        .await
+    toc.query_batch(
+        collection_name,
+        requests,
+        read_consistency,
+        access,
+        timeout,
+        hw_measurement_acc,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_query_point_groups(
     toc: &TableOfContent,
     collection_name: &str,
@@ -1012,6 +1166,7 @@ pub async fn do_query_point_groups(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<GroupsResult, StorageError> {
     toc.group(
         collection_name,
@@ -1020,10 +1175,12 @@ pub async fn do_query_point_groups(
         shard_selection,
         access,
         timeout,
+        hw_measurement_acc,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_search_points_matrix(
     toc: &TableOfContent,
     collection_name: &str,
@@ -1032,6 +1189,7 @@ pub async fn do_search_points_matrix(
     shard_selection: ShardSelectorInternal,
     access: Access,
     timeout: Option<Duration>,
+    hw_measurement_acc: &HwMeasurementAcc,
 ) -> Result<CollectionSearchMatrixResponse, StorageError> {
     toc.search_points_matrix(
         collection_name,
@@ -1040,6 +1198,7 @@ pub async fn do_search_points_matrix(
         shard_selection,
         access,
         timeout,
+        hw_measurement_acc,
     )
     .await
 }

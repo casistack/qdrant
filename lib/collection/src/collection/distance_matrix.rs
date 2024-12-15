@@ -5,15 +5,20 @@ use api::rest::{
     SearchMatrixOffsetsResponse, SearchMatrixPair, SearchMatrixPairsResponse,
     SearchMatrixRequestInternal,
 };
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::data_types::vectors::{NamedVectorStruct, DEFAULT_VECTOR_NAME};
-use segment::types::{Condition, Filter, HasIdCondition, PointIdType, ScoredPoint, WithVector};
+use segment::types::{
+    Condition, Filter, HasIdCondition, HasVectorCondition, PointIdType, ScoredPoint, WithVector,
+};
 
 use crate::collection::Collection;
 use crate::operations::consistency_params::ReadConsistency;
 use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{CollectionResult, CoreSearchRequest, CoreSearchRequestBatch};
-use crate::operations::universal_query::shard_query::{Sample, ScoringQuery, ShardQueryRequest};
+use crate::operations::universal_query::shard_query::{
+    SampleInternal, ScoringQuery, ShardQueryRequest,
+};
 
 #[derive(Debug, Default)]
 pub struct CollectionSearchMatrixResponse {
@@ -29,6 +34,11 @@ pub struct CollectionSearchMatrixRequest {
     pub using: String,
 }
 
+impl CollectionSearchMatrixRequest {
+    pub const DEFAULT_LIMIT_PER_SAMPLE: usize = 3;
+    pub const DEFAULT_SAMPLE: usize = 10;
+}
+
 impl From<SearchMatrixRequestInternal> for CollectionSearchMatrixRequest {
     fn from(request: SearchMatrixRequestInternal) -> Self {
         let SearchMatrixRequestInternal {
@@ -38,8 +48,9 @@ impl From<SearchMatrixRequestInternal> for CollectionSearchMatrixRequest {
             using,
         } = request;
         Self {
-            sample_size: sample,
-            limit_per_sample: limit,
+            sample_size: sample.unwrap_or(CollectionSearchMatrixRequest::DEFAULT_SAMPLE),
+            limit_per_sample: limit
+                .unwrap_or(CollectionSearchMatrixRequest::DEFAULT_LIMIT_PER_SAMPLE),
             filter,
             using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
         }
@@ -66,8 +77,8 @@ impl From<CollectionSearchMatrixResponse> for SearchMatrixOffsetsResponse {
             }
         }
         let scores = nearests
-            .iter()
-            .flat_map(|row| row.iter().map(|p| p.score))
+            .into_iter()
+            .flat_map(|row| row.into_iter().map(|p| p.score))
             .collect();
         Self {
             offsets_row,
@@ -85,7 +96,8 @@ impl From<CollectionSearchMatrixResponse> for SearchMatrixPairsResponse {
             nearests,
         } = response;
 
-        let mut pairs = vec![];
+        let pairs_len = nearests.iter().map(|n| n.len()).sum();
+        let mut pairs = Vec::with_capacity(pairs_len);
 
         for (a, scored_points) in sample_ids.into_iter().zip(nearests.into_iter()) {
             for scored_point in scored_points {
@@ -101,8 +113,25 @@ impl From<CollectionSearchMatrixResponse> for SearchMatrixPairsResponse {
     }
 }
 
-// TODO introduce HasVector condition to avoid iterative sampling
-const SAMPLING_TRIES: usize = 3;
+impl From<CollectionSearchMatrixResponse> for api::grpc::qdrant::SearchMatrixPairs {
+    fn from(response: CollectionSearchMatrixResponse) -> Self {
+        let rest_result = SearchMatrixPairsResponse::from(response);
+        let pairs = rest_result.pairs.into_iter().map(From::from).collect();
+        Self { pairs }
+    }
+}
+
+impl From<CollectionSearchMatrixResponse> for api::grpc::qdrant::SearchMatrixOffsets {
+    fn from(response: CollectionSearchMatrixResponse) -> Self {
+        let rest_result = SearchMatrixOffsetsResponse::from(response);
+        Self {
+            offsets_row: rest_result.offsets_row,
+            offsets_col: rest_result.offsets_col,
+            scores: rest_result.scores,
+            ids: rest_result.ids.into_iter().map(From::from).collect(),
+        }
+    }
+}
 
 impl Collection {
     pub async fn search_points_matrix(
@@ -111,7 +140,9 @@ impl Collection {
         shard_selection: ShardSelectorInternal,
         read_consistency: Option<ReadConsistency>,
         timeout: Option<Duration>,
+        hw_measurement_acc: &HwMeasurementAcc,
     ) -> CollectionResult<CollectionSearchMatrixResponse> {
+        let start = std::time::Instant::now();
         let CollectionSearchMatrixRequest {
             sample_size,
             limit_per_sample,
@@ -122,94 +153,78 @@ impl Collection {
             return Ok(Default::default());
         }
 
-        let mut sampled_points: Vec<(_, _)> = Vec::with_capacity(sample_size);
+        // make sure the vector is present in the point
+        let has_vector = Filter::new_must(Condition::HasVector(HasVectorCondition::from(
+            using.clone(),
+        )));
 
-        // Sampling multiple times because we might not have enough points with the named vector
-        for _ in 0..SAMPLING_TRIES {
-            let filter = filter.clone();
-            // check if we have enough samples with right named vector
-            if sampled_points.len() >= sample_size {
-                break;
-            }
+        // merge user's filter with the has_vector filter
+        let filter = Some(
+            filter
+                .map(|filter| filter.merge(&has_vector))
+                .unwrap_or(has_vector),
+        );
 
-            // exclude already sampled points
-            let exclude_ids: HashSet<_> = sampled_points.iter().map(|(id, _)| *id).collect();
-            let filter = if exclude_ids.is_empty() {
-                filter
-            } else {
-                let exclude_ids = Filter::new_must_not(Condition::HasId(exclude_ids.into()));
-                Some(
-                    filter
-                        .map(|filter| filter.merge(&exclude_ids))
-                        .unwrap_or(exclude_ids),
-                )
-            };
+        // sample random points
+        let sampling_query = ShardQueryRequest {
+            prefetches: vec![],
+            query: Some(ScoringQuery::Sample(SampleInternal::Random)),
+            filter,
+            score_threshold: None,
+            limit: sample_size,
+            offset: 0,
+            params: None,
+            with_vector: WithVector::Selector(vec![using.clone()]), // retrieve the vector
+            with_payload: Default::default(),
+        };
 
-            // Sample points with query API
-            let sampling_query = ShardQueryRequest {
-                prefetches: vec![],
-                query: Some(ScoringQuery::Sample(Sample::Random)),
-                filter,
-                score_threshold: None,
-                limit: sample_size,
-                offset: 0,
-                params: None,
-                with_vector: WithVector::Selector(vec![using.clone()]), // retrieve the vector
-                with_payload: Default::default(),
-            };
+        let mut sampled_points = self
+            .query(
+                sampling_query,
+                read_consistency,
+                shard_selection.clone(),
+                timeout,
+                hw_measurement_acc,
+            )
+            .await?;
 
-            let sampling_response = self
-                .query(
-                    sampling_query.clone(),
-                    read_consistency,
-                    shard_selection.clone(),
-                    timeout,
-                )
-                .await?;
-
-            // select only points with the queried named vector
-            let filtered = sampling_response.into_iter().filter_map(|p| {
-                p.vector
-                    .as_ref()
-                    .and_then(|v| v.get(&using))
-                    .map(|v| (p.id, v.to_owned()))
-            });
-
-            sampled_points.extend(filtered);
+        // if we have less than 2 points, we can't build a matrix
+        if sampled_points.len() < 2 {
+            return Ok(CollectionSearchMatrixResponse::default());
         }
 
         sampled_points.truncate(sample_size);
         // sort by id for a deterministic order
-        sampled_points.sort_unstable_by(|(id1, _), (id2, _)| id1.cmp(id2));
-        let sampled_point_ids: Vec<_> = sampled_points.iter().map(|(id, _)| *id).collect();
+        sampled_points.sort_unstable_by_key(|p| p.id);
+
+        // collect the sampled point ids in the same order
+        let sampled_point_ids: Vec<_> = sampled_points.iter().map(|p| p.id).collect();
+
+        // filter to only include the sampled points in the search
+        // use the same filter for all requests to leverage batch search
+        let filter = Filter::new_must(Condition::HasId(HasIdCondition::from(
+            sampled_point_ids.iter().copied().collect::<HashSet<_>>(),
+        )));
 
         // Perform nearest neighbor search for each sampled point
         let mut searches = Vec::with_capacity(sampled_points.len());
-        for (point_id, vector) in sampled_points {
+        for point in sampled_points {
+            let vector = point
+                .vector
+                .as_ref()
+                .and_then(|v| v.get(&using))
+                .map(|v| v.to_owned())
+                .expect("Vector not found in the point");
+
             // nearest query on the sample vector
             let named_vector = NamedVectorStruct::new_from_vector(vector, using.clone());
             let query = QueryEnum::Nearest(named_vector);
 
-            // exclude the point itself from the possible points to score
-            let req_ids: HashSet<_> = sampled_point_ids
-                .iter()
-                .filter(|id| *id != &point_id)
-                .cloned()
-                .collect();
-            let only_ids = Filter::new_must(Condition::HasId(HasIdCondition::from(req_ids)));
-
-            // update filter with the only_ids
-            let req_filter = Some(
-                filter
-                    .as_ref()
-                    .map(|filter| filter.merge(&only_ids))
-                    .unwrap_or(only_ids),
-            );
             searches.push(CoreSearchRequest {
                 query,
-                filter: req_filter,
+                filter: Some(filter.clone()),
                 score_threshold: None,
-                limit: limit_per_sample,
+                limit: limit_per_sample + 1, // +1 to exclude the point itself afterward
                 offset: 0,
                 params: None,
                 with_vector: None,
@@ -217,11 +232,34 @@ impl Collection {
             });
         }
 
+        // update timeout
+        let timeout = timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
+
         // run batch search request
         let batch_request = CoreSearchRequestBatch { searches };
-        let nearest = self
-            .core_search_batch(batch_request, read_consistency, shard_selection, timeout)
+        let mut nearest = self
+            .core_search_batch(
+                batch_request,
+                read_consistency,
+                shard_selection,
+                timeout,
+                hw_measurement_acc,
+            )
             .await?;
+
+        // postprocess the results to account for overlapping samples
+        for (scores, sample_id) in nearest.iter_mut().zip(sampled_point_ids.iter()) {
+            // need to remove the sample_id from the results
+            if let Some(sample_pos) = scores.iter().position(|p| p.id == *sample_id) {
+                scores.remove(sample_pos);
+            } else {
+                // if not found pop lowest score
+                if scores.len() == limit_per_sample + 1 {
+                    // if we have enough results, remove the last one
+                    scores.pop();
+                }
+            }
+        }
 
         Ok(CollectionSearchMatrixResponse {
             sample_ids: sampled_point_ids,

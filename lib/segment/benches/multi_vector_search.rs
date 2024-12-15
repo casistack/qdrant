@@ -1,6 +1,3 @@
-#[cfg(not(target_os = "windows"))]
-mod prof;
-
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -23,6 +20,9 @@ use segment::types::{
     VectorStorageType,
 };
 use tempfile::Builder;
+
+#[cfg(not(target_os = "windows"))]
+mod prof;
 
 const NUM_POINTS: usize = 10_000;
 const NUM_VECTORS_PER_POINT: usize = 16;
@@ -85,6 +85,7 @@ fn multi_vector_search_benchmark(c: &mut Criterion) {
         payload_index: segment.payload_index.clone(),
         hnsw_config,
         permit: Some(permit),
+        gpu_device: None,
         stopped: &stopped,
     })
     .unwrap();

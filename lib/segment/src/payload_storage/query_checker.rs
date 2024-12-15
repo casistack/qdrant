@@ -13,11 +13,12 @@ use crate::id_tracker::IdTrackerSS;
 use crate::index::field_index::FieldIndex;
 use crate::payload_storage::condition_checker::ValueChecker;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
-use crate::payload_storage::ConditionChecker;
+use crate::payload_storage::{ConditionChecker, PayloadStorage};
 use crate::types::{
     Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition, MinShould,
-    OwnedPayloadRef, Payload, PayloadContainer, PayloadKeyType,
+    OwnedPayloadRef, Payload, PayloadContainer, PayloadKeyType, VectorName,
 };
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 fn check_condition<F>(checker: &F, condition: &Condition) -> bool
 where
@@ -113,6 +114,7 @@ where
 pub fn check_payload<'a, R>(
     get_payload: Box<dyn Fn() -> OwnedPayloadRef<'a> + 'a>,
     id_tracker: Option<&IdTrackerSS>,
+    vector_storages: &HashMap<VectorName, Arc<AtomicRefCell<VectorStorageEnum>>>,
     query: &Filter,
     point_id: PointOffsetType,
     field_indexes: &HashMap<PayloadKeyType, R>,
@@ -128,7 +130,14 @@ where
         Condition::IsNull(is_null) => check_is_null_condition(is_null, get_payload().deref()),
         Condition::HasId(has_id) => id_tracker
             .and_then(|id_tracker| id_tracker.external_id(point_id))
-            .map_or(false, |id| has_id.has_id.contains(&id)),
+            .is_some_and(|id| has_id.has_id.contains(&id)),
+        Condition::HasVector(has_vector) => {
+            if let Some(vector_storage) = vector_storages.get(&has_vector.has_vector) {
+                !vector_storage.borrow().is_deleted_vector(point_id)
+            } else {
+                false
+            }
+        }
         Condition::Nested(nested) => {
             let nested_path = nested.array_key();
             let nested_indexes = select_nested_indexes(&nested_path, field_indexes);
@@ -139,7 +148,8 @@ where
                 .any(|object| {
                     check_payload(
                         Box::new(|| OwnedPayloadRef::from(object)),
-                        None,
+                        None,            // HasId check in nested fields is not supported
+                        &HashMap::new(), // HasVector check in nested fields is not supported
                         &nested.nested.filter,
                         point_id,
                         &nested_indexes,
@@ -149,7 +159,7 @@ where
 
         Condition::CustomIdChecker(cond) => id_tracker
             .and_then(|id_tracker| id_tracker.external_id(point_id))
-            .map_or(false, |point_id| cond.check(point_id)),
+            .is_some_and(|point_id| cond.check(point_id)),
 
         Condition::Filter(_) => unreachable!(),
     };
@@ -215,6 +225,7 @@ where
 pub struct SimpleConditionChecker {
     payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
     id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    vector_storages: HashMap<VectorName, Arc<AtomicRefCell<VectorStorageEnum>>>,
     empty_payload: Payload,
 }
 
@@ -223,10 +234,12 @@ impl SimpleConditionChecker {
     pub fn new(
         payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
         id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+        vector_storages: HashMap<VectorName, Arc<AtomicRefCell<VectorStorageEnum>>>,
     ) -> Self {
         SimpleConditionChecker {
             payload_storage,
             id_tracker,
+            vector_storages,
             empty_payload: Default::default(),
         }
     }
@@ -239,6 +252,8 @@ impl ConditionChecker for SimpleConditionChecker {
 
         let payload_ref_cell: RefCell<Option<OwnedPayloadRef>> = RefCell::new(None);
         let id_tracker = self.id_tracker.borrow();
+
+        let vector_storages = &self.vector_storages;
 
         check_payload(
             Box::new(|| {
@@ -268,6 +283,12 @@ impl ConditionChecker for SimpleConditionChecker {
                                 .unwrap_or_else(|err| panic!("Payload storage is corrupted: {err}"))
                                 .map(|x| x.into())
                         }
+                        PayloadStorageEnum::MmapPayloadStorage(s) => {
+                            let payload = s.get(point_id).unwrap_or_else(|err| {
+                                panic!("Payload storage is corrupted: {err}")
+                            });
+                            Some(OwnedPayloadRef::from(payload))
+                        }
                     };
 
                     payload_ref_cell
@@ -276,6 +297,7 @@ impl ConditionChecker for SimpleConditionChecker {
                 payload_ref_cell.borrow().as_ref().cloned().unwrap()
             }),
             Some(id_tracker.deref()),
+            vector_storages,
             query,
             point_id,
             &IndexesMap::new(),
@@ -333,11 +355,12 @@ mod tests {
         id_tracker.set_link(1.into(), 1).unwrap();
         id_tracker.set_link(2.into(), 2).unwrap();
         id_tracker.set_link(10.into(), 10).unwrap();
-        payload_storage.assign_all(0, &payload).unwrap();
+        payload_storage.overwrite(0, &payload).unwrap();
 
         let payload_checker = SimpleConditionChecker::new(
             Arc::new(AtomicRefCell::new(payload_storage)),
             Arc::new(AtomicRefCell::new(id_tracker)),
+            HashMap::new(),
         );
 
         let is_empty_condition = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {

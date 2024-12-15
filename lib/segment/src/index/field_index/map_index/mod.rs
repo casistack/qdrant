@@ -40,6 +40,7 @@ pub mod mmap_map_index;
 pub mod mutable_map_index;
 
 pub type IdRefIter<'a> = Box<dyn Iterator<Item = &'a PointOffsetType> + 'a>;
+pub type IdIter<'a> = Box<dyn Iterator<Item = PointOffsetType> + 'a>;
 
 pub trait MapIndexKey: Key + MmapValue + Eq + Display + Debug {
     type Owned: Borrow<Self> + Hash + Eq + Clone + FromStr + Default;
@@ -78,7 +79,7 @@ pub enum MapIndex<N: MapIndexKey + ?Sized> {
 }
 
 impl<N: MapIndexKey + ?Sized> MapIndex<N> {
-    pub fn new(db: Arc<RwLock<DB>>, field_name: &str, is_appendable: bool) -> Self {
+    pub fn new_memory(db: Arc<RwLock<DB>>, field_name: &str, is_appendable: bool) -> Self {
         if is_appendable {
             MapIndex::Mutable(MutableMapIndex::new(db, field_name))
         } else {
@@ -198,7 +199,7 @@ impl<N: MapIndexKey + ?Sized> MapIndex<N> {
         }
     }
 
-    pub fn iter_values_map(&self) -> Box<dyn Iterator<Item = (&N, IdRefIter<'_>)> + '_> {
+    pub fn iter_values_map(&self) -> Box<dyn Iterator<Item = (&N, IdIter<'_>)> + '_> {
         match self {
             MapIndex::Mutable(index) => Box::new(index.iter_values_map()),
             MapIndex::Immutable(index) => Box::new(index.iter_values_map()),
@@ -422,7 +423,7 @@ where
     fn init(&mut self) -> OperationResult<()> {
         match &mut self.0 {
             MapIndex::Mutable(index) => index.get_db_wrapper().recreate_column_family(),
-            MapIndex::Immutable(_) => unreachable!(),
+            MapIndex::Immutable(index) => index.get_db_wrapper().recreate_column_family(),
             MapIndex::Mmap(_) => unreachable!(),
         }
     }
@@ -490,7 +491,7 @@ impl PayloadFieldIndex for MapIndex<str> {
         self.load_from_db()
     }
 
-    fn clear(self) -> OperationResult<()> {
+    fn cleanup(self) -> OperationResult<()> {
         self.clear()
     }
 
@@ -550,7 +551,7 @@ impl PayloadFieldIndex for MapIndex<str> {
                     let mut estimation = self.match_cardinality(keyword.as_str());
                     estimation
                         .primary_clauses
-                        .push(PrimaryCondition::Condition(condition.clone()));
+                        .push(PrimaryCondition::Condition(Box::new(condition.clone())));
                     Some(estimation)
                 }
                 ValueVariants::Integer(_) => None,
@@ -568,38 +569,35 @@ impl PayloadFieldIndex for MapIndex<str> {
                         combine_should_estimations(&estimations, self.get_indexed_points())
                     };
                     Some(
-                        estimation
-                            .with_primary_clause(PrimaryCondition::Condition(condition.clone())),
+                        estimation.with_primary_clause(PrimaryCondition::Condition(Box::new(
+                            condition.clone(),
+                        ))),
                     )
                 }
                 AnyVariants::Integers(integers) => {
                     if integers.is_empty() {
-                        Some(
-                            CardinalityEstimation::exact(0).with_primary_clause(
-                                PrimaryCondition::Condition(condition.clone()),
-                            ),
-                        )
+                        Some(CardinalityEstimation::exact(0).with_primary_clause(
+                            PrimaryCondition::Condition(Box::new(condition.clone())),
+                        ))
                     } else {
                         None
                     }
                 }
             },
-            Some(Match::Except(MatchExcept { except })) => {
-                match except {
-                    AnyVariants::Strings(keywords) => {
-                        Some(self.except_cardinality(keywords.iter().map(|k| k.as_str())))
-                    }
-                    AnyVariants::Integers(others) => {
-                        if others.is_empty() {
-                            Some(CardinalityEstimation::exact(0).with_primary_clause(
-                                PrimaryCondition::Condition(condition.clone()),
-                            ))
-                        } else {
-                            None
-                        }
+            Some(Match::Except(MatchExcept { except })) => match except {
+                AnyVariants::Strings(keywords) => {
+                    Some(self.except_cardinality(keywords.iter().map(|k| k.as_str())))
+                }
+                AnyVariants::Integers(others) => {
+                    if others.is_empty() {
+                        Some(CardinalityEstimation::exact(0).with_primary_clause(
+                            PrimaryCondition::Condition(Box::new(condition.clone())),
+                        ))
+                    } else {
+                        None
                     }
                 }
-            }
+            },
             _ => None,
         }
     }
@@ -630,7 +628,7 @@ impl PayloadFieldIndex for MapIndex<UuidIntType> {
         self.load_from_db()
     }
 
-    fn clear(self) -> OperationResult<()> {
+    fn cleanup(self) -> OperationResult<()> {
         self.clear()
     }
 
@@ -714,7 +712,7 @@ impl PayloadFieldIndex for MapIndex<UuidIntType> {
                     let mut estimation = self.match_cardinality(&uuid.as_u128());
                     estimation
                         .primary_clauses
-                        .push(PrimaryCondition::Condition(condition.clone()));
+                        .push(PrimaryCondition::Condition(Box::new(condition.clone())));
                     Some(estimation)
                 }
                 ValueVariants::Integer(_) => None,
@@ -739,45 +737,42 @@ impl PayloadFieldIndex for MapIndex<UuidIntType> {
                         combine_should_estimations(&estimations, self.get_indexed_points())
                     };
                     Some(
-                        estimation
-                            .with_primary_clause(PrimaryCondition::Condition(condition.clone())),
+                        estimation.with_primary_clause(PrimaryCondition::Condition(Box::new(
+                            condition.clone(),
+                        ))),
                     )
                 }
                 AnyVariants::Integers(integers) => {
                     if integers.is_empty() {
-                        Some(
-                            CardinalityEstimation::exact(0).with_primary_clause(
-                                PrimaryCondition::Condition(condition.clone()),
-                            ),
-                        )
+                        Some(CardinalityEstimation::exact(0).with_primary_clause(
+                            PrimaryCondition::Condition(Box::new(condition.clone())),
+                        ))
                     } else {
                         None
                     }
                 }
             },
-            Some(Match::Except(MatchExcept { except })) => {
-                match except {
-                    AnyVariants::Strings(uuids_string) => {
-                        let uuids: Result<IndexSet<u128>, _> = uuids_string
-                            .iter()
-                            .map(|uuid_string| Uuid::from_str(uuid_string).map(|x| x.as_u128()))
-                            .collect();
+            Some(Match::Except(MatchExcept { except })) => match except {
+                AnyVariants::Strings(uuids_string) => {
+                    let uuids: Result<IndexSet<u128>, _> = uuids_string
+                        .iter()
+                        .map(|uuid_string| Uuid::from_str(uuid_string).map(|x| x.as_u128()))
+                        .collect();
 
-                        let excluded_uuids = uuids.ok()?;
+                    let excluded_uuids = uuids.ok()?;
 
-                        Some(self.except_cardinality(excluded_uuids.iter()))
-                    }
-                    AnyVariants::Integers(other) => {
-                        if other.is_empty() {
-                            Some(CardinalityEstimation::exact(0).with_primary_clause(
-                                PrimaryCondition::Condition(condition.clone()),
-                            ))
-                        } else {
-                            None
-                        }
+                    Some(self.except_cardinality(excluded_uuids.iter()))
+                }
+                AnyVariants::Integers(other) => {
+                    if other.is_empty() {
+                        Some(CardinalityEstimation::exact(0).with_primary_clause(
+                            PrimaryCondition::Condition(Box::new(condition.clone())),
+                        ))
+                    } else {
+                        None
                     }
                 }
-            }
+            },
             _ => None,
         }
     }
@@ -811,7 +806,7 @@ impl PayloadFieldIndex for MapIndex<IntPayloadType> {
         self.load_from_db()
     }
 
-    fn clear(self) -> OperationResult<()> {
+    fn cleanup(self) -> OperationResult<()> {
         self.clear()
     }
 
@@ -872,7 +867,7 @@ impl PayloadFieldIndex for MapIndex<IntPayloadType> {
                     let mut estimation = self.match_cardinality(integer);
                     estimation
                         .primary_clauses
-                        .push(PrimaryCondition::Condition(condition.clone()));
+                        .push(PrimaryCondition::Condition(Box::new(condition.clone())));
                     Some(estimation)
                 }
                 ValueVariants::Bool(_) => None,
@@ -880,11 +875,9 @@ impl PayloadFieldIndex for MapIndex<IntPayloadType> {
             Some(Match::Any(MatchAny { any: any_variants })) => match any_variants {
                 AnyVariants::Strings(keywords) => {
                     if keywords.is_empty() {
-                        Some(
-                            CardinalityEstimation::exact(0).with_primary_clause(
-                                PrimaryCondition::Condition(condition.clone()),
-                            ),
-                        )
+                        Some(CardinalityEstimation::exact(0).with_primary_clause(
+                            PrimaryCondition::Condition(Box::new(condition.clone())),
+                        ))
                     } else {
                         None
                     }
@@ -900,19 +893,18 @@ impl PayloadFieldIndex for MapIndex<IntPayloadType> {
                         combine_should_estimations(&estimations, self.get_indexed_points())
                     };
                     Some(
-                        estimation
-                            .with_primary_clause(PrimaryCondition::Condition(condition.clone())),
+                        estimation.with_primary_clause(PrimaryCondition::Condition(Box::new(
+                            condition.clone(),
+                        ))),
                     )
                 }
             },
             Some(Match::Except(MatchExcept { except })) => match except {
                 AnyVariants::Strings(others) => {
                     if others.is_empty() {
-                        Some(
-                            CardinalityEstimation::exact(0).with_primary_clause(
-                                PrimaryCondition::Condition(condition.clone()),
-                            ),
-                        )
+                        Some(CardinalityEstimation::exact(0).with_primary_clause(
+                            PrimaryCondition::Condition(Box::new(condition.clone())),
+                        ))
                     } else {
                         None
                     }
@@ -1088,11 +1080,13 @@ mod tests {
     ) -> MapIndex<N> {
         let mut index = match index_type {
             IndexType::Mutable => {
-                MapIndex::<N>::new(open_db_with_existing_cf(path).unwrap(), FIELD_NAME, true)
+                MapIndex::<N>::new_memory(open_db_with_existing_cf(path).unwrap(), FIELD_NAME, true)
             }
-            IndexType::Immutable => {
-                MapIndex::<N>::new(open_db_with_existing_cf(path).unwrap(), FIELD_NAME, false)
-            }
+            IndexType::Immutable => MapIndex::<N>::new_memory(
+                open_db_with_existing_cf(path).unwrap(),
+                FIELD_NAME,
+                false,
+            ),
             IndexType::Mmap => MapIndex::<N>::new_mmap(path).unwrap(),
         };
         index.load_from_db().unwrap();

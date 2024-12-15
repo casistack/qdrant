@@ -45,6 +45,7 @@ impl Collection {
                 let replica_set = self
                     .create_replica_set(
                         resharding_key.shard_id,
+                        resharding_key.shard_key.clone(),
                         &[resharding_key.peer_id],
                         Some(ReplicaState::Resharding),
                     )
@@ -170,14 +171,14 @@ impl Collection {
         Ok(())
     }
 
-    pub async fn commit_read_hashring(&self, resharding_key: ReshardKey) -> CollectionResult<()> {
+    pub async fn commit_read_hashring(&self, resharding_key: &ReshardKey) -> CollectionResult<()> {
         self.shards_holder
             .write()
             .await
             .commit_read_hashring(resharding_key)
     }
 
-    pub async fn commit_write_hashring(&self, resharding_key: ReshardKey) -> CollectionResult<()> {
+    pub async fn commit_write_hashring(&self, resharding_key: &ReshardKey) -> CollectionResult<()> {
         self.shards_holder
             .write()
             .await
@@ -194,7 +195,7 @@ impl Collection {
         if resharding_key.direction == ReshardingDirection::Down {
             // Remove the shard we've now migrated all points out of
             if let Some(shard_key) = &resharding_key.shard_key {
-                shard_holder.remove_shard_from_key_mapping(&resharding_key.shard_id, shard_key)?;
+                shard_holder.remove_shard_from_key_mapping(resharding_key.shard_id, shard_key)?;
             }
             shard_holder
                 .drop_and_remove_shard(resharding_key.shard_id)

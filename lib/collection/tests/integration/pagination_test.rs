@@ -1,10 +1,11 @@
 use api::rest::SearchRequestInternal;
 use collection::operations::point_ops::{
-    PointInsertOperationsInternal, PointOperations, PointStruct, WriteOrdering,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+    WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::CollectionUpdateOperations;
-use segment::data_types::vectors::VectorStructInternal;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::WithPayloadInterface;
 use tempfile::Builder;
 
@@ -27,9 +28,9 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
     // Upload 1000 random vectors to the collection
     let mut points = Vec::new();
     for i in 0..1000 {
-        points.push(PointStruct {
+        points.push(PointStructPersisted {
             id: i.into(),
-            vector: VectorStructInternal::from(vec![i as f32, 0.0, 0.0, 0.0]).into(),
+            vector: VectorStructPersisted::Single(vec![i as f32, 0.0, 0.0, 0.0]),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
@@ -54,15 +55,18 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let reference_result = collection
         .search(
             full_search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await
         .unwrap();
+    hw_acc.discard();
 
     assert_eq!(reference_result.len(), 100);
     assert_eq!(reference_result[0].id, 999.into());
@@ -80,15 +84,18 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let page_1_result = collection
         .search(
             page_1_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await
         .unwrap();
+    hw_acc.discard();
 
     // Check that the first page is the same as the reference result
     assert_eq!(page_1_result.len(), 10);
@@ -107,15 +114,18 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let page_9_result = collection
         .search(
             page_9_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            &hw_acc,
         )
         .await
         .unwrap();
+    hw_acc.discard();
 
     // Check that the 9th page is the same as the reference result
     assert_eq!(page_9_result.len(), 10);

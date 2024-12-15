@@ -64,15 +64,21 @@ fn test_filtering_context_consistency() {
     for (idx, payload) in nested_payloads().into_iter().enumerate() {
         points.insert(idx, payload.clone());
         payload_storage
-            .assign(idx as PointOffsetType, &payload)
+            .set(idx as PointOffsetType, &payload)
             .unwrap();
     }
 
     let wrapped_payload_storage = Arc::new(AtomicRefCell::new(payload_storage.into()));
     let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(NUM_POINTS)));
 
-    let mut index =
-        StructPayloadIndex::open(wrapped_payload_storage, id_tracker, dir.path(), true).unwrap();
+    let mut index = StructPayloadIndex::open(
+        wrapped_payload_storage,
+        id_tracker,
+        HashMap::new(),
+        dir.path(),
+        true,
+    )
+    .unwrap();
 
     index
         .set_indexed(&JsonPath::new("f"), PayloadSchemaType::Integer)

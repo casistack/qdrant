@@ -54,8 +54,6 @@ pub enum OperationError {
     WrongSparse,
     #[error("Wrong usage of multi vectors")]
     WrongMulti,
-    #[error("Wrong key of payload")]
-    WrongPayloadKey { description: String },
     #[error("No range index for `order_by` key: `{key}`. Please create one to use `order_by`. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Range conditions")]
     MissingRangeIndexForOrderBy { key: String },
     #[error("No appropriate index for faceting: `{key}`. Please create one to facet on this field. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Match conditions")]
@@ -63,10 +61,20 @@ pub enum OperationError {
 }
 
 impl OperationError {
+    /// Create a new service error with a description and a backtrace
+    /// Warning: capturing a backtrace can be an expensive operation on some platforms, so this should be used with caution in performance-sensitive parts of code.
     pub fn service_error(description: impl Into<String>) -> OperationError {
         OperationError::ServiceError {
             description: description.into(),
             backtrace: Some(Backtrace::force_capture().to_string()),
+        }
+    }
+
+    /// Create a new service error with a description and no backtrace
+    pub fn service_error_light(description: impl Into<String>) -> OperationError {
+        OperationError::ServiceError {
+            description: description.into(),
+            backtrace: None,
         }
     }
 }
@@ -153,6 +161,12 @@ impl From<fs_extra::error::Error> for OperationError {
     }
 }
 
+impl From<geohash::GeohashError> for OperationError {
+    fn from(err: geohash::GeohashError) -> Self {
+        OperationError::service_error(format!("Geohash error: {err}"))
+    }
+}
+
 impl From<quantization::EncodingError> for OperationError {
     fn from(err: quantization::EncodingError) -> Self {
         match err {
@@ -175,6 +189,13 @@ impl From<TryReserveError> for OperationError {
             description: format!("Failed to reserve memory: {err}"),
             free: free_memory,
         }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<gpu::GpuError> for OperationError {
+    fn from(err: gpu::GpuError) -> Self {
+        Self::service_error(format!("GPU error: {err:?}"))
     }
 }
 

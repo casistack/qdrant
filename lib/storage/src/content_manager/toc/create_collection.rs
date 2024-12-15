@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use collection::collection::Collection;
-use collection::config::{self, CollectionConfig, CollectionParams, ShardingMethod};
+use collection::config::{self, CollectionConfigInternal, CollectionParams, ShardingMethod};
 use collection::operations::config_diff::DiffConfig as _;
 use collection::operations::types::{
     check_sparse_compatible, CollectionResult, SparseVectorParams, VectorsConfig,
@@ -45,13 +45,13 @@ impl TableOfContent {
             quantization_config,
             sparse_vectors,
             strict_mode_config,
+            uuid,
         } = operation;
 
         self.collections
             .read()
             .await
-            .validate_collection_not_exists(collection_name)
-            .await?;
+            .validate_collection_not_exists(collection_name)?;
 
         if self
             .alias_persistence
@@ -135,18 +135,19 @@ impl TableOfContent {
         let collection_params = CollectionParams {
             vectors,
             sparse_vectors,
-            shard_number: NonZeroU32::new(shard_number).ok_or(StorageError::BadInput {
-                description: "`shard_number` cannot be 0".to_string(),
-            })?,
+            shard_number: NonZeroU32::new(shard_number)
+                .ok_or_else(|| StorageError::bad_input("`shard_number` cannot be 0"))?,
             sharding_method,
             on_disk_payload: on_disk_payload.unwrap_or(self.storage_config.on_disk_payload),
-            replication_factor: NonZeroU32::new(replication_factor).ok_or(
+            on_disk_payload_uses_mmap: self.storage_config.on_disk_payload_uses_mmap,
+            on_disk_sparse_vectors_uses_mmap: self.storage_config.on_disk_sparse_vectors_uses_mmap,
+            replication_factor: NonZeroU32::new(replication_factor).ok_or_else(|| {
                 StorageError::BadInput {
                     description: "`replication_factor` cannot be 0".to_string(),
-                },
-            )?,
-            write_consistency_factor: NonZeroU32::new(write_consistency_factor).ok_or(
-                StorageError::BadInput {
+                }
+            })?,
+            write_consistency_factor: NonZeroU32::new(write_consistency_factor).ok_or_else(
+                || StorageError::BadInput {
                     description: "`write_consistency_factor` cannot be 0".to_string(),
                 },
             )?,
@@ -176,18 +177,37 @@ impl TableOfContent {
             Some(diff) => Some(diff),
         };
 
+        let strict_mode_config = match strict_mode_config {
+            Some(diff) => {
+                let default_config = self
+                    .storage_config
+                    .collection
+                    .as_ref()
+                    .and_then(|i| i.strict_mode.clone())
+                    .unwrap_or_default();
+                Some(diff.update(&default_config)?)
+            }
+            None => self
+                .storage_config
+                .collection
+                .as_ref()
+                .and_then(|i| i.strict_mode.as_ref())
+                .cloned(),
+        };
+
         let storage_config = self
             .storage_config
             .to_shared_storage_config(self.is_distributed())
             .into();
 
-        let collection_config = CollectionConfig {
+        let collection_config = CollectionConfigInternal {
             wal_config,
             params: collection_params,
             optimizer_config: optimizers_config,
             hnsw_config,
             quantization_config,
             strict_mode_config,
+            uuid,
         };
         let collection = Collection::new(
             collection_name.to_string(),
@@ -198,11 +218,10 @@ impl TableOfContent {
             storage_config,
             collection_shard_distribution,
             self.channel_service.clone(),
-            Self::change_peer_state_callback(
+            Self::change_peer_from_state_callback(
                 self.consensus_proposal_sender.clone(),
                 collection_name.to_string(),
                 ReplicaState::Dead,
-                None,
             ),
             Self::request_shard_transfer_callback(
                 self.consensus_proposal_sender.clone(),
@@ -223,9 +242,7 @@ impl TableOfContent {
 
         {
             let mut write_collections = self.collections.write().await;
-            write_collections
-                .validate_collection_not_exists(collection_name)
-                .await?;
+            write_collections.validate_collection_not_exists(collection_name)?;
             write_collections.insert(collection_name.to_string(), collection);
         }
 

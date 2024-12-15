@@ -1,10 +1,11 @@
 mod collection_container;
-use common::types::TelemetryDetail;
 mod collection_meta_ops;
 mod create_collection;
+pub mod dispatcher;
 mod locks;
 mod point_ops;
 mod point_ops_internal;
+pub mod request_hw_counter;
 mod snapshots;
 mod temp_directories;
 pub mod transfer;
@@ -17,19 +18,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use api::rest::models::HardwareUsage;
 use collection::collection::{Collection, RequestShardTransfer};
-use collection::config::{default_replication_factor, CollectionConfig};
+use collection::config::{default_replication_factor, CollectionConfigInternal};
 use collection::operations::types::*;
 use collection::shards::channel_service::ChannelService;
-use collection::shards::replica_set;
 use collection::shards::replica_set::{AbortShardTransfer, ReplicaState};
 use collection::shards::shard::{PeerId, ShardId};
+use collection::shards::{replica_set, CollectionId};
 use collection::telemetry::CollectionTelemetry;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::cpu::{get_num_cpus, CpuBudget};
+use common::types::TelemetryDetail;
+use dashmap::DashMap;
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, Semaphore};
 
-use self::transfer::ShardTransferDispatcher;
+use self::dispatcher::TocDispatcher;
 use crate::content_manager::alias_mapping::AliasPersistence;
 use crate::content_manager::collection_meta_ops::CreateCollectionOperation;
 use crate::content_manager::collections_ops::{Checker, Collections};
@@ -45,6 +50,7 @@ pub const COLLECTIONS_DIR: &str = "collections";
 pub const FULL_SNAPSHOT_FILE_NAME: &str = "full-snapshot";
 
 /// The main object of the service. It holds all objects, required for proper functioning.
+///
 /// In most cases only one `TableOfContent` is enough for service. It is created only once during
 /// the launch of the service.
 pub struct TableOfContent {
@@ -61,6 +67,8 @@ pub struct TableOfContent {
     channel_service: ChannelService,
     /// Backlink to the consensus, if none - single node mode
     consensus_proposal_sender: Option<OperationSender>,
+    /// Dispatcher for access to table of contents and consensus, if none - single node mode
+    toc_dispatcher: parking_lot::Mutex<Option<TocDispatcher>>,
     is_write_locked: AtomicBool,
     lock_error_message: parking_lot::Mutex<Option<String>>,
     /// Prevent DDoS of too many concurrent updates in distributed mode.
@@ -72,8 +80,8 @@ pub struct TableOfContent {
     /// A lock to prevent concurrent collection creation.
     /// Effectively, this lock ensures that `create_collection` is called sequentially.
     collection_create_lock: Mutex<()>,
-    /// Dispatcher for shard transfer to access consensus.
-    shard_transfer_dispatcher: parking_lot::Mutex<Option<ShardTransferDispatcher>>,
+    /// Aggregation of all hardware measurements for each alias or collection config.
+    collection_hw_metrics: DashMap<CollectionId, Arc<HwMeasurementAcc>>,
 }
 
 impl TableOfContent {
@@ -106,7 +114,7 @@ impl TableOfContent {
                 .expect("Can't access of one of the collection files")
                 .path();
 
-            if !CollectionConfig::check(&collection_path) {
+            if !CollectionConfigInternal::check(&collection_path) {
                 log::warn!(
                     "Collection config is not found in the collection directory: {}, skipping",
                     collection_path.display(),
@@ -135,11 +143,10 @@ impl TableOfContent {
                     .to_shared_storage_config(is_distributed)
                     .into(),
                 channel_service.clone(),
-                Self::change_peer_state_callback(
+                Self::change_peer_from_state_callback(
                     consensus_proposal_sender.clone(),
                     collection_name.clone(),
                     ReplicaState::Dead,
-                    None,
                 ),
                 Self::request_shard_transfer_callback(
                     consensus_proposal_sender.clone(),
@@ -158,8 +165,8 @@ impl TableOfContent {
             collections.insert(collection_name, collection);
         }
         let alias_path = Path::new(&storage_config.storage_path).join(ALIASES_PATH);
-        let alias_persistence =
-            AliasPersistence::open(alias_path).expect("Can't open database by the provided config");
+        let alias_persistence = AliasPersistence::open(&alias_path)
+            .expect("Can't open database by the provided config");
 
         let rate_limiter = match storage_config.performance.update_rate_limit {
             Some(limit) => Some(Semaphore::new(limit)),
@@ -189,11 +196,12 @@ impl TableOfContent {
             this_peer_id,
             channel_service,
             consensus_proposal_sender,
+            toc_dispatcher: Default::default(),
             is_write_locked: AtomicBool::new(false),
             lock_error_message: parking_lot::Mutex::new(None),
             update_rate_limiter: rate_limiter,
             collection_create_lock: Default::default(),
-            shard_transfer_dispatcher: Default::default(),
+            collection_hw_metrics: DashMap::new(),
         }
     }
 
@@ -242,7 +250,7 @@ impl TableOfContent {
 
         let real_collection_name = {
             let alias_persistence = self.alias_persistence.read().await;
-            Self::resolve_name(collection_name, &read_collection, &alias_persistence).await?
+            Self::resolve_name(collection_name, &read_collection, &alias_persistence)?
         };
         // resolve_name already checked collection existence, unwrap is safe here
         Ok(RwLockReadGuard::map(read_collection, |collection| {
@@ -250,9 +258,9 @@ impl TableOfContent {
         }))
     }
 
-    pub async fn get_collection<'a>(
+    pub async fn get_collection(
         &self,
-        collection: &CollectionPass<'a>,
+        collection: &CollectionPass<'_>,
     ) -> Result<RwLockReadGuard<Collection>, StorageError> {
         self.get_collection_unchecked(collection.name()).await
     }
@@ -277,7 +285,7 @@ impl TableOfContent {
     /// If the collection exists - return its name
     /// If alias exists - returns the original collection name
     /// If neither exists - returns [`StorageError`]
-    async fn resolve_name(
+    fn resolve_name(
         collection_name: &str,
         collections: &Collections,
         aliases: &AliasPersistence,
@@ -288,9 +296,7 @@ impl TableOfContent {
             None => collection_name.to_string(),
             Some(resolved_alias) => resolved_alias,
         };
-        collections
-            .validate_collection_exists(&resolved_name)
-            .await?;
+        collections.validate_collection_exists(&resolved_name)?;
         Ok(resolved_name)
     }
 
@@ -332,7 +338,7 @@ impl TableOfContent {
         Ok(aliases)
     }
 
-    pub async fn suggest_shard_distribution(
+    pub fn suggest_shard_distribution(
         &self,
         op: &CreateCollectionOperation,
         suggested_shard_number: NonZeroU32,
@@ -398,13 +404,28 @@ impl TableOfContent {
         Ok(())
     }
 
-    pub fn update_cluster_metadata(
+    pub async fn update_cluster_metadata(
         &self,
         key: String,
         value: serde_json::Value,
+        wait: bool,
     ) -> Result<(), StorageError> {
-        self.get_consensus_proposal_sender()?
-            .send(ConsensusOperations::UpdateClusterMetadata { key, value })?;
+        let operation = ConsensusOperations::UpdateClusterMetadata { key, value };
+
+        if wait {
+            let dispatcher = self.toc_dispatcher.lock().clone().ok_or_else(|| {
+                StorageError::service_error("Qdrant is running in standalone mode")
+            })?;
+            dispatcher
+                .consensus_state()
+                .propose_consensus_op_with_await(operation, None)
+                .await
+                .map_err(|err| {
+                    StorageError::service_error(format!("Failed to propose and confirm metadata update operation through consensus: {err}"))
+                })?;
+        } else {
+            self.get_consensus_proposal_sender()?.send(operation)?;
+        }
 
         Ok(())
     }
@@ -439,19 +460,23 @@ impl TableOfContent {
         result
     }
 
-    /// Cancels all transfers where the source peer is the current peer.
-    pub async fn cancel_outgoing_all_transfers(&self, reason: &str) -> Result<(), StorageError> {
+    /// Cancels all transfers related to the current peer.
+    ///
+    /// Transfers whehre this peer is the source or the target will be cancelled.
+    pub async fn cancel_related_transfers(&self, reason: &str) -> Result<(), StorageError> {
         let collections = self.collections.read().await;
         if let Some(proposal_sender) = &self.consensus_proposal_sender {
             for collection in collections.values() {
-                for transfer in collection.get_outgoing_transfers(&self.this_peer_id).await {
+                for transfer in collection.get_related_transfers(self.this_peer_id).await {
                     let cancel_transfer =
                         ConsensusOperations::abort_transfer(collection.name(), transfer, reason);
                     proposal_sender.send(cancel_transfer)?;
                 }
             }
         } else {
-            log::error!("Can't cancel outgoing transfers, this is a single node deployment");
+            log::error!(
+                "Can't cancel transfers related to this node, this is a single node deployment"
+            );
         }
         Ok(())
     }
@@ -462,7 +487,17 @@ impl TableOfContent {
         state: ReplicaState,
         from_state: Option<ReplicaState>,
     ) -> replica_set::ChangePeerState {
-        Arc::new(move |peer_id, shard_id| {
+        let callback =
+            Self::change_peer_from_state_callback(proposal_sender, collection_name, state);
+        Arc::new(move |peer_id, shard_id| callback(peer_id, shard_id, from_state))
+    }
+
+    fn change_peer_from_state_callback(
+        proposal_sender: Option<OperationSender>,
+        collection_name: String,
+        state: ReplicaState,
+    ) -> replica_set::ChangePeerFromState {
+        Arc::new(move |peer_id, shard_id, from_state| {
             if let Some(proposal_sender) = &proposal_sender {
                 if let Err(send_error) = Self::send_set_replica_state_proposal_op(
                     proposal_sender,
@@ -472,13 +507,7 @@ impl TableOfContent {
                     state,
                     from_state,
                 ) {
-                    log::error!(
-                        "Can't send proposal to deactivate replica on peer {} of shard {} of collection {}. Error: {}",
-                        peer_id,
-                        shard_id,
-                        collection_name,
-                        send_error
-                    );
+                    log::error!("Can't send proposal to deactivate replica on peer {peer_id} of shard {shard_id} of collection {collection_name}. Error: {send_error}");
                 }
             } else {
                 log::error!("Can't send proposal to deactivate replica. Error: this is a single node deployment");
@@ -568,7 +597,7 @@ impl TableOfContent {
         let path = self.get_collection_path(collection_name);
 
         if path.exists() {
-            if CollectionConfig::check(&path) {
+            if CollectionConfigInternal::check(&path) {
                 return Err(StorageError::bad_input(format!(
                     "Can't create collection with name {collection_name}. Collection data already exists at {path}",
                     collection_name = collection_name,
@@ -609,12 +638,32 @@ impl TableOfContent {
             .ok_or_else(|| StorageError::service_error("Qdrant is running in standalone mode"))
     }
 
-    /// Insert dispatcher into table of contents for shard transfer.
-    pub fn with_shard_transfer_dispatcher(&self, dispatcher: ShardTransferDispatcher) {
-        self.shard_transfer_dispatcher.lock().replace(dispatcher);
+    /// Insert dispatcher for access to table of contents and consensus.
+    pub fn with_toc_dispatcher(&self, dispatcher: TocDispatcher) {
+        self.toc_dispatcher.lock().replace(dispatcher);
     }
 
     pub fn get_channel_service(&self) -> &ChannelService {
         &self.channel_service
+    }
+
+    /// Gets a copy of hardware metrics for all collections that have been collected from operations on this node.
+    /// This copy is intentional to prevent 'uncontrolled' modifications of the DashMap, which doesn't need to be mutable for modifications.
+    pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
+        self.collection_hw_metrics
+            .iter()
+            .map(|i| (i.key().to_string(), HardwareUsage { cpu: i.get_cpu() }))
+            .collect()
+    }
+}
+
+impl Drop for TableOfContent {
+    fn drop(&mut self) {
+        // When dropping `TableOfContent` we also drop the collected hardware measurements which need to be discarded
+        // to prevent panicking in debug mode and tests.
+        #[cfg(any(debug_assertions, test))]
+        for metric in self.collection_hw_metrics.iter_mut() {
+            metric.discard();
+        }
     }
 }

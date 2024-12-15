@@ -15,6 +15,7 @@ impl Collection {
     pub async fn create_replica_set(
         &self,
         shard_id: ShardId,
+        shard_key: Option<ShardKey>,
         replicas: &[PeerId],
         init_state: Option<ReplicaState>,
     ) -> Result<ShardReplicaSet, CollectionError> {
@@ -30,6 +31,7 @@ impl Collection {
 
         ShardReplicaSet::build(
             shard_id,
+            shard_key,
             self.name(),
             self.this_peer_id,
             is_local,
@@ -45,7 +47,7 @@ impl Collection {
             self.update_runtime.clone(),
             self.search_runtime.clone(),
             self.optimizer_cpu_budget.clone(),
-            init_state.or(Some(ReplicaState::Active)),
+            Some(init_state.unwrap_or(ReplicaState::Active)),
         )
         .await
     }
@@ -102,7 +104,12 @@ impl Collection {
             let shard_id = max_shard_id + idx as ShardId + 1;
 
             let replica_set = self
-                .create_replica_set(shard_id, shard_replicas_placement, None)
+                .create_replica_set(
+                    shard_id,
+                    Some(shard_key.clone()),
+                    shard_replicas_placement,
+                    None,
+                )
                 .await?;
 
             for (field_name, field_schema) in payload_schema.iter() {

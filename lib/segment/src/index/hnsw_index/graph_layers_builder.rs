@@ -101,6 +101,32 @@ impl GraphLayersBuilder {
         })
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn m0(&self) -> usize {
+        self.m0
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn ef_construct(&self) -> usize {
+        self.ef_construct
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn links_layers(&self) -> &[LockedLayersContainer] {
+        &self.links_layers
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn clear_ready_list(&mut self) {
+        let num_vectors = self.num_points();
+        self.ready_list = RwLock::new(BitVec::repeat(true, num_vectors));
+    }
+
     pub fn new_with_params(
         num_vectors: usize, // Initial number of points in index
         m: usize,           // Expected M for non-first layer
@@ -206,7 +232,7 @@ impl GraphLayersBuilder {
         picked_level.round() as usize
     }
 
-    fn get_point_level(&self, point_id: PointOffsetType) -> usize {
+    pub(crate) fn get_point_level(&self, point_id: PointOffsetType) -> usize {
         self.links_layers[point_id as usize].len() - 1
     }
 
@@ -286,7 +312,7 @@ impl GraphLayersBuilder {
     }
 
     /// <https://github.com/nmslib/hnswlib/issues/99>
-    fn select_candidates_with_heuristic<F>(
+    pub(crate) fn select_candidates_with_heuristic<F>(
         candidates: FixedLengthPriorityQueue<ScoredPointOffset>,
         m: usize,
         score_internal: F,
@@ -544,6 +570,7 @@ mod tests {
                     let scorer =
                         FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
                     graph_layers.link_new_point(idx, scorer);
+                    raw_scorer.take_hardware_counter().discard_results();
                 });
         });
 
@@ -585,6 +612,7 @@ mod tests {
             let raw_scorer = vector_holder.get_raw_scorer(added_vector.clone()).unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             graph_layers.link_new_point(idx, scorer);
+            raw_scorer.take_hardware_counter().discard_results();
         }
 
         (vector_holder, graph_layers)
@@ -651,11 +679,12 @@ mod tests {
             .unwrap();
 
         let fake_filter_context = FakeFilterContext {};
-        let raw_scorer = vector_holder.get_raw_scorer(query.clone()).unwrap();
+        let raw_scorer = vector_holder.get_raw_scorer(query).unwrap();
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer, None);
 
+        raw_scorer.take_hardware_counter().discard_results();
         assert_eq!(reference_top.into_vec(), graph_search);
     }
 
@@ -682,7 +711,7 @@ mod tests {
         assert_eq!(orig_len, builder_len);
 
         for idx in 0..builder_len {
-            let links_orig = &graph_layers_orig.links.links(idx as PointOffsetType, 0);
+            let links_orig = &graph_layers_orig.links.links_vec(idx as PointOffsetType, 0);
             let links_builder = graph_layers_builder.links_layers[idx][0].read();
             let link_container_from_builder = links_builder.iter().copied().collect::<Vec<_>>();
             assert_eq!(links_orig, &link_container_from_builder);
@@ -738,7 +767,7 @@ mod tests {
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer, None);
-
+        raw_scorer.take_hardware_counter().discard_results();
         assert_eq!(reference_top.into_vec(), graph_search);
     }
 
@@ -764,6 +793,7 @@ mod tests {
             let level = graph_layers_builder.get_random_layer(&mut rng);
             graph_layers_builder.set_levels(idx, level);
             graph_layers_builder.link_new_point(idx, scorer);
+            raw_scorer.take_hardware_counter().discard_results();
         }
         let graph_layers = graph_layers_builder
             .into_graph_layers::<GraphLinksRam>(None)
@@ -780,12 +810,12 @@ mod tests {
 
         let layers910 = graph_layers.links.point_level(910);
         let links910 = (0..layers910 + 1)
-            .map(|i| graph_layers.links.links(910, i).to_vec())
+            .map(|i| graph_layers.links.links_vec(910, i))
             .collect::<Vec<_>>();
         eprintln!("graph_layers.links_layers[910] = {links910:#?}",);
 
         let total_edges: usize = (0..NUM_VECTORS)
-            .map(|i| graph_layers.links.links(i as PointOffsetType, 0).len())
+            .map(|i| graph_layers.links.links_vec(i as PointOffsetType, 0).len())
             .sum();
         let avg_connectivity = total_edges as f64 / NUM_VECTORS as f64;
         eprintln!("avg_connectivity = {avg_connectivity:#?}");
@@ -831,6 +861,8 @@ mod tests {
         for x in selected_candidates.iter() {
             eprintln!("selected_candidates = {x}");
         }
+
+        scorer.take_hardware_counter().discard_results();
     }
 
     #[test]

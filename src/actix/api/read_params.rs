@@ -19,6 +19,10 @@ impl ReadParams {
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout.map(|num| Duration::from_secs(num.get()))
     }
+
+    pub(crate) fn timeout_as_secs(&self) -> Option<usize> {
+        self.timeout.map(|i| i.get() as usize)
+    }
 }
 
 fn deserialize_read_consistency<'de, D>(
@@ -37,9 +41,9 @@ where
     match Helper::deserialize(deserializer)? {
         Helper::ReadConsistency(read_consistency) => Ok(Some(read_consistency)),
         Helper::Str("") => Ok(None),
-        _ => Err(serde::de::Error::custom(
-            "failed to deserialize read consistency query parameter value",
-        )),
+        Helper::Str(x) => Err(serde::de::Error::custom(format!(
+            "failed to deserialize read consistency query parameter value '{x}'"
+        ))),
     }
 }
 

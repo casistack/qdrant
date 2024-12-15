@@ -145,7 +145,7 @@ impl<T: PrimitiveVectorElement> SimpleDenseVectorStorage<T> {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> bool {
-        if key as usize >= self.vectors.len() {
+        if !deleted && key as usize >= self.vectors.len() {
             return false;
         }
         let was_deleted = bitvec_set_deleted(&mut self.deleted, key, deleted);
@@ -209,7 +209,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
         self.vectors.len()
     }
 
-    fn available_size_in_bytes(&self) -> usize {
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
         self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
     }
 

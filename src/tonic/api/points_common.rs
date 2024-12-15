@@ -1,54 +1,63 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::grpc::conversions::{json_path_from_proto, proto_to_payloads};
+use api::conversions::json::{json_path_from_proto, proto_to_payloads};
 use api::grpc::qdrant::payload_index_params::IndexParams;
 use api::grpc::qdrant::points_update_operation::{ClearPayload, Operation, PointStructList};
 use api::grpc::qdrant::{
     points_update_operation, BatchResult, ClearPayloadPoints, CoreSearchPoints, CountPoints,
     CountResponse, CreateFieldIndexCollection, DeleteFieldIndexCollection, DeletePayloadPoints,
     DeletePointVectors, DeletePoints, DiscoverBatchResponse, DiscoverPoints, DiscoverResponse,
-    FacetCounts, FacetResponse, FieldType, GetPoints, GetResponse, PayloadIndexParams,
-    PointsOperationResponseInternal, PointsSelector, QueryBatchResponse, QueryGroupsResponse,
-    QueryPointGroups, QueryPoints, QueryResponse, ReadConsistency as ReadConsistencyGrpc,
-    RecommendBatchResponse, RecommendGroupsResponse, RecommendPointGroups, RecommendPoints,
-    RecommendResponse, ScrollPoints, ScrollResponse, SearchBatchResponse, SearchGroupsResponse,
-    SearchPointGroups, SearchPoints, SearchResponse, SetPayloadPoints, SyncPoints,
-    UpdateBatchPoints, UpdateBatchResponse, UpdatePointVectors, UpsertPoints,
+    FacetCounts, FacetResponse, FieldType, GetPoints, GetResponse, GroupsResult,
+    PayloadIndexParams, PointsOperationResponseInternal, PointsSelector, QueryBatchResponse,
+    QueryGroupsResponse, QueryPointGroups, QueryPoints, QueryResponse,
+    ReadConsistency as ReadConsistencyGrpc, RecommendBatchResponse, RecommendGroupsResponse,
+    RecommendPointGroups, RecommendPoints, RecommendResponse, ScrollPoints, ScrollResponse,
+    SearchBatchResponse, SearchGroupsResponse, SearchMatrixPoints, SearchPointGroups, SearchPoints,
+    SearchResponse, SetPayloadPoints, SyncPoints, UpdateBatchPoints, UpdateBatchResponse,
+    UpdatePointVectors, UpsertPoints,
 };
-use api::rest::{OrderByInterface, ShardKeySelector};
+use api::rest::schema::{PointInsertOperations, PointsList};
+use api::rest::{
+    OrderByInterface, PointStruct, PointVectors, ShardKeySelector, UpdateVectors, VectorStruct,
+};
+use collection::collection::distance_matrix::{
+    CollectionSearchMatrixRequest, CollectionSearchMatrixResponse,
+};
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::conversions::{
     try_discover_request_from_grpc, try_points_selector_from_grpc, write_ordering_from_proto,
 };
 use collection::operations::payload_ops::DeletePayload;
-use collection::operations::point_ops::{
-    self, PointInsertOperations, PointOperations, PointSyncOperation, PointsList,
-};
+use collection::operations::point_ops::{self, PointOperations, PointSyncOperation};
 use collection::operations::query_enum::QueryEnum;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{
     default_exact_count, CoreSearchRequest, CoreSearchRequestBatch, PointRequestInternal,
-    RecommendExample, Record, ScrollRequestInternal,
+    RecommendExample, ScrollRequestInternal,
 };
-use collection::operations::universal_query::collection_query::{
-    CollectionQueryGroupsRequest, CollectionQueryRequest,
-};
-use collection::operations::vector_ops::{DeleteVectors, PointVectors, UpdateVectors};
+use collection::operations::vector_ops::DeleteVectors;
 use collection::operations::{ClockTag, CollectionUpdateOperations, OperationWithClockTag};
 use collection::shards::shard::ShardId;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::data_types::facets::FacetParams;
 use segment::data_types::order_by::OrderBy;
-use segment::data_types::vectors::VectorStructInternal;
+use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use segment::types::{
     ExtendedPointId, Filter, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType,
 };
+use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 use tonic::{Response, Status};
 
+use crate::common::inference::query_requests_grpc::{
+    convert_query_point_groups_from_grpc, convert_query_points_from_grpc,
+};
+use crate::common::inference::service::InferenceType;
+use crate::common::inference::update_requests::convert_point_struct;
 use crate::common::points::{
     do_clear_payload, do_core_search_points, do_count_points, do_create_index,
     do_create_index_internal, do_delete_index, do_delete_index_internal, do_delete_payload,
@@ -56,6 +65,7 @@ use crate::common::points::{
     do_query_batch_points, do_query_point_groups, do_query_points, do_scroll_points,
     do_search_batch_points, do_set_payload, do_update_vectors, do_upsert_points, CreateFieldIndex,
 };
+use crate::tonic::verification::{CheckedTocProvider, StrictModeCheckedTocProvider};
 
 fn extract_points_selector(
     points_selector: Option<PointsSelector>,
@@ -101,7 +111,7 @@ pub(crate) fn convert_shard_selector_for_read(
 }
 
 pub async fn upsert(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     upsert_points: UpsertPoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -114,17 +124,21 @@ pub async fn upsert(
         ordering,
         shard_key_selector,
     } = upsert_points;
-    let points = points
-        .into_iter()
-        .map(|point| point.try_into())
-        .collect::<Result<_, _>>()?;
+
+    let points: Result<_, _> = points.into_iter().map(PointStruct::try_from).collect();
+
     let operation = PointInsertOperations::PointsList(PointsList {
-        points,
+        points: points?,
         shard_key: shard_key_selector.map(ShardKeySelector::from),
     });
+
+    let toc = toc_provider
+        .check_strict_mode(&operation, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_upsert_points(
-        toc,
+        toc.clone(),
         collection_name,
         operation,
         clock_tag,
@@ -155,12 +169,13 @@ pub async fn sync(
         ordering,
     } = sync_points;
 
-    let points = points
-        .into_iter()
-        .map(|point| point.try_into())
-        .collect::<Result<_, _>>()?;
-
     let timing = Instant::now();
+
+    let point_structs: Result<_, _> = points.into_iter().map(PointStruct::try_from).collect();
+
+    // No actual inference should happen here, as we are just syncing existing points
+    // So this function is used for consistency only
+    let points = convert_point_struct(point_structs?, InferenceType::Update).await?;
 
     let operation = PointSyncOperation {
         points,
@@ -193,7 +208,7 @@ pub async fn sync(
 }
 
 pub async fn delete(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     delete_points: DeletePoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -212,9 +227,13 @@ pub async fn delete(
         Some(p) => try_points_selector_from_grpc(p, shard_key_selector)?,
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&points_selector, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_delete_points(
-        toc,
+        toc.clone(),
         collection_name,
         points_selector,
         clock_tag,
@@ -230,7 +249,7 @@ pub async fn delete(
 }
 
 pub async fn update_vectors(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     update_point_vectors: UpdatePointVectors,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -251,14 +270,11 @@ pub async fn update_vectors(
             Some(id) => id.try_into()?,
             None => return Err(Status::invalid_argument("id is expected")),
         };
-        let vector: VectorStructInternal = match point.vectors {
-            Some(vectors) => vectors.try_into()?,
+        let vector = match point.vectors {
+            Some(vectors) => VectorStruct::try_from(vectors)?,
             None => return Err(Status::invalid_argument("vectors is expected")),
         };
-        op_points.push(PointVectors {
-            id,
-            vector: api::rest::VectorStruct::from(vector),
-        });
+        op_points.push(PointVectors { id, vector });
     }
 
     let operation = UpdateVectors {
@@ -266,9 +282,13 @@ pub async fn update_vectors(
         shard_key: shard_key_selector.map(ShardKeySelector::from),
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&operation, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_update_vectors(
-        toc,
+        toc.clone(),
         collection_name,
         operation,
         clock_tag,
@@ -284,7 +304,7 @@ pub async fn update_vectors(
 }
 
 pub async fn delete_vectors(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     delete_point_vectors: DeletePointVectors,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -312,9 +332,13 @@ pub async fn delete_vectors(
         shard_key: shard_key_selector.map(ShardKeySelector::from),
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&operation, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_delete_vectors(
-        toc,
+        toc.clone(),
         collection_name,
         operation,
         clock_tag,
@@ -330,7 +354,7 @@ pub async fn delete_vectors(
 }
 
 pub async fn set_payload(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     set_payload_points: SetPayloadPoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -356,9 +380,13 @@ pub async fn set_payload(
         key,
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&operation, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_set_payload(
-        toc,
+        toc.clone(),
         collection_name,
         operation,
         clock_tag,
@@ -374,7 +402,7 @@ pub async fn set_payload(
 }
 
 pub async fn overwrite_payload(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     set_payload_points: SetPayloadPoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -400,9 +428,13 @@ pub async fn overwrite_payload(
         key: None,
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&operation, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_overwrite_payload(
-        toc,
+        toc.clone(),
         collection_name,
         operation,
         clock_tag,
@@ -418,7 +450,7 @@ pub async fn overwrite_payload(
 }
 
 pub async fn delete_payload(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     delete_payload_points: DeletePayloadPoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -442,9 +474,13 @@ pub async fn delete_payload(
         shard_key: shard_key_selector.map(ShardKeySelector::from),
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&operation, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_delete_payload(
-        toc,
+        toc.clone(),
         collection_name,
         operation,
         clock_tag,
@@ -460,7 +496,7 @@ pub async fn delete_payload(
 }
 
 pub async fn clear_payload(
-    toc: Arc<TableOfContent>,
+    toc_provider: impl CheckedTocProvider,
     clear_payload_points: ClearPayloadPoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -479,9 +515,13 @@ pub async fn clear_payload(
         Some(p) => try_points_selector_from_grpc(p, shard_key_selector)?,
     };
 
+    let toc = toc_provider
+        .check_strict_mode(&points_selector, &collection_name, None, &access)
+        .await?;
+
     let timing = Instant::now();
     let result = do_clear_payload(
-        toc,
+        toc.clone(),
         collection_name,
         points_selector,
         clock_tag,
@@ -497,7 +537,7 @@ pub async fn clear_payload(
 }
 
 pub async fn update_batch(
-    toc: Arc<TableOfContent>,
+    dispatcher: &Dispatcher,
     update_batch_points: UpdateBatchPoints,
     clock_tag: Option<ClockTag>,
     shard_selection: Option<ShardId>,
@@ -515,7 +555,7 @@ pub async fn update_batch(
     for op in operations {
         let operation = op
             .operation
-            .ok_or(Status::invalid_argument("Operation is missing"))?;
+            .ok_or_else(|| Status::invalid_argument("Operation is missing"))?;
         let collection_name = collection_name.clone();
         let ordering = ordering.clone();
         let result = match operation {
@@ -524,7 +564,7 @@ pub async fn update_batch(
                 shard_key_selector,
             }) => {
                 upsert(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     UpsertPoints {
                         collection_name,
                         wait,
@@ -540,7 +580,7 @@ pub async fn update_batch(
             }
             points_update_operation::Operation::DeleteDeprecated(points) => {
                 delete(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     DeletePoints {
                         collection_name,
                         wait,
@@ -563,7 +603,7 @@ pub async fn update_batch(
                 },
             ) => {
                 set_payload(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     SetPayloadPoints {
                         collection_name,
                         wait,
@@ -588,7 +628,7 @@ pub async fn update_batch(
                 },
             ) => {
                 overwrite_payload(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     SetPayloadPoints {
                         collection_name,
                         wait,
@@ -613,7 +653,7 @@ pub async fn update_batch(
                 },
             ) => {
                 delete_payload(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     DeletePayloadPoints {
                         collection_name,
                         wait,
@@ -633,7 +673,7 @@ pub async fn update_batch(
                 shard_key_selector,
             }) => {
                 clear_payload(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     ClearPayloadPoints {
                         collection_name,
                         wait,
@@ -654,7 +694,7 @@ pub async fn update_batch(
                 },
             ) => {
                 update_vectors(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     UpdatePointVectors {
                         collection_name,
                         wait,
@@ -676,7 +716,7 @@ pub async fn update_batch(
                 },
             ) => {
                 delete_vectors(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     DeletePointVectors {
                         collection_name,
                         wait,
@@ -693,7 +733,7 @@ pub async fn update_batch(
             }
             Operation::ClearPayloadDeprecated(selector) => {
                 clear_payload(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     ClearPayloadPoints {
                         collection_name,
                         wait,
@@ -712,7 +752,7 @@ pub async fn update_batch(
                 shard_key_selector,
             }) => {
                 delete(
-                    toc.clone(),
+                    StrictModeCheckedTocProvider::new(dispatcher),
                     DeletePoints {
                         collection_name,
                         wait,
@@ -967,10 +1007,11 @@ pub async fn delete_field_index_internal(
 }
 
 pub async fn search(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     search_points: SearchPoints,
     shard_selection: Option<ShardId>,
     access: Access,
+    hw_measurement_acc: RequestHwCounter,
 ) -> Result<Response<SearchResponse>, Status> {
     let SearchPoints {
         collection_name,
@@ -1009,6 +1050,15 @@ pub async fn search(
         score_threshold,
     };
 
+    let toc = toc_provider
+        .check_strict_mode(
+            &search_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
+
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
     let timing = Instant::now();
@@ -1020,6 +1070,7 @@ pub async fn search(
         shard_selector,
         access,
         timeout.map(Duration::from_secs),
+        hw_measurement_acc.get_counter(),
     )
     .await?;
 
@@ -1029,30 +1080,43 @@ pub async fn search(
             .map(|point| point.into())
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: hw_measurement_acc.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn core_search_batch(
-    toc: &TableOfContent,
-    collection_name: String,
+    toc_provider: impl CheckedTocProvider,
+    collection_name: &str,
     requests: Vec<(CoreSearchRequest, ShardSelectorInternal)>,
     read_consistency: Option<ReadConsistencyGrpc>,
     access: Access,
     timeout: Option<Duration>,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<SearchBatchResponse>, Status> {
+    let toc = toc_provider
+        .check_strict_mode_batch(
+            &requests,
+            |i| &i.0,
+            collection_name,
+            timeout.map(|i| i.as_secs() as usize),
+            &access,
+        )
+        .await?;
+
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
     let timing = Instant::now();
 
     let scored_points = do_search_batch_points(
         toc,
-        &collection_name,
+        collection_name,
         requests,
         read_consistency,
         access,
         timeout,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
@@ -1064,11 +1128,13 @@ pub async fn core_search_batch(
             })
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn core_search_list(
     toc: &TableOfContent,
     collection_name: String,
@@ -1077,6 +1143,7 @@ pub async fn core_search_list(
     shard_selection: Option<ShardId>,
     access: Access,
     timeout: Option<Duration>,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<SearchBatchResponse>, Status> {
     let searches: Result<Vec<_>, Status> =
         search_points.into_iter().map(TryInto::try_into).collect();
@@ -1107,6 +1174,7 @@ pub async fn core_search_list(
             shard_selection,
             access,
             timeout,
+            request_hw_counter.get_counter(),
         )
         .await?;
 
@@ -1118,16 +1186,18 @@ pub async fn core_search_list(
             })
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn search_groups(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     search_point_groups: SearchPointGroups,
     shard_selection: Option<ShardId>,
     access: Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<SearchGroupsResponse>, Status> {
     let search_groups_request = search_point_groups.clone().try_into()?;
 
@@ -1138,6 +1208,15 @@ pub async fn search_groups(
         shard_key_selector,
         ..
     } = search_point_groups;
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &search_groups_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
 
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
@@ -1152,21 +1231,27 @@ pub async fn search_groups(
         shard_selector,
         access,
         timeout.map(Duration::from_secs),
+        request_hw_counter.get_counter(),
     )
     .await?;
 
+    let groups_result = GroupsResult::try_from(groups_result)
+        .map_err(|e| Status::internal(format!("Failed to convert groups result: {e}")))?;
+
     let response = SearchGroupsResponse {
-        result: Some(groups_result.into()),
+        result: Some(groups_result),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn recommend(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     recommend_points: RecommendPoints,
     access: Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<RecommendResponse>, Status> {
     // TODO(luis): check if we can make this into a From impl
     let RecommendPoints {
@@ -1189,8 +1274,6 @@ pub async fn recommend(
         timeout,
         shard_key_selector,
     } = recommend_points;
-
-    let timeout = timeout.map(Duration::from_secs);
 
     let positive_ids = positive
         .into_iter()
@@ -1231,9 +1314,18 @@ pub async fn recommend(
         lookup_from: lookup_from.map(|l| l.into()),
     };
 
-    let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
+    let toc = toc_provider
+        .check_strict_mode(
+            &request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
 
+    let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
     let shard_selector = convert_shard_selector_for_read(None, shard_key_selector);
+    let timeout = timeout.map(Duration::from_secs);
 
     let timing = Instant::now();
     let recommended_points = toc
@@ -1244,6 +1336,7 @@ pub async fn recommend(
             shard_selector,
             access,
             timeout,
+            request_hw_counter.get_counter(),
         )
         .await?;
 
@@ -1253,18 +1346,20 @@ pub async fn recommend(
             .map(|point| point.into())
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn recommend_batch(
-    toc: &TableOfContent,
-    collection_name: String,
+    toc_provider: impl CheckedTocProvider,
+    collection_name: &str,
     recommend_points: Vec<RecommendPoints>,
     read_consistency: Option<ReadConsistencyGrpc>,
     access: Access,
     timeout: Option<Duration>,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<RecommendBatchResponse>, Status> {
     let mut requests = Vec::with_capacity(recommend_points.len());
 
@@ -1276,16 +1371,27 @@ pub async fn recommend_batch(
         requests.push((internal_request, shard_selector));
     }
 
+    let toc = toc_provider
+        .check_strict_mode_batch(
+            &requests,
+            |i| &i.0,
+            collection_name,
+            timeout.map(|i| i.as_secs() as usize),
+            &access,
+        )
+        .await?;
+
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
     let timing = Instant::now();
     let scored_points = toc
         .recommend_batch(
-            &collection_name,
+            collection_name,
             requests,
             read_consistency,
             access,
             timeout,
+            request_hw_counter.get_counter(),
         )
         .await?;
 
@@ -1297,15 +1403,17 @@ pub async fn recommend_batch(
             })
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn recommend_groups(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     recommend_point_groups: RecommendPointGroups,
     access: Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<RecommendGroupsResponse>, Status> {
     let recommend_groups_request = recommend_point_groups.clone().try_into()?;
 
@@ -1316,6 +1424,15 @@ pub async fn recommend_groups(
         shard_key_selector,
         ..
     } = recommend_point_groups;
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &recommend_groups_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
 
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
@@ -1330,24 +1447,39 @@ pub async fn recommend_groups(
         shard_selector,
         access,
         timeout.map(Duration::from_secs),
+        request_hw_counter.get_counter(),
     )
     .await?;
 
+    let groups_result = GroupsResult::try_from(groups_result)
+        .map_err(|e| Status::internal(format!("Failed to convert groups result: {e}")))?;
+
     let response = RecommendGroupsResponse {
-        result: Some(groups_result.into()),
+        result: Some(groups_result),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn discover(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     discover_points: DiscoverPoints,
     access: Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<DiscoverResponse>, Status> {
     let (request, collection_name, read_consistency, timeout, shard_key_selector) =
         try_discover_request_from_grpc(discover_points)?;
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &request,
+            &collection_name,
+            timeout.map(|i| i.as_secs() as usize),
+            &access,
+        )
+        .await?;
 
     let timing = Instant::now();
 
@@ -1361,6 +1493,7 @@ pub async fn discover(
             shard_selector,
             access,
             timeout,
+            request_hw_counter.get_counter(),
         )
         .await?;
 
@@ -1370,18 +1503,20 @@ pub async fn discover(
             .map(|point| point.into())
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn discover_batch(
-    toc: &TableOfContent,
-    collection_name: String,
+    toc_provider: impl CheckedTocProvider,
+    collection_name: &str,
     discover_points: Vec<DiscoverPoints>,
     read_consistency: Option<ReadConsistencyGrpc>,
     access: Access,
     timeout: Option<Duration>,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<DiscoverBatchResponse>, Status> {
     let mut requests = Vec::with_capacity(discover_points.len());
 
@@ -1394,14 +1529,25 @@ pub async fn discover_batch(
 
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
+    let toc = toc_provider
+        .check_strict_mode_batch(
+            &requests,
+            |i| &i.0,
+            collection_name,
+            timeout.map(|i| i.as_secs() as usize),
+            &access,
+        )
+        .await?;
+
     let timing = Instant::now();
     let scored_points = toc
         .discover_batch(
-            &collection_name,
+            collection_name,
             requests,
             read_consistency,
             access,
             timeout,
+            request_hw_counter.get_counter(),
         )
         .await?;
 
@@ -1413,12 +1559,14 @@ pub async fn discover_batch(
             })
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
+
 pub async fn scroll(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     scroll_points: ScrollPoints,
     shard_selection: Option<ShardId>,
     access: Access,
@@ -1450,6 +1598,15 @@ pub async fn scroll(
             .map(OrderByInterface::Struct),
     };
 
+    let toc = toc_provider
+        .check_strict_mode(
+            &scroll_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
+
     let timeout = timeout.map(Duration::from_secs);
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
@@ -1467,14 +1624,17 @@ pub async fn scroll(
     )
     .await?;
 
+    let points: Result<_, _> = scrolled_points
+        .points
+        .into_iter()
+        .map(api::grpc::qdrant::RetrievedPoint::try_from)
+        .collect();
+
+    let points = points.map_err(|e| Status::internal(format!("Failed to convert points: {e}")))?;
+
     let response = ScrollResponse {
         next_page_offset: scrolled_points.next_page_offset.map(|n| n.into()),
-        result: scrolled_points
-            .points
-            .into_iter()
-            .map(Record::from)
-            .map(api::grpc::qdrant::RetrievedPoint::from)
-            .collect(),
+        result: points,
         time: timing.elapsed().as_secs_f64(),
     };
 
@@ -1482,10 +1642,11 @@ pub async fn scroll(
 }
 
 pub async fn count(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     count_points: CountPoints,
     shard_selection: Option<ShardId>,
-    access: Access,
+    access: &Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<CountResponse>, Status> {
     let CountPoints {
         collection_name,
@@ -1500,12 +1661,23 @@ pub async fn count(
         filter: filter.map(|f| f.try_into()).transpose()?,
         exact: exact.unwrap_or_else(default_exact_count),
     };
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &count_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            access,
+        )
+        .await?;
+
     let timeout = timeout.map(Duration::from_secs);
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
     let shard_selector = convert_shard_selector_for_read(shard_selection, shard_key_selector);
 
     let timing = Instant::now();
+
     let count_result = do_count_points(
         toc,
         &collection_name,
@@ -1513,20 +1685,22 @@ pub async fn count(
         read_consistency,
         timeout,
         shard_selector,
-        access,
+        access.clone(),
+        request_hw_counter.get_counter(),
     )
     .await?;
 
     let response = CountResponse {
         result: Some(count_result.into()),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn get(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     get_points: GetPoints,
     shard_selection: Option<ShardId>,
     access: Access,
@@ -1551,12 +1725,22 @@ pub async fn get(
             .map(|selector| selector.into())
             .unwrap_or_default(),
     };
-    let timeout = timeout.map(Duration::from_secs);
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
 
     let shard_selector = convert_shard_selector_for_read(shard_selection, shard_key_selector);
 
     let timing = Instant::now();
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &point_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
+
+    let timeout = timeout.map(Duration::from_secs);
 
     let records = do_get_points(
         toc,
@@ -1578,10 +1762,11 @@ pub async fn get(
 }
 
 pub async fn query(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     query_points: QueryPoints,
     shard_selection: Option<ShardId>,
     access: Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<QueryResponse>, Status> {
     let shard_key_selector = query_points.shard_key_selector.clone();
     let shard_selector = convert_shard_selector_for_read(shard_selection, shard_key_selector);
@@ -1590,9 +1775,21 @@ pub async fn query(
         .clone()
         .map(TryFrom::try_from)
         .transpose()?;
-    let timeout = query_points.timeout.map(Duration::from_secs);
     let collection_name = query_points.collection_name.clone();
-    let request = CollectionQueryRequest::try_from(query_points)?;
+    let timeout = query_points.timeout;
+    let request = convert_query_points_from_grpc(query_points).await?;
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
+
+    let timeout = timeout.map(Duration::from_secs);
+
     let timing = Instant::now();
     let scored_points = do_query_points(
         toc,
@@ -1602,6 +1799,7 @@ pub async fn query(
         shard_selector,
         access,
         timeout,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
@@ -1611,35 +1809,49 @@ pub async fn query(
             .map(|point| point.into())
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn query_batch(
-    toc: &TableOfContent,
-    collection_name: String,
+    toc_provider: impl CheckedTocProvider,
+    collection_name: &str,
     points: Vec<QueryPoints>,
     read_consistency: Option<ReadConsistencyGrpc>,
     access: Access,
     timeout: Option<Duration>,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<QueryBatchResponse>, Status> {
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
     let mut requests = Vec::with_capacity(points.len());
     for query_points in points {
         let shard_key_selector = query_points.shard_key_selector.clone();
         let shard_selector = convert_shard_selector_for_read(None, shard_key_selector);
-        let request = CollectionQueryRequest::try_from(query_points)?;
+        let request = convert_query_points_from_grpc(query_points).await?;
         requests.push((request, shard_selector));
     }
+
+    let toc = toc_provider
+        .check_strict_mode_batch(
+            &requests,
+            |i| &i.0,
+            collection_name,
+            timeout.map(|i| i.as_secs() as usize),
+            &access,
+        )
+        .await?;
+
     let timing = Instant::now();
     let scored_points = do_query_batch_points(
         toc,
-        &collection_name,
+        collection_name,
         requests,
         read_consistency,
         access,
         timeout,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
@@ -1651,16 +1863,18 @@ pub async fn query_batch(
             })
             .collect(),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn query_groups(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     query_points: QueryPointGroups,
     shard_selection: Option<ShardId>,
     access: Access,
+    request_hw_counter: RequestHwCounter,
 ) -> Result<Response<QueryGroupsResponse>, Status> {
     let shard_key_selector = query_points.shard_key_selector.clone();
     let shard_selector = convert_shard_selector_for_read(shard_selection, shard_key_selector);
@@ -1669,10 +1883,22 @@ pub async fn query_groups(
         .clone()
         .map(TryFrom::try_from)
         .transpose()?;
-    let timeout = query_points.timeout.map(Duration::from_secs);
+    let timeout = query_points.timeout;
     let collection_name = query_points.collection_name.clone();
-    let request = CollectionQueryGroupsRequest::try_from(query_points)?;
+    let request = convert_query_point_groups_from_grpc(query_points).await?;
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
+
+    let timeout = timeout.map(Duration::from_secs);
     let timing = Instant::now();
+
     let groups_result = do_query_point_groups(
         toc,
         &collection_name,
@@ -1681,19 +1907,24 @@ pub async fn query_groups(
         shard_selector,
         access,
         timeout,
+        request_hw_counter.get_counter(),
     )
     .await?;
 
+    let grpc_group_result = GroupsResult::try_from(groups_result)
+        .map_err(|err| Status::internal(format!("failed to convert result: {err}")))?;
+
     let response = QueryGroupsResponse {
-        result: Some(groups_result.into()),
+        result: Some(grpc_group_result),
         time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_counter.to_grpc_api(),
     };
 
     Ok(Response::new(response))
 }
 
 pub async fn facet(
-    toc: &TableOfContent,
+    toc_provider: impl CheckedTocProvider,
     facet_counts: FacetCounts,
     access: Access,
 ) -> Result<Response<FacetResponse>, Status> {
@@ -1718,6 +1949,15 @@ pub async fn facet(
             .unwrap_or(FacetParams::DEFAULT_LIMIT),
         exact: exact.unwrap_or(FacetParams::DEFAULT_EXACT),
     };
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &facet_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
 
     let timeout = timeout.map(Duration::from_secs);
     let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
@@ -1744,4 +1984,65 @@ pub async fn facet(
     };
 
     Ok(Response::new(response))
+}
+
+pub async fn search_points_matrix(
+    toc_provider: impl CheckedTocProvider,
+    search_matrix_points: SearchMatrixPoints,
+    access: Access,
+    hw_measurement_acc: &HwMeasurementAcc,
+) -> Result<CollectionSearchMatrixResponse, Status> {
+    let SearchMatrixPoints {
+        collection_name,
+        filter,
+        sample,
+        limit,
+        using,
+        read_consistency,
+        shard_key_selector,
+        timeout,
+    } = search_matrix_points;
+
+    let search_matrix_request = CollectionSearchMatrixRequest {
+        filter: filter.map(TryInto::try_into).transpose()?,
+        sample_size: sample
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("could not parse 'sample' param into usize"))?
+            .unwrap_or(CollectionSearchMatrixRequest::DEFAULT_SAMPLE),
+        limit_per_sample: limit
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("could not parse 'limit' param into usize"))?
+            .unwrap_or(CollectionSearchMatrixRequest::DEFAULT_LIMIT_PER_SAMPLE),
+        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
+    };
+
+    let toc = toc_provider
+        .check_strict_mode(
+            &search_matrix_request,
+            &collection_name,
+            timeout.map(|i| i as usize),
+            &access,
+        )
+        .await?;
+
+    let timeout = timeout.map(Duration::from_secs);
+    let read_consistency = ReadConsistency::try_from_optional(read_consistency)?;
+
+    let shard_selector = convert_shard_selector_for_read(None, shard_key_selector);
+
+    let search_matrix_response = toc
+        .search_points_matrix(
+            &collection_name,
+            search_matrix_request,
+            read_consistency,
+            shard_selector,
+            access,
+            timeout,
+            hw_measurement_acc,
+        )
+        .await?;
+
+    Ok(search_matrix_response)
 }

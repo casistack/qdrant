@@ -1,6 +1,9 @@
 use std::ops::Deref as _;
 use std::path::Path;
 
+use common::tar_ext;
+use segment::types::SnapshotFormat;
+
 use super::{ReplicaSetState, ReplicaState, ShardReplicaSet, REPLICA_STATE_FILE};
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::save_on_disk::SaveOnDisk;
@@ -13,22 +16,24 @@ impl ShardReplicaSet {
     pub async fn create_snapshot(
         &self,
         temp_path: &Path,
-        target_path: &Path,
+        tar: &tar_ext::BuilderExt,
+        format: SnapshotFormat,
         save_wal: bool,
     ) -> CollectionResult<()> {
         let local_read = self.local.read().await;
 
         if let Some(local) = &*local_read {
             local
-                .create_snapshot(temp_path, target_path, save_wal)
+                .create_snapshot(temp_path, tar, format, save_wal)
                 .await?
         }
 
         self.replica_state
-            .save_to(target_path.join(REPLICA_STATE_FILE))?;
+            .save_to_tar(tar, REPLICA_STATE_FILE)
+            .await?;
 
         let shard_config = ShardConfig::new_replica_set();
-        shard_config.save(target_path)?;
+        shard_config.save_to_tar(tar).await?;
         Ok(())
     }
 
@@ -136,17 +141,21 @@ impl ShardReplicaSet {
                 // TODO: Handle single-node mode!? (How!? 😰)
 
                 // Mark this peer as "locally disabled"...
-                let has_other_active_peers = self.active_remote_shards().await.is_empty();
+                let has_other_active_peers = self.active_remote_shards().is_empty();
 
                 // ...if this peer is *not* the last active replica
                 if has_other_active_peers {
                     let notify = self
                         .locally_disabled_peers
                         .write()
-                        .disable_peer_and_notify_if_elapsed(self.this_peer_id());
+                        .disable_peer_and_notify_if_elapsed(self.this_peer_id(), None);
 
                     if notify {
-                        self.notify_peer_failure_cb.deref()(self.this_peer_id(), self.shard_id);
+                        self.notify_peer_failure_cb.deref()(
+                            self.this_peer_id(),
+                            self.shard_id,
+                            None,
+                        );
                     }
                 }
 

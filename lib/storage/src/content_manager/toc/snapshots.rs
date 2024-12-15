@@ -14,7 +14,7 @@ use crate::rbac::CollectionPass;
 
 impl TableOfContent {
     pub fn get_snapshots_storage_manager(&self) -> Result<SnapshotStorageManager, StorageError> {
-        SnapshotStorageManager::new(self.storage_config.snapshots_config.clone()).map_err(|err| {
+        SnapshotStorageManager::new(&self.storage_config.snapshots_config).map_err(|err| {
             StorageError::service_error(format!(
                 "Can't create snapshot storage manager. Error: {err}"
             ))
@@ -52,9 +52,9 @@ impl TableOfContent {
         Ok(snapshots_path)
     }
 
-    pub async fn create_snapshot<'a>(
+    pub async fn create_snapshot(
         &self,
-        collection: &CollectionPass<'a>,
+        collection: &CollectionPass<'_>,
     ) -> Result<SnapshotDescription, StorageError> {
         let collection = self.get_collection(collection).await?;
         // We want to use temp dir inside the temp_path (storage if not specified), because it is possible, that

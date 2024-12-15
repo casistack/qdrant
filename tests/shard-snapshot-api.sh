@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -eEuo pipefail
 
 
 declare QDRANT_HOST="${QDRANT_HOST:-localhost}"
@@ -38,6 +38,7 @@ declare FILESERVER_PID=''
 
 function main {
 	load-qdrant-status
+	trap 'failure $LINENO' ERR
 	trap cleanup EXIT
 	"$@"
 }
@@ -80,26 +81,24 @@ function cleanup {
 	fi
 }
 
+function failure {
+	printf "Exit code: %d\n" $? >&2
+	declare INDEX
+	for (( INDEX=0; INDEX<${#BASH_LINENO[@]}-1; INDEX++ ))
+	do
+		printf "%s:%d@%s: " \
+			"${BASH_SOURCE[INDEX+1]}" \
+			"$(( INDEX > 0 ? BASH_LINENO[INDEX] : $1 ))" \
+			"${FUNCNAME[INDEX+1]}"
+		(( INDEX > 0 )) && \
+			printf "%s\n" "${FUNCNAME[INDEX]}" || \
+			printf "%s\n" " $BASH_COMMAND"
+	done >&2
+}
+
 function kill-jobs {
 	# shellcheck disable=SC2046
 	kill $(jobs -p) &>/dev/null || :
-}
-
-function storage-s3-test-all {
-	echo "Using S3 storage"
-  CONFIG_FILE="./config/config.yaml"
-
-	yq eval -i '.storage.snapshots_config += {"s3_config": {}}' $CONFIG_FILE
-
-	# Set to S3 with dynamic or fixed credentials
-	yq eval -i '.storage.snapshots_config.snapshots_storage = "s3"' $CONFIG_FILE
-	yq eval -i '.storage.snapshots_config.s3_config.bucket = "test-bucket"' $CONFIG_FILE
-	yq eval -i '.storage.snapshots_config.s3_config.region = "us-east-1"' $CONFIG_FILE
-	yq eval -i '.storage.snapshots_config.s3_config.access_key = "minioadmin"' $CONFIG_FILE
-	yq eval -i '.storage.snapshots_config.s3_config.secret_key = "minioadmin"' $CONFIG_FILE
-	yq eval -i '.storage.snapshots_config.s3_config.endpoint_url = "http://127.0.0.1:9000"' $CONFIG_FILE
-
-	test-all
 }
 
 
@@ -317,8 +316,16 @@ function upload {
 	fixture-with-downloaded-snapshot
 	fixture-with-empty-collection
 
+    # Memory usage before upload
+    echo "Memory usage before upload:"
+    free -h
+
 	do-upload "$@"
 	check-recovered - "$DOWNLOADED_SNAPSHOT_POINTS" "$@"
+
+    # Memory usage after upload
+    echo "Memory usage after upload:"
+    free -h
 }
 
 function upload-priority-snapshot {
@@ -437,7 +444,7 @@ function fixture-with-points {
 				--uri "http://$QDRANT_HOST:$QDRANT_GRPC_PORT" \
 				--collection-name "$(basename "$(url)")" \
 				--dim 128 \
-				--num-vectors 10000 \
+                --num-vectors 100000 \
 				--skip-create
 		else
 			curl-ok \
@@ -606,7 +613,7 @@ function points-count {
 }
 
 function concurrent {
-	declare PARALLEL ; PARALLEL="$(or-default "$1" 2)"
+	declare PARALLEL ; PARALLEL="$(or-default "$1" 10)"
 	declare CMD=( "${@:2}" )
 
 	declare -A JOBS

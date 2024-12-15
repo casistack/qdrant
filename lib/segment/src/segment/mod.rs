@@ -25,6 +25,7 @@ use crate::common::operation_error::{OperationResult, SegmentFailedState};
 use crate::id_tracker::IdTrackerSS;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::VectorIndexEnum;
+use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
 use crate::types::{SegmentConfig, SegmentType, SeqNumberType, VectorName};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::VectorStorageEnum;
@@ -65,6 +66,7 @@ pub struct Segment {
     pub id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
     pub vector_data: HashMap<VectorName, VectorData>,
     pub payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
+    pub payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
     /// Shows if it is possible to insert more points into this segment
     pub appendable_flag: bool,
     /// Shows what kind of indexes and storages are used in this segment
@@ -92,7 +94,7 @@ impl fmt::Debug for VectorData {
 impl VectorData {
     pub fn prefault_mmap_pages(&self) -> impl Iterator<Item = mmap_ops::PrefaultMmapPages> {
         let index_task = match &*self.vector_index.borrow() {
-            VectorIndexEnum::HnswMmap(index) => index.prefault_mmap_pages(),
+            VectorIndexEnum::HnswMmap(index) => Some(index.prefault_mmap_pages()),
             _ => None,
         };
 

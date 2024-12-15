@@ -10,7 +10,7 @@ pub mod web_ui;
 use std::io;
 use std::sync::Arc;
 
-use ::api::grpc::models::{ApiResponse, ApiStatus, VersionInfo};
+use ::api::rest::models::{ApiResponse, ApiStatus, VersionInfo};
 use actix_cors::Cors;
 use actix_multipart::form::tempfile::TempFileConfig;
 use actix_multipart::form::MultipartFormConfig;
@@ -19,6 +19,7 @@ use actix_web::{error, get, web, App, HttpRequest, HttpResponse, HttpServer, Res
 use actix_web_extras::middleware::Condition as ConditionEx;
 use api::facet_api::config_facet_api;
 use collection::operations::validation;
+use collection::operations::verification::new_unchecked_verification_pass;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 
@@ -61,12 +62,16 @@ pub fn init(
     logger_handle: LoggerHandle,
 ) -> io::Result<()> {
     actix_web::rt::System::new().block_on(async {
+        // Nothing to verify here.
+        let pass = new_unchecked_verification_pass();
         let auth_keys = AuthKeys::try_create(
             &settings.service,
-            dispatcher.toc(&Access::full("For JWT validation")).clone(),
+            dispatcher
+                .toc(&Access::full("For JWT validation"), &pass)
+                .clone(),
         );
         let upload_dir = dispatcher
-            .toc(&Access::full("For upload dir"))
+            .toc(&Access::full("For upload dir"), &pass)
             .upload_dir()
             .unwrap();
         let dispatcher_data = web::Data::from(dispatcher);
@@ -81,6 +86,7 @@ pub fn init(
         let http_client = web::Data::new(HttpClient::from_settings(&settings)?);
         let health_checker = web::Data::new(health_checker);
         let web_ui_available = web_ui_folder(&settings);
+        let service_config = web::Data::new(settings.service.clone());
 
         let mut api_key_whitelist = vec![
             WhitelistItem::exact("/"),
@@ -137,6 +143,7 @@ pub fn init(
                 .app_data(validate_json_config)
                 .app_data(TempFileConfig::default().directory(&upload_dir))
                 .app_data(MultipartFormConfig::default().total_limit(usize::MAX))
+                .app_data(service_config.clone())
                 .service(index)
                 .configure(config_collections_api)
                 .configure(config_snapshots_api)
@@ -235,6 +242,7 @@ fn validation_error_handler(
         result: None,
         status: ApiStatus::Error(msg),
         time: 0.0,
+        usage: None,
     });
     error::InternalError::from_response(err, response).into()
 }

@@ -166,7 +166,7 @@ impl PayloadIndex for PlainPayloadIndex {
         Box::new(vec![].into_iter())
     }
 
-    fn assign_all(
+    fn overwrite_payload(
         &mut self,
         _point_id: PointOffsetType,
         _payload: &Payload,
@@ -174,7 +174,7 @@ impl PayloadIndex for PlainPayloadIndex {
         unreachable!()
     }
 
-    fn assign(
+    fn set_payload(
         &mut self,
         _point_id: PointOffsetType,
         _payload: &Payload,
@@ -183,11 +183,11 @@ impl PayloadIndex for PlainPayloadIndex {
         unreachable!()
     }
 
-    fn payload(&self, _point_id: PointOffsetType) -> OperationResult<Payload> {
+    fn get_payload(&self, _point_id: PointOffsetType) -> OperationResult<Payload> {
         unreachable!()
     }
 
-    fn delete(
+    fn delete_payload(
         &mut self,
         _point_id: PointOffsetType,
         _key: PayloadKeyTypeRef,
@@ -195,7 +195,7 @@ impl PayloadIndex for PlainPayloadIndex {
         unreachable!()
     }
 
-    fn drop(&mut self, _point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
+    fn clear_payload(&mut self, _point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
         unreachable!()
     }
 
@@ -252,7 +252,7 @@ impl PlainIndex {
         let available_vector_count = vector_storage.available_vector_count();
         if available_vector_count > 0 {
             let vector_size_bytes =
-                vector_storage.available_size_in_bytes() / available_vector_count;
+                vector_storage.size_of_available_vectors_in_bytes() / available_vector_count;
             let indexing_threshold_bytes = search_optimized_threshold_kb * BYTES_IN_KB;
 
             if let Some(payload_filter) = filter {
@@ -300,7 +300,7 @@ impl VectorIndex for PlainIndex {
                 let filtered_ids_vec = payload_index.query_points(filter);
                 let deleted_points = query_context
                     .deleted_points()
-                    .unwrap_or(id_tracker.deleted_point_bitslice());
+                    .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
                 vectors
                     .iter()
                     .map(|&vector| {
@@ -311,7 +311,10 @@ impl VectorIndex for PlainIndex {
                             &is_stopped,
                         )
                         .map(|scorer| {
-                            scorer.peek_top_iter(&mut filtered_ids_vec.iter().copied(), top)
+                            let res =
+                                scorer.peek_top_iter(&mut filtered_ids_vec.iter().copied(), top);
+                            query_context.apply_hardware_counter(scorer.take_hardware_counter());
+                            res
                         })
                     })
                     .collect()
@@ -322,7 +325,7 @@ impl VectorIndex for PlainIndex {
                 let id_tracker = self.id_tracker.borrow();
                 let deleted_points = query_context
                     .deleted_points()
-                    .unwrap_or(id_tracker.deleted_point_bitslice());
+                    .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
                 vectors
                     .iter()
                     .map(|&vector| {
@@ -332,7 +335,11 @@ impl VectorIndex for PlainIndex {
                             deleted_points,
                             &is_stopped,
                         )
-                        .map(|scorer| scorer.peek_top_all(top))
+                        .map(|scorer| {
+                            let res = scorer.peek_top_all(top);
+                            query_context.apply_hardware_counter(scorer.take_hardware_counter());
+                            res
+                        })
                     })
                     .collect()
             }
@@ -397,7 +404,7 @@ pub struct PlainFilterContext<'a> {
     filter: &'a Filter,
 }
 
-impl<'a> FilterContext for PlainFilterContext<'a> {
+impl FilterContext for PlainFilterContext<'_> {
     fn check(&self, point_id: PointOffsetType) -> bool {
         self.condition_checker.check(point_id, self.filter)
     }

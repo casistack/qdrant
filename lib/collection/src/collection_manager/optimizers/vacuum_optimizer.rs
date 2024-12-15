@@ -65,7 +65,7 @@ impl VacuumOptimizer {
         &self,
         segments: LockedSegmentHolder,
         excluded_ids: &HashSet<SegmentId>,
-    ) -> Option<(SegmentId, LockedSegment)> {
+    ) -> Option<SegmentId> {
         let segments_read_guard = segments.read();
         segments_read_guard
             .iter()
@@ -81,7 +81,7 @@ impl VacuumOptimizer {
                     .map(|ratio| (*idx, ratio))
             })
             .max_by_key(|(_, ratio)| OrderedFloat(*ratio))
-            .map(|(idx, _)| (idx, segments_read_guard.get(idx).unwrap().clone()))
+            .map(|(idx, _)| idx)
     }
 
     /// Calculate littered ratio for segment on point level
@@ -196,10 +196,9 @@ impl SegmentOptimizer for VacuumOptimizer {
         segments: LockedSegmentHolder,
         excluded_ids: &HashSet<SegmentId>,
     ) -> Vec<SegmentId> {
-        match self.worst_segment(segments, excluded_ids) {
-            None => vec![],
-            Some((segment_id, _segment)) => vec![segment_id],
-        }
+        self.worst_segment(segments, excluded_ids)
+            .into_iter()
+            .collect()
     }
 
     fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator> {
@@ -468,7 +467,7 @@ mod tests {
                 &false.into(),
             )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
             "optimized segment should be gone",
@@ -583,7 +582,7 @@ mod tests {
                 &false.into(),
             )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure deleted points and vectors are optimized
         locked_holder

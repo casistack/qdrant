@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use collection::common::snapshots_manager::SnapShotsConfig;
-use collection::config::WalConfig;
+use collection::config::{default_on_disk_payload, WalConfig};
 use collection::operations::config_diff::OptimizersConfigDiff;
 use collection::operations::shared_storage_config::{
     SharedStorageConfig, DEFAULT_IO_SHARD_TRANSFER_LIMIT, DEFAULT_SNAPSHOTS_PATH,
@@ -43,6 +43,8 @@ pub struct PerformanceConfig {
     pub incoming_shard_transfers_limit: Option<usize>,
     #[serde(default = "default_io_shard_transfers_limit")]
     pub outgoing_shard_transfers_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_scorer: Option<bool>,
 }
 
 const fn default_io_shard_transfers_limit() -> Option<usize> {
@@ -64,6 +66,12 @@ pub struct StorageConfig {
     pub temp_path: Option<String>,
     #[serde(default = "default_on_disk_payload")]
     pub on_disk_payload: bool,
+    // TODO: remove this field after integration is finished
+    #[serde(default)]
+    pub on_disk_payload_uses_mmap: bool,
+    // TODO: remove this field after integration is finished
+    #[serde(default)]
+    pub on_disk_sparse_vectors_uses_mmap: bool,
     #[validate(nested)]
     pub optimizers: OptimizersConfig,
     #[validate(nested)]
@@ -82,8 +90,6 @@ pub struct StorageConfig {
     pub update_queue_size: Option<usize>,
     #[serde(default)]
     pub handle_collection_load_errors: bool,
-    #[serde(default)]
-    pub async_scorer: bool,
     /// If provided - qdrant will start in recovery mode, which means that it will not accept any new data.
     /// Only collection metadata will be available, and it will only process collection delete requests.
     /// Provided value will be used error message for unavailable requests.
@@ -122,10 +128,6 @@ impl StorageConfig {
 
 fn default_snapshots_path() -> String {
     DEFAULT_SNAPSHOTS_PATH.to_string()
-}
-
-const fn default_on_disk_payload() -> bool {
-    false
 }
 
 const fn default_mmap_advice() -> madvise::Advice {

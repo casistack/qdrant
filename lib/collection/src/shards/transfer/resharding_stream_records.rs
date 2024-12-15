@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use parking_lot::Mutex;
 
 use super::transfer_tasks_pool::TransferTaskProgress;
@@ -30,6 +31,7 @@ pub(crate) async fn transfer_resharding_stream_records(
     collection_id: &CollectionId,
 ) -> CollectionResult<()> {
     let remote_peer_id = remote_shard.peer_id;
+    let cutoff;
     let hashring;
 
     log::debug!(
@@ -40,7 +42,7 @@ pub(crate) async fn transfer_resharding_stream_records(
     {
         let shard_holder = shard_holder.read().await;
 
-        let Some(replica_set) = shard_holder.get_shard(&shard_id) else {
+        let Some(replica_set) = shard_holder.get_shard(shard_id) else {
             return Err(CollectionError::service_error(format!(
                 "Shard {shard_id} cannot be proxied because it does not exist"
             )));
@@ -62,6 +64,7 @@ pub(crate) async fn transfer_resharding_stream_records(
             .proxify_local(remote_shard.clone(), Some(hashring.clone()))
             .await?;
 
+        let hw_acc = HwMeasurementAcc::new();
         let Some(count_result) = replica_set
             .count_local(
                 Arc::new(CountRequestInternal {
@@ -69,6 +72,7 @@ pub(crate) async fn transfer_resharding_stream_records(
                     exact: true,
                 }),
                 None,
+                &hw_acc,
             )
             .await?
         else {
@@ -77,8 +81,12 @@ pub(crate) async fn transfer_resharding_stream_records(
             )));
         };
         progress.lock().points_total = count_result.count;
+        hw_acc.discard();
 
         replica_set.transfer_indexes().await?;
+
+        // Take our last seen clocks as cutoff point right before doing content batch transfers
+        cutoff = replica_set.shard_recovery_point().await?;
     }
 
     // Transfer contents batch by batch
@@ -89,7 +97,7 @@ pub(crate) async fn transfer_resharding_stream_records(
     loop {
         let shard_holder = shard_holder.read().await;
 
-        let Some(replica_set) = shard_holder.get_shard(&shard_id) else {
+        let Some(replica_set) = shard_holder.get_shard(shard_id) else {
             // Forward proxy gone?!
             // That would be a programming error.
             return Err(CollectionError::service_error(format!(
@@ -115,37 +123,20 @@ pub(crate) async fn transfer_resharding_stream_records(
         }
     }
 
-    // Update cutoff point on remote shard, disallow recovery before our current last seen
-    {
-        let shard_holder = shard_holder.read().await;
-        let Some(replica_set) = shard_holder.get_shard(&shard_id) else {
-            // Forward proxy gone?!
-            // That would be a programming error.
-            return Err(CollectionError::service_error(format!(
-                "Shard {shard_id} is not found"
-            )));
-        };
-
-        let cutoff = replica_set.shard_recovery_point().await?;
-        let result = remote_shard
-            .update_shard_cutoff_point(collection_id, remote_shard.id, &cutoff)
-            .await;
-
-        // Warn and ignore if remote shard is running an older version, error otherwise
-        // TODO: this is fragile, improve this with stricter matches/checks
-        match result {
-            // This string match is fragile but there does not seem to be a better way
-            Err(err)
-                if err.to_string().starts_with(
-                    "Service internal error: Tonic status error: status: Unimplemented",
-                ) =>
-            {
-                log::warn!("Cannot update cutoff point on remote shard because it is running an older version, ignoring: {err}");
-            }
-            Err(err) => return Err(err),
-            Ok(()) => {}
-        }
-    }
+    // Update cutoff point on remote shard, disallow recovery before it
+    //
+    // We provide it our last seen clocks from just before transferrinmg the content batches, and
+    // not our current last seen clocks. We're sure that after the transfer the remote must have
+    // seen all point data for those clocks. While we cannot guarantee the remote has all point
+    // data for our current last seen clocks because some operations may still be in flight.
+    // This is a trade-off between being conservative and being too conservative.
+    //
+    // We must send a cutoff point to the remote so it can learn about all the clocks that exist.
+    // If we don't do this it is possible the remote will never see a clock, breaking all future
+    // WAL delta transfers.
+    remote_shard
+        .update_shard_cutoff_point(collection_id, remote_shard.id, &cutoff)
+        .await?;
 
     log::debug!(
         "Ending shard {shard_id} transfer to peer {remote_peer_id} by reshard streaming records"

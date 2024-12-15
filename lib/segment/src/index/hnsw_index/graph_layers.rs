@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::cmp::max;
 use std::path::{Path, PathBuf};
 
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::types::{PointOffsetType, ScoredPointOffset};
-use io::file_operations::{atomic_save_bin, read_bin, FileStorageError};
+use io::file_operations::{atomic_save_bin, read_bin};
 use itertools::Itertools;
 use memory::mmap_ops;
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,6 @@ use super::graph_links::{GraphLinks, GraphLinksMmap};
 use crate::common::operation_error::OperationResult;
 use crate::common::utils::rev_range;
 use crate::index::hnsw_index::entry_points::EntryPoints;
-use crate::index::hnsw_index::graph_links::GraphLinksConverter;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::hnsw_index::search_context::SearchContext;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
@@ -24,27 +24,22 @@ pub type LayersContainer = Vec<LinkContainer>;
 pub const HNSW_GRAPH_FILE: &str = "graph.bin";
 pub const HNSW_LINKS_FILE: &str = "links.bin";
 
+/// Contents of the `graph.bin` file.
 #[derive(Deserialize, Serialize, Debug)]
-pub struct GraphLayersBackwardCompatibility {
-    pub(super) max_level: usize,
-    pub(super) m: usize,
-    pub(super) m0: usize,
-    pub(super) ef_construct: usize,
-    pub(super) links_layers: Vec<LayersContainer>,
-    pub(super) entry_points: EntryPoints,
+struct GraphLayerData<'a> {
+    m: usize,
+    m0: usize,
+    ef_construct: usize,
+    entry_points: Cow<'a, EntryPoints>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Debug)]
 pub struct GraphLayers<TGraphLinks: GraphLinks> {
     pub(super) m: usize,
     pub(super) m0: usize,
     pub(super) ef_construct: usize,
-
-    #[serde(skip)]
     pub(super) links: TGraphLinks,
     pub(super) entry_points: EntryPoints,
-
-    #[serde(skip)]
     pub(super) visited_pool: VisitedPool,
 }
 
@@ -142,6 +137,41 @@ pub trait GraphLayersBase {
         }
         current_point
     }
+
+    #[cfg(test)]
+    #[cfg(feature = "gpu")]
+    fn search_entry_on_level(
+        &self,
+        entry_point: PointOffsetType,
+        level: usize,
+        points_scorer: &mut FilteredScorer,
+    ) -> ScoredPointOffset {
+        let limit = self.get_m(level);
+        let mut links: Vec<PointOffsetType> = Vec::with_capacity(2 * self.get_m(0));
+        let mut current_point = ScoredPointOffset {
+            idx: entry_point,
+            score: points_scorer.score_point(entry_point),
+        };
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+
+            links.clear();
+            self.links_map(current_point.idx, level, |link| {
+                links.push(link);
+            });
+
+            let scores = points_scorer.score_points(&mut links, limit);
+            scores.iter().copied().for_each(|score_point| {
+                if score_point.score > current_point.score {
+                    changed = true;
+                    current_point = score_point;
+                }
+            });
+        }
+        current_point
+    }
 }
 
 impl<TGraphLinks: GraphLinks> GraphLayersBase for GraphLayers<TGraphLinks> {
@@ -153,9 +183,7 @@ impl<TGraphLinks: GraphLinks> GraphLayersBase for GraphLayers<TGraphLinks> {
     where
         F: FnMut(PointOffsetType),
     {
-        for link in self.links.links(point_id, level) {
-            f(*link);
-        }
+        self.links.for_each_link(point_id, level, &mut f);
     }
 
     fn get_m(&self, level: usize) -> usize {
@@ -239,53 +267,33 @@ where
     TGraphLinks: GraphLinks,
 {
     pub fn load(graph_path: &Path, links_path: &Path) -> OperationResult<Self> {
-        let try_self: Result<Self, FileStorageError> = if links_path.exists() {
-            read_bin(graph_path)
-        } else {
-            Err(FileStorageError::generic(format!(
-                "Links file does not exists: {links_path:?}"
-            )))
-        };
-
-        match try_self {
-            Ok(mut slf) => {
-                let links = TGraphLinks::load_from_file(links_path)?;
-                slf.links = links;
-                Ok(slf)
-            }
-            Err(err) => {
-                let try_legacy: Result<GraphLayersBackwardCompatibility, _> = read_bin(graph_path);
-                if let Ok(legacy) = try_legacy {
-                    log::debug!("Converting legacy graph to new format");
-
-                    let mut converter = GraphLinksConverter::new(legacy.links_layers);
-                    converter.save_as(links_path)?;
-
-                    let links = TGraphLinks::from_converter(converter)?;
-                    let slf = Self {
-                        m: legacy.m,
-                        m0: legacy.m0,
-                        ef_construct: legacy.ef_construct,
-                        links,
-                        entry_points: legacy.entry_points,
-                        visited_pool: VisitedPool::new(),
-                    };
-                    slf.save(graph_path)?;
-                    Ok(slf)
-                } else {
-                    Err(err)?
-                }
-            }
-        }
+        let graph_data: GraphLayerData = read_bin(graph_path)?;
+        Ok(Self {
+            m: graph_data.m,
+            m0: graph_data.m0,
+            ef_construct: graph_data.ef_construct,
+            links: TGraphLinks::load_from_file(links_path)?,
+            entry_points: graph_data.entry_points.into_owned(),
+            visited_pool: VisitedPool::new(),
+        })
     }
 
     pub fn save(&self, path: &Path) -> OperationResult<()> {
-        Ok(atomic_save_bin(path, self)?)
+        Ok(atomic_save_bin(path, &self.data())?)
+    }
+
+    fn data(&self) -> GraphLayerData {
+        GraphLayerData {
+            m: self.m,
+            m0: self.m0,
+            ef_construct: self.ef_construct,
+            entry_points: Cow::Borrowed(&self.entry_points),
+        }
     }
 }
 
 impl GraphLayers<GraphLinksMmap> {
-    pub fn prefault_mmap_pages(&self, path: &Path) -> Option<mmap_ops::PrefaultMmapPages> {
+    pub fn prefault_mmap_pages(&self, path: &Path) -> mmap_ops::PrefaultMmapPages {
         self.links.prefault_mmap_pages(path)
     }
 }
@@ -305,7 +313,7 @@ mod tests {
     use crate::fixtures::index_fixtures::{
         random_vector, FakeFilterContext, TestRawScorerProducer,
     };
-    use crate::index::hnsw_index::graph_links::GraphLinksRam;
+    use crate::index::hnsw_index::graph_links::{GraphLinksConverter, GraphLinksRam};
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
     use crate::spaces::metric::Metric;
     use crate::spaces::simple::{CosineMetric, DotProductMetric};
@@ -319,9 +327,12 @@ mod tests {
     ) -> Vec<ScoredPointOffset> {
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_storage.get_raw_scorer(query.to_owned()).unwrap();
+
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
-        graph.search(top, ef, scorer, None)
+        let res = graph.search(top, ef, scorer, None);
+        raw_scorer.take_hardware_counter().discard_results();
+        res
     }
 
     const M: usize = 8;
@@ -339,20 +350,18 @@ mod tests {
         let vector_holder =
             TestRawScorerProducer::<DotProductMetric>::new(dim, num_vectors, &mut rng);
 
-        let mut graph_layers = GraphLayers {
-            m,
-            m0: 2 * m,
-            ef_construct,
-            links: GraphLinksRam::default(),
-            entry_points: EntryPoints::new(entry_points_num),
-            visited_pool: VisitedPool::new(),
-        };
-
         let mut graph_links = vec![vec![Vec::new()]; num_vectors];
         graph_links[0][0] = vec![1, 2, 3, 4, 5, 6];
 
-        graph_layers.links =
-            GraphLinksRam::from_converter(GraphLinksConverter::new(graph_links.clone())).unwrap();
+        let graph_layers = GraphLayers {
+            m,
+            m0: 2 * m,
+            ef_construct,
+            links: GraphLinksRam::from_converter(GraphLinksConverter::new(graph_links.clone()))
+                .unwrap(),
+            entry_points: EntryPoints::new(entry_points_num),
+            visited_pool: VisitedPool::new(),
+        };
 
         let linking_idx: PointOffsetType = 7;
 
@@ -383,6 +392,8 @@ mod tests {
                 scorer.score_internal(linking_idx, nearest.idx)
             )
         }
+
+        raw_scorer.take_hardware_counter().discard_results();
     }
 
     #[test]
@@ -444,7 +455,7 @@ mod tests {
         assert_eq!(main_entry.level, num_levels);
 
         let total_links_0 = (0..num_vectors)
-            .map(|i| graph_layers.links.links(i as PointOffsetType, 0).len())
+            .map(|i| graph_layers.links.links_vec(i as PointOffsetType, 0).len())
             .sum::<usize>();
 
         eprintln!("total_links_0 = {total_links_0:#?}");
@@ -486,7 +497,7 @@ mod tests {
             None,
         );
 
-        let graph_json = serde_json::to_string_pretty(&graph_layers).unwrap();
+        let graph_json = serde_json::to_string_pretty(&graph_layers.data()).unwrap();
 
         let vectors_json = serde_json::to_string_pretty(
             &(0..vector_holder.vectors.len() as PointOffsetType)

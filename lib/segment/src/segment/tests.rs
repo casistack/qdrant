@@ -1,17 +1,22 @@
+use std::collections::HashSet;
+use std::fs::File;
 use std::sync::atomic::AtomicBool;
 
+use common::tar_ext;
+use rstest::rstest;
 use tempfile::Builder;
 
 use super::*;
 use crate::common::operation_error::OperationError::PointIdError;
 use crate::common::{check_named_vectors, check_vector, check_vector_name};
 use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::query_context::QueryContext;
 use crate::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
 use crate::entry::entry_point::SegmentEntry;
 use crate::segment_constructor::{build_segment, load_segment};
 use crate::types::{
-    Distance, Filter, Indexes, Payload, SegmentConfig, VectorDataConfig, VectorStorageType,
-    WithPayload, WithVector,
+    Distance, Filter, Indexes, Payload, SegmentConfig, SnapshotFormat, VectorDataConfig,
+    VectorStorageType, WithPayload, WithVector,
 };
 
 #[test]
@@ -60,6 +65,9 @@ fn test_search_batch_equivalence_single() {
         .unwrap();
     eprintln!("search_result = {search_result:#?}");
 
+    let query_context = QueryContext::default();
+    let segment_query_context = query_context.get_segment_query_context();
+
     let search_batch_result = segment
         .search_batch(
             DEFAULT_VECTOR_NAME,
@@ -69,13 +77,16 @@ fn test_search_batch_equivalence_single() {
             None,
             10,
             None,
-            Default::default(),
+            &segment_query_context,
         )
         .unwrap();
     eprintln!("search_batch_result = {search_batch_result:#?}");
 
     assert!(!search_result.is_empty());
-    assert_eq!(search_result, search_batch_result[0].clone())
+    assert_eq!(search_result, search_batch_result[0].clone());
+    segment_query_context
+        .take_hardware_counter()
+        .discard_results();
 }
 
 #[test]
@@ -171,8 +182,12 @@ fn test_from_filter_attributes() {
     assert!(results_with_invalid_filter.is_empty());
 }
 
-#[test]
-fn test_snapshot() {
+#[rstest]
+#[case::regular(SnapshotFormat::Regular)]
+#[case::streamable(SnapshotFormat::Streamable)]
+fn test_snapshot(#[case] format: SnapshotFormat) {
+    let _ = env_logger::builder().is_test(true).try_init();
+
     let data = r#"
         {
             "name": "John Doe",
@@ -211,36 +226,63 @@ fn test_snapshot() {
         .set_full_payload(1, 0.into(), &serde_json::from_str(data).unwrap())
         .unwrap();
 
-    let snapshot_dir = Builder::new().prefix("snapshot_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
-
-    // snapshotting!
-    let archive = segment
-        .take_snapshot(temp_dir.path(), snapshot_dir.path())
+    // The segment snapshot is a part of a parent collection/shard snapshot.
+    let parent_snapshot_tar = Builder::new()
+        .prefix("parent_snapshot")
+        .suffix(".tar")
+        .tempfile()
         .unwrap();
-    let archive_extension = archive.extension().unwrap();
-    let archive_name = archive.file_name().unwrap().to_str().unwrap().to_string();
-
-    // correct file extension
-    assert_eq!(archive_extension, "tar");
-
-    // archive name contains segment id
     let segment_id = segment
         .current_path
         .file_stem()
         .and_then(|f| f.to_str())
         .unwrap();
-    assert!(archive_name.starts_with(segment_id));
+
+    // snapshotting!
+    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(&parent_snapshot_tar).unwrap());
+    segment
+        .take_snapshot(temp_dir.path(), &tar, format, &mut HashSet::new())
+        .unwrap();
+    tar.blocking_finish().unwrap();
+
+    let parent_snapshot_unpacked = Builder::new().prefix("parent_snapshot").tempdir().unwrap();
+    tar::Archive::new(File::open(&parent_snapshot_tar).unwrap())
+        .unpack(parent_snapshot_unpacked.path())
+        .unwrap();
+
+    // Should be exactly one entry in the snapshot.
+    let mut entries = parent_snapshot_unpacked.path().read_dir().unwrap();
+    let entry = entries.next().unwrap().unwrap();
+    assert!(entries.next().is_none());
+
+    match format {
+        SnapshotFormat::Ancient => unreachable!("The old days are gone"),
+        SnapshotFormat::Regular => {
+            assert_eq!(entry.file_name(), format!("{segment_id}.tar").as_str());
+            assert!(entry.path().is_file());
+        }
+        SnapshotFormat::Streamable => {
+            assert_eq!(entry.file_name(), segment_id);
+            assert!(entry.path().is_dir());
+        }
+    }
 
     // restore snapshot
-    Segment::restore_snapshot(&archive, segment_id).unwrap();
+    Segment::restore_snapshot_in_place(&entry.path()).unwrap();
 
-    let restored_segment = load_segment(
-        &snapshot_dir.path().join(segment_id),
-        &AtomicBool::new(false),
-    )
-    .unwrap()
-    .unwrap();
+    // Should be exactly one entry in the snapshot.
+    let mut entries = parent_snapshot_unpacked.path().read_dir().unwrap();
+    let entry = entries.next().unwrap().unwrap();
+    assert!(entries.next().is_none());
+
+    // It should be unpacked entry, not tar archive.
+    assert!(entry.path().is_dir());
+    assert_eq!(entry.file_name(), segment_id);
+
+    let restored_segment = load_segment(&entry.path(), &AtomicBool::new(false))
+        .unwrap()
+        .unwrap();
 
     // validate restored snapshot is the same as original segment
     assert_eq!(
@@ -557,7 +599,7 @@ fn test_point_vector_count_multivec() {
     segment
         .replace_all_vectors(
             internal_8,
-            NamedVectors::from_pairs([("a".into(), vec![0.1])]),
+            &NamedVectors::from_pairs([("a".into(), vec![0.1])]),
         )
         .unwrap();
     let segment_info = segment.info();
@@ -568,7 +610,7 @@ fn test_point_vector_count_multivec() {
     segment
         .replace_all_vectors(
             internal_8,
-            NamedVectors::from_pairs([("a".into(), vec![0.1]), ("b".into(), vec![0.1])]),
+            &NamedVectors::from_pairs([("a".into(), vec![0.1]), ("b".into(), vec![0.1])]),
         )
         .unwrap();
     let segment_info = segment.info();
@@ -689,6 +731,8 @@ fn test_vector_compatibility_checks() {
             )
             .err()
             .unwrap();
+        let query_context = QueryContext::default();
+        let segment_query_context = query_context.get_segment_query_context();
         segment
             .search_batch(
                 vector_name,
@@ -701,7 +745,7 @@ fn test_vector_compatibility_checks() {
                 None,
                 1,
                 None,
-                Default::default(),
+                &segment_query_context,
             )
             .err()
             .unwrap();
@@ -718,11 +762,11 @@ fn test_vector_compatibility_checks() {
             .err()
             .unwrap();
         segment
-            .insert_new_vectors(point_id, vectors.clone())
+            .insert_new_vectors(point_id, &vectors)
             .err()
             .unwrap();
         segment
-            .replace_all_vectors(internal_id, vectors.clone())
+            .replace_all_vectors(internal_id, &vectors)
             .err()
             .unwrap();
     }

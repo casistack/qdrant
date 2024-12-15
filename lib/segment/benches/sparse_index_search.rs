@@ -1,6 +1,3 @@
-#[cfg(not(target_os = "windows"))]
-mod prof;
-
 use std::sync::atomic::AtomicBool;
 
 use common::types::PointOffsetType;
@@ -25,6 +22,9 @@ use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndex
 use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use sparse::index::loaders::Csr;
 use tempfile::Builder;
+
+#[cfg(not(target_os = "windows"))]
+mod prof;
 
 const NUM_VECTORS: usize = 50_000;
 const MAX_SPARSE_DIM: usize = 30_000;
@@ -92,7 +92,7 @@ fn sparse_vector_index_search_benchmark_impl(
     let mut payload_index = sparse_vector_index.payload_index().borrow_mut();
     for idx in 0..NUM_VECTORS {
         payload_index
-            .assign(idx as PointOffsetType, &payload, &None)
+            .set_payload(idx as PointOffsetType, &payload, &None)
             .unwrap();
     }
     drop(payload_index);

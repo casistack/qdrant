@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use common::types::ScoreType;
 use fnv::FnvBuildHasher;
-use geo::prelude::HaversineDistance;
-use geo::{Contains, Coord, LineString, Point, Polygon};
+use geo::{Contains, Coord, Distance as GeoDistance, Haversine, LineString, Point, Polygon};
 use indexmap::IndexSet;
 use itertools::Itertools;
+use merge::Merge;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -153,10 +153,7 @@ impl<'de> serde::Deserialize<'de> for ExtendedPointId {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = match serde_value::Value::deserialize(deserializer) {
-            Ok(val) => val,
-            Err(err) => return Err(err),
-        };
+        let value = serde_value::Value::deserialize(deserializer)?;
 
         if let Ok(num) = value.clone().deserialize_into() {
             return Ok(ExtendedPointId::NumId(num));
@@ -327,6 +324,11 @@ pub struct SegmentInfo {
     pub num_points: usize,
     pub num_indexed_vectors: usize,
     pub num_deleted_vectors: usize,
+    /// An ESTIMATION of effective amount of bytes used for vectors
+    /// Do NOT rely on this number unless you know what you are doing
+    pub vectors_size_bytes: usize,
+    /// An estimation of the effective amount of bytes used for payloads
+    pub payloads_size_bytes: usize,
     pub ram_usage_bytes: usize,
     pub disk_usage_bytes: usize,
     pub is_appendable: bool,
@@ -416,6 +418,9 @@ pub struct CollectionConfigDefaults {
     #[serde(default = "default_write_consistency_factor_const")]
     #[validate(range(min = 1))]
     pub write_consistency_factor: u32,
+
+    #[validate(nested)]
+    pub strict_mode: Option<StrictModeConfig>,
 }
 
 /// Configuration for vectors.
@@ -661,6 +666,97 @@ impl From<BinaryQuantizationConfig> for QuantizationConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge)]
+pub struct StrictModeConfig {
+    // Global
+    /// Whether strict mode is enabled for a collection or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Max allowed `limit` parameter for all APIs that don't have their own max limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_query_limit: Option<usize>,
+
+    /// Max allowed `timeout` parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_timeout: Option<usize>,
+
+    /// Allow usage of unindexed fields in retrieval based (eg. search) filters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unindexed_filtering_retrieve: Option<bool>,
+
+    /// Allow usage of unindexed fields in filtered updates (eg. delete by payload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unindexed_filtering_update: Option<bool>,
+
+    // Search
+    /// Max HNSW value allowed in search parameters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_hnsw_ef: Option<usize>,
+
+    /// Whether exact search is allowed or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_allow_exact: Option<bool>,
+
+    /// Max oversampling value allowed in search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_oversampling: Option<f64>,
+
+    /// Max batchsize when upserting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upsert_max_batchsize: Option<usize>,
+
+    /// Max size of a collections vector storage in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_collection_vector_size_bytes: Option<usize>,
+
+    /// Max number of read operations per second per shard per peer
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_rate_limit_per_sec: Option<usize>,
+
+    /// Max number of write operations per second per shard per peer
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_rate_limit_per_sec: Option<usize>,
+}
+
+impl Eq for StrictModeConfig {}
+
+impl Hash for StrictModeConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            enabled,
+            max_query_limit,
+            max_timeout,
+            unindexed_filtering_retrieve,
+            unindexed_filtering_update,
+            search_max_hnsw_ef,
+            search_allow_exact,
+            // We skip hashing this field because we cannot reliably hash a float
+            search_max_oversampling: _,
+            upsert_max_batchsize,
+            max_collection_vector_size_bytes,
+            read_rate_limit_per_sec,
+            write_rate_limit_per_sec,
+        } = self;
+        (
+            enabled,
+            max_query_limit,
+            max_timeout,
+            unindexed_filtering_retrieve,
+            unindexed_filtering_update,
+            search_max_hnsw_ef,
+            search_allow_exact,
+            upsert_max_batchsize,
+            max_collection_vector_size_bytes,
+            read_rate_limit_per_sec,
+            write_rate_limit_per_sec,
+        )
+            .hash(state);
+    }
+}
+
 pub const DEFAULT_HNSW_EF_CONSTRUCT: usize = 100;
 
 impl Default for HnswConfig {
@@ -687,15 +783,17 @@ impl Default for Indexes {
 #[serde(tag = "type", content = "options", rename_all = "snake_case")]
 pub enum PayloadStorageType {
     // Store payload in memory and use persistence storage only if vectors are changed
-    #[default]
     InMemory,
     // Store payload on disk only, read each time it is requested
+    #[default]
     OnDisk,
+    // Store payload on disk and in memory, read from memory if possible
+    Mmap,
 }
 
 impl PayloadStorageType {
     pub fn is_on_disk(&self) -> bool {
-        matches!(self, PayloadStorageType::OnDisk)
+        matches!(self, PayloadStorageType::OnDisk | PayloadStorageType::Mmap)
     }
 }
 
@@ -872,12 +970,33 @@ impl VectorDataConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SparseVectorStorageType {
+    /// Storage on disk
+    // (rocksdb storage)
+    #[default]
+    OnDisk,
+    /// Storage in memory maps
+    // (blob_store storage)
+    Mmap,
+}
+
 /// Config of single sparse vector data storage
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Validate)]
 #[serde(rename_all = "snake_case")]
 pub struct SparseVectorDataConfig {
     /// Sparse inverted index config
     pub index: SparseIndexConfig,
+
+    /// Type of storage this sparse vector uses
+    #[serde(default = "default_sparse_vector_storage_type_when_not_in_config")]
+    pub storage_type: SparseVectorStorageType,
+}
+
+/// If the storage type is not in config, it means it is the OnDisk variant
+const fn default_sparse_vector_storage_type_when_not_in_config() -> SparseVectorStorageType {
+    SparseVectorStorageType::OnDisk
 }
 
 impl SparseVectorDataConfig {
@@ -986,9 +1105,8 @@ impl Payload {
         utils::merge_map(&mut self.0, &value.0)
     }
 
-    pub fn merge_by_key(&mut self, value: &Payload, key: &JsonPath) -> OperationResult<()> {
+    pub fn merge_by_key(&mut self, value: &Payload, key: &JsonPath) {
         JsonPath::value_set(Some(key), &mut self.0, &value.0);
-        Ok(())
     }
 
     pub fn remove(&mut self, path: &JsonPath) -> Vec<Value> {
@@ -1020,7 +1138,7 @@ impl PayloadContainer for Payload {
     }
 }
 
-impl<'a> PayloadContainer for OwnedPayloadRef<'a> {
+impl PayloadContainer for OwnedPayloadRef<'_> {
     fn get_value(&self, path: &JsonPath) -> MultiValue<&Value> {
         path.value_get(self.as_ref())
     }
@@ -1062,7 +1180,7 @@ pub enum OwnedPayloadRef<'a> {
     Owned(Rc<Map<String, Value>>),
 }
 
-impl<'a> Deref for OwnedPayloadRef<'a> {
+impl Deref for OwnedPayloadRef<'_> {
     type Target = Map<String, Value>;
 
     fn deref(&self) -> &Self::Target {
@@ -1073,7 +1191,7 @@ impl<'a> Deref for OwnedPayloadRef<'a> {
     }
 }
 
-impl<'a> AsRef<Map<String, Value>> for OwnedPayloadRef<'a> {
+impl AsRef<Map<String, Value>> for OwnedPayloadRef<'_> {
     fn as_ref(&self) -> &Map<String, Value> {
         match self {
             OwnedPayloadRef::Ref(reference) => reference,
@@ -1082,13 +1200,13 @@ impl<'a> AsRef<Map<String, Value>> for OwnedPayloadRef<'a> {
     }
 }
 
-impl<'a> From<Payload> for OwnedPayloadRef<'a> {
+impl From<Payload> for OwnedPayloadRef<'_> {
     fn from(payload: Payload) -> Self {
         OwnedPayloadRef::Owned(Rc::new(payload.0))
     }
 }
 
-impl<'a> From<Map<String, Value>> for OwnedPayloadRef<'a> {
+impl From<Map<String, Value>> for OwnedPayloadRef<'_> {
     fn from(payload: Map<String, Value>) -> Self {
         OwnedPayloadRef::Owned(Rc::new(payload))
     }
@@ -1210,8 +1328,8 @@ impl PayloadSchemaParams {
             PayloadSchemaParams::Float(i) => i.on_disk.unwrap_or_default(),
             PayloadSchemaParams::Datetime(i) => i.on_disk.unwrap_or_default(),
             PayloadSchemaParams::Uuid(i) => i.on_disk.unwrap_or_default(),
-            PayloadSchemaParams::Geo(_) => false,
-            PayloadSchemaParams::Text(_) => false,
+            PayloadSchemaParams::Text(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Geo(i) => i.on_disk.unwrap_or_default(),
             PayloadSchemaParams::Bool(_) => false,
         }
     }
@@ -1681,7 +1799,7 @@ pub struct GeoRadius {
 impl GeoRadius {
     pub fn check_point(&self, point: &GeoPoint) -> bool {
         let query_center = Point::new(self.center.lon, self.center.lat);
-        query_center.haversine_distance(&Point::new(point.lon, point.lat)) < self.radius
+        Haversine::distance(query_center, Point::new(point.lon, point.lat)) < self.radius
     }
 }
 
@@ -1965,9 +2083,29 @@ pub struct HasIdCondition {
     pub has_id: HashSet<PointIdType>,
 }
 
+/// Filter points which have specific vector assigned
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+pub struct HasVectorCondition {
+    pub has_vector: String,
+}
+
+impl From<String> for HasVectorCondition {
+    fn from(vector: String) -> Self {
+        HasVectorCondition { has_vector: vector }
+    }
+}
+
 impl From<HashSet<PointIdType>> for HasIdCondition {
     fn from(set: HashSet<PointIdType>) -> Self {
         HasIdCondition { has_id: set }
+    }
+}
+
+impl FromIterator<PointIdType> for HasIdCondition {
+    fn from_iter<T: IntoIterator<Item = PointIdType>>(iter: T) -> Self {
+        HasIdCondition {
+            has_id: iter.into_iter().collect(),
+        }
     }
 }
 
@@ -2008,6 +2146,9 @@ impl NestedCondition {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
+#[serde(
+    expecting = "Expected some form of condition, which can be a field condition (like {\"key\": ..., \"match\": ... }), or some other mentioned in the documentation: https://qdrant.tech/documentation/concepts/filtering/#filtering-conditions"
+)]
 #[allow(clippy::large_enum_variant)]
 pub enum Condition {
     /// Check if field satisfies provided condition
@@ -2018,6 +2159,8 @@ pub enum Condition {
     IsNull(IsNullCondition),
     /// Check if points id is in a given set
     HasId(HasIdCondition),
+    /// Check if point has vector assigned
+    HasVector(HasVectorCondition),
     /// Nested filters
     Nested(NestedCondition),
     /// Nested filter
@@ -2034,6 +2177,7 @@ impl PartialEq for Condition {
             (Self::IsEmpty(this), Self::IsEmpty(other)) => this == other,
             (Self::IsNull(this), Self::IsNull(other)) => this == other,
             (Self::HasId(this), Self::HasId(other)) => this == other,
+            (Self::HasVector(this), Self::HasVector(other)) => this == other,
             (Self::Nested(this), Self::Nested(other)) => this == other,
             (Self::Filter(this), Self::Filter(other)) => this == other,
             (Self::CustomIdChecker(_), Self::CustomIdChecker(_)) => false,
@@ -2054,7 +2198,10 @@ impl Condition {
 impl Validate for Condition {
     fn validate(&self) -> Result<(), ValidationErrors> {
         match self {
-            Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => Ok(()),
+            Condition::HasId(_)
+            | Condition::IsEmpty(_)
+            | Condition::IsNull(_)
+            | Condition::HasVector(_) => Ok(()),
             Condition::Field(field_condition) => field_condition.validate(),
             Condition::Nested(nested_condition) => nested_condition.validate(),
             Condition::Filter(filter) => filter.validate(),
@@ -2071,6 +2218,9 @@ pub trait CustomIdCheckerCondition: fmt::Debug {
 /// Options for specifying which payload to include or not
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
 #[serde(untagged, rename_all = "snake_case")]
+#[serde(
+    expecting = "Expected a boolean, an array of strings, or an object with an include/exclude field"
+)]
 pub enum WithPayloadInterface {
     /// If `true` - return all payload,
     /// If `false` - do not return payload
@@ -2096,6 +2246,7 @@ impl Default for WithPayloadInterface {
 /// Options for specifying which vector to include
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(untagged, rename_all = "snake_case")]
+#[serde(expecting = "Expected a boolean, or an array of strings")]
 pub enum WithVector {
     /// If `true` - return all vector,
     /// If `false` - do not return vector
@@ -2375,6 +2526,73 @@ impl Filter {
             .chain(self.should.iter().flatten())
             .chain(self.min_should.iter().flat_map(|i| &i.conditions))
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SnapshotFormat {
+    /// Created by Qdrant `<0.11.0`.
+    ///
+    /// The collection snapshot contains nested tar archives for segments.
+    /// Segment tar archives contain a plain copy of the segment directory.
+    ///
+    /// ```plaintext
+    /// ./0/segments/
+    /// ├── 0b31e274-dc65-40e4-8493-67ebed4bcf10.tar
+    /// │   ├── segment.json
+    /// │   ├── CURRENT
+    /// │   ├── 000009.sst
+    /// │   ├── 000010.sst
+    /// │   └── …
+    /// ├── 1d6c96ec-7965-491a-9c45-362d55361e9b.tar
+    /// └── …
+    /// ```
+    Ancient,
+    /// Qdrant `>=0.11.0` `<=1.13` (and maybe even later).
+    ///
+    /// The collection snapshot contains nested tar archives for segments.
+    /// Distinguished by a single top-level directory `snapshot` in each segment
+    /// tar archive. RocksDB data stored as backups and requires unpacking
+    /// procedure.
+    ///
+    /// ```plaintext
+    /// ./0/segments/
+    /// ├── 0b31e274-dc65-40e4-8493-67ebed4bcf10.tar
+    /// │   └── snapshot/                               # single top-level dir
+    /// │       ├── db_backup/                          # rockdb backup
+    /// │       │   ├── meta/
+    /// │       │   ├── private/
+    /// │       │   └── shared_checksum/
+    /// │       ├── payload_index_db_backup             # rocksdb backup
+    /// │       │   ├── meta/
+    /// │       │   ├── private/
+    /// │       │   └── shared_checksum/
+    /// │       └── files/                              # regular files
+    /// │           ├── segment.json
+    /// │           └── …
+    /// ├── 1d6c96ec-7965-491a-9c45-362d55361e9b.tar
+    /// └── …
+    /// ```
+    Regular,
+    /// New experimental format.
+    ///
+    /// ```plaintext
+    /// ./0/segments/
+    /// ├── 0b31e274-dc65-40e4-8493-67ebed4bcf10/
+    /// │   ├── db_backup/                              # rockdb backup
+    /// │   │   ├── meta/
+    /// │   │   ├── private/
+    /// │   │   └── shared_checksum/
+    /// │   ├── payload_index_db_backup                 # rocksdb backup
+    /// │   │   ├── meta/
+    /// │   │   ├── private/
+    /// │   │   └── shared_checksum/
+    /// │   └── files/                                  # regular files
+    /// │       ├── segment.json
+    /// │       └── …
+    /// ├── 1d6c96ec-7965-491a-9c45-362d55361e9b/
+    /// └── …
+    /// ```
+    Streamable,
 }
 
 #[cfg(test)]

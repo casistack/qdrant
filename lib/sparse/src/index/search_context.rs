@@ -2,6 +2,7 @@ use std::cmp::{max, min, Ordering};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::top_k::TopK;
 use common::types::{PointOffsetType, ScoredPointOffset};
 
@@ -32,6 +33,7 @@ pub struct SearchContext<'a, 'b, T: PostingListIter = PostingListIterator<'a>> {
     max_record_id: PointOffsetType,         // max_record_id ids across all posting lists
     pooled: PooledScoresHandle<'b>,         // handle to pooled scores
     use_pruning: bool,
+    hardware_counter: HardwareCounterCell,
 }
 
 impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
@@ -86,6 +88,7 @@ impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
             max_record_id,
             pooled,
             use_pruning,
+            hardware_counter: HardwareCounterCell::new(),
         }
     }
 
@@ -94,6 +97,8 @@ impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
         // sort ids to fully leverage posting list iterator traversal
         let mut sorted_ids = ids.to_vec();
         sorted_ids.sort_unstable();
+
+        let cpu_counter = self.hardware_counter.cpu_counter_mut();
 
         for id in sorted_ids {
             // check for cancellation
@@ -115,6 +120,11 @@ impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
                     }
                 }
             }
+
+            // Accumulate the sum of the length of the retrieved sparse vector and the query vector length
+            // as measurement for CPU usage of plain search.
+            cpu_counter.incr_delta_mut(indices.len() + self.query.indices.len());
+
             // reconstruct sparse vector and score against query
             let sparse_vector = RemappedSparseVector { indices, values };
             self.top_results.push(ScoredPointOffset {
@@ -243,6 +253,17 @@ impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
         if self.postings_iterators.is_empty() {
             return Vec::new();
         }
+
+        {
+            // Measure CPU usage of indexed sparse search.
+            // Assume the complexity of the search as total volume of the posting lists
+            // that are traversed in the batched search.
+            let cpu_counter = self.hardware_counter.cpu_counter_mut();
+            for posting in self.postings_iterators.iter() {
+                cpu_counter.incr_delta_mut(posting.posting_list_iterator.len_to_end());
+            }
+        }
+
         let mut best_min_score = f32::MIN;
         loop {
             // check for cancellation (atomic amortized by batch)
@@ -373,6 +394,11 @@ impl<'a, 'b, T: PostingListIter> SearchContext<'a, 'b, T> {
         }
         // no pruning took place
         false
+    }
+
+    /// Return the current hardware measurement counter.
+    pub fn take_hardware_counter(&self) -> HardwareCounterCell {
+        self.hardware_counter.take()
     }
 }
 
@@ -538,6 +564,11 @@ mod tests {
                 },
             ]
         );
+
+        // len(QueryVector)=3 * len(vector)=3 => 3*3 => 9
+        let counter = search_context.take_hardware_counter();
+        assert_eq!(counter.cpu_counter().get(), 9);
+        counter.discard_results();
     }
 
     #[test]
@@ -584,6 +615,7 @@ mod tests {
                 },
             ]
         );
+        search_context.take_hardware_counter().discard_results();
         drop(search_context);
 
         // update index with new point
@@ -627,6 +659,7 @@ mod tests {
                 },
             ]
         );
+        search_context.take_hardware_counter().discard_results();
     }
 
     #[test]
@@ -675,6 +708,13 @@ mod tests {
             ]
         );
 
+        // [ID=1] (Retrieve all 9 Vectors) => 9
+        // [ID=2] (Retrieve 1-3)           => 3
+        // [ID=3] (Retrieve 1-3)           => 3
+        //                       3 + 3 + 9 => 15
+        assert_eq!(search_context.hardware_counter.cpu_counter().get(), 15);
+        search_context.take_hardware_counter().discard_results();
+
         let mut search_context = SearchContext::new(
             RemappedSparseVector {
                 indices: vec![1, 2, 3],
@@ -704,6 +744,11 @@ mod tests {
                 ScoredPointOffset { score: 6.0, idx: 9 },
             ]
         );
+
+        // No difference to previous calculation because it's the same amount of score
+        // calculations when increasing the "top" parameter.
+        assert_eq!(search_context.hardware_counter.cpu_counter().get(), 15);
+        search_context.take_hardware_counter().discard_results();
     }
 
     #[test]
@@ -915,6 +960,14 @@ mod tests {
                 },
             ]
         );
+
+        // [ID=1] (Retrieve three sparse vectors (1,2,3)) + QueryLength=3 => 6
+        // [ID=2] (Retrieve two sparse vectors (1,3))     + QueryLength=3 => 5
+        // [ID=3] (Retrieve two sparse vectors (1,3))     + QueryLength=3 => 5
+        //                                                      6 + 5 + 5 => 16
+        let hardware_counter = search_context.take_hardware_counter();
+        assert_eq!(hardware_counter.cpu_counter().get(), 16);
+        hardware_counter.discard_results();
     }
 
     #[test]
@@ -958,5 +1011,13 @@ mod tests {
                 },
             ]
         );
+
+        // [ID=1] (Retrieve two sparse vectors (1,2)) + QueryLength=2 => 4
+        // [ID=2] (Retrieve two sparse vectors (1,3)) + QueryLength=2 => 4
+        // [ID=3] (Retrieve one sparse vector (3))    + QueryLength=2 => 3
+        //                                                  4 + 4 + 3 => 11
+        let hardware_counter = search_context.take_hardware_counter();
+        assert_eq!(hardware_counter.cpu_counter().get(), 11);
+        hardware_counter.discard_results();
     }
 }

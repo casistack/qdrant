@@ -1,9 +1,9 @@
 //! Types used within `LocalShard` to represent a planned `ShardQueryRequest`
 
 use common::types::ScoreType;
-use segment::types::{Filter, WithPayloadInterface, WithVector};
+use segment::types::{Filter, SearchParams, WithPayloadInterface, WithVector};
 
-use super::shard_query::{Sample, ScoringQuery, ShardPrefetch, ShardQueryRequest};
+use super::shard_query::{SampleInternal, ScoringQuery, ShardPrefetch, ShardQueryRequest};
 use crate::operations::types::{
     CollectionError, CollectionResult, CoreSearchRequest, QueryScrollRequestInternal, ScrollOrder,
 };
@@ -44,6 +44,9 @@ pub struct RescoreParams {
 
     /// The payload to return
     pub with_payload: WithPayloadInterface,
+
+    /// Parameters for the rescore search request
+    pub params: Option<SearchParams>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -55,7 +58,7 @@ pub enum Source {
     ScrollsIdx(usize),
 
     /// A nested prefetch
-    Prefetch(MergePlan),
+    Prefetch(Box<MergePlan>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -110,7 +113,7 @@ impl PlannedQuery {
                     &mut self.scrolls,
                     prefetches,
                     offset,
-                    filter,
+                    &filter,
                     Some((with_payload, with_vector)),
                 )?;
 
@@ -126,7 +129,7 @@ impl PlannedQuery {
                     &mut self.scrolls,
                     prefetches,
                     offset,
-                    filter,
+                    &filter,
                     None,
                 )?;
 
@@ -138,6 +141,7 @@ impl PlannedQuery {
                         score_threshold,
                         with_vector,
                         with_payload,
+                        params,
                     }),
                 }
             }
@@ -181,7 +185,7 @@ impl PlannedQuery {
 
                     vec![Source::ScrollsIdx(idx)]
                 }
-                Some(ScoringQuery::Sample(Sample::Random)) => {
+                Some(ScoringQuery::Sample(SampleInternal::Random)) => {
                     // Everything should come from 1 scroll
                     let scroll = QueryScrollRequestInternal {
                         scroll_order: ScrollOrder::Random,
@@ -232,7 +236,7 @@ fn recurse_prefetches(
     scrolls: &mut Vec<QueryScrollRequestInternal>,
     prefetches: Vec<ShardPrefetch>,
     root_offset: usize, // Offset is added to all prefetches, so we make sure we have enough
-    propagate_filter: Option<Filter>, // Global filter to apply to all prefetches
+    propagate_filter: &Option<Filter>, // Global filter to apply to all prefetches
     // Top-level fusion requests won't be merged on shard level, so we pass these params down one level to fetch on the sources.
     // Otherwise we would miss to fetch the payload and vector.
     with_payload_and_vector: Option<(WithPayloadInterface, WithVector)>,
@@ -265,7 +269,7 @@ fn recurse_prefetches(
                 scrolls,
                 prefetches,
                 root_offset,
-                filter,
+                &filter,
                 None,
             )?;
 
@@ -281,10 +285,11 @@ fn recurse_prefetches(
                     score_threshold,
                     with_vector: with_vector.clone(),
                     with_payload: with_payload.clone(),
+                    params,
                 }),
             };
 
-            Source::Prefetch(merge_plan)
+            Source::Prefetch(Box::new(merge_plan))
         } else {
             // This is a leaf prefetch. Fetch this info from the segments
             match query {
@@ -324,7 +329,7 @@ fn recurse_prefetches(
 
                     Source::ScrollsIdx(idx)
                 }
-                Some(ScoringQuery::Sample(Sample::Random)) => {
+                Some(ScoringQuery::Sample(SampleInternal::Random)) => {
                     let scroll = QueryScrollRequestInternal {
                         scroll_order: ScrollOrder::Random,
                         filter,
@@ -377,7 +382,9 @@ mod tests {
 
     use std::collections::HashSet;
 
-    use segment::data_types::vectors::{MultiDenseVectorInternal, NamedVectorStruct, Vector};
+    use segment::data_types::vectors::{
+        MultiDenseVectorInternal, NamedVectorStruct, VectorInternal,
+    };
     use segment::json_path::JsonPath;
     use segment::types::{
         Condition, FieldCondition, Filter, Match, SearchParams, WithPayloadInterface, WithVector,
@@ -386,7 +393,7 @@ mod tests {
 
     use super::*;
     use crate::operations::query_enum::QueryEnum;
-    use crate::operations::universal_query::shard_query::Fusion;
+    use crate::operations::universal_query::shard_query::FusionInternal;
 
     #[test]
     fn test_try_from_double_rescore() {
@@ -407,7 +414,7 @@ mod tests {
                     prefetches: Default::default(),
                     query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                         NamedVectorStruct::new_from_vector(
-                            Vector::Dense(dummy_vector.clone()),
+                            VectorInternal::Dense(dummy_vector.clone()),
                             "byte",
                         ),
                     ))),
@@ -417,7 +424,10 @@ mod tests {
                     score_threshold: None,
                 }],
                 query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
-                    NamedVectorStruct::new_from_vector(Vector::Dense(dummy_vector.clone()), "full"),
+                    NamedVectorStruct::new_from_vector(
+                        VectorInternal::Dense(dummy_vector.clone()),
+                        "full",
+                    ),
                 ))),
                 limit: 100,
                 params: None,
@@ -426,8 +436,8 @@ mod tests {
             }],
             query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                 NamedVectorStruct::new_from_vector(
-                    Vector::MultiDense(MultiDenseVectorInternal::new_unchecked(vec![
-                        dummy_vector.clone()
+                    VectorInternal::MultiDense(MultiDenseVectorInternal::new_unchecked(vec![
+                        dummy_vector.clone(),
                     ])),
                     "multi",
                 ),
@@ -436,7 +446,10 @@ mod tests {
             score_threshold: None,
             limit: 10,
             offset: 0,
-            params: None,
+            params: Some(SearchParams {
+                exact: true,
+                ..Default::default()
+            }),
             with_vector: WithVector::Bool(true),
             with_payload: WithPayloadInterface::Bool(true),
         };
@@ -447,7 +460,7 @@ mod tests {
             planned_query.searches,
             vec![CoreSearchRequest {
                 query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
-                    Vector::Dense(dummy_vector.clone()),
+                    VectorInternal::Dense(dummy_vector.clone()),
                     "byte",
                 )),
                 filter: Some(
@@ -467,12 +480,12 @@ mod tests {
         assert_eq!(
             planned_query.root_plans,
             vec![MergePlan {
-                sources: vec![Source::Prefetch(MergePlan {
+                sources: vec![Source::Prefetch(Box::from(MergePlan {
                     sources: vec![Source::SearchesIdx(0)],
                     rescore_params: Some(RescoreParams {
                         rescore: ScoringQuery::Vector(QueryEnum::Nearest(
                             NamedVectorStruct::new_from_vector(
-                                Vector::Dense(dummy_vector.clone()),
+                                VectorInternal::Dense(dummy_vector.clone()),
                                 "full",
                             )
                         )),
@@ -480,14 +493,15 @@ mod tests {
                         score_threshold: None,
                         with_vector: WithVector::Bool(false),
                         with_payload: WithPayloadInterface::Bool(false),
+                        params: None,
                     })
-                })],
+                }))],
                 rescore_params: Some(RescoreParams {
                     rescore: ScoringQuery::Vector(QueryEnum::Nearest(
                         NamedVectorStruct::new_from_vector(
-                            Vector::MultiDense(MultiDenseVectorInternal::new_unchecked(vec![
-                                dummy_vector.clone()
-                            ])),
+                            VectorInternal::MultiDense(MultiDenseVectorInternal::new_unchecked(
+                                vec![dummy_vector]
+                            )),
                             "multi"
                         )
                     )),
@@ -495,6 +509,10 @@ mod tests {
                     score_threshold: None,
                     with_vector: WithVector::Bool(true),
                     with_payload: WithPayloadInterface::Bool(true),
+                    params: Some(SearchParams {
+                        exact: true,
+                        ..Default::default()
+                    })
                 })
             }]
         );
@@ -506,7 +524,10 @@ mod tests {
         let request = ShardQueryRequest {
             prefetches: vec![], // No prefetch
             query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
-                NamedVectorStruct::new_from_vector(Vector::Dense(dummy_vector.clone()), "full"),
+                NamedVectorStruct::new_from_vector(
+                    VectorInternal::Dense(dummy_vector.clone()),
+                    "full",
+                ),
             ))),
             filter: Some(Filter::default()),
             score_threshold: Some(0.5),
@@ -523,7 +544,7 @@ mod tests {
             planned_query.searches,
             vec![CoreSearchRequest {
                 query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
-                    Vector::Dense(dummy_vector.clone()),
+                    VectorInternal::Dense(dummy_vector),
                     "full",
                 )),
                 filter: Some(Filter::default()),
@@ -569,7 +590,7 @@ mod tests {
                     prefetches: Vec::new(),
                     query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                         NamedVectorStruct::new_from_vector(
-                            Vector::Dense(dummy_vector.clone()),
+                            VectorInternal::Dense(dummy_vector.clone()),
                             "dense",
                         ),
                     ))),
@@ -582,7 +603,7 @@ mod tests {
                     prefetches: Vec::new(),
                     query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                         NamedVectorStruct::new_from_vector(
-                            Vector::Sparse(dummy_sparse.clone()),
+                            VectorInternal::Sparse(dummy_sparse.clone()),
                             "sparse",
                         ),
                     ))),
@@ -592,7 +613,7 @@ mod tests {
                     score_threshold: None,
                 },
             ],
-            query: Some(ScoringQuery::Fusion(Fusion::Rrf)),
+            query: Some(ScoringQuery::Fusion(FusionInternal::Rrf)),
             filter: Some(filter_outer.clone()),
             score_threshold: None,
             limit: 50,
@@ -609,7 +630,7 @@ mod tests {
             vec![
                 CoreSearchRequest {
                     query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
-                        Vector::Dense(dummy_vector.clone()),
+                        VectorInternal::Dense(dummy_vector),
                         "dense",
                     )),
                     filter: Some(filter_outer.merge(&filter_inner1)),
@@ -622,7 +643,7 @@ mod tests {
                 },
                 CoreSearchRequest {
                     query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
-                        Vector::Sparse(dummy_sparse.clone()),
+                        VectorInternal::Sparse(dummy_sparse),
                         "sparse",
                     )),
                     filter: Some(filter_outer.merge(&filter_inner2)),
@@ -649,7 +670,7 @@ mod tests {
     fn test_try_from_rrf_without_source() {
         let request = ShardQueryRequest {
             prefetches: vec![],
-            query: Some(ScoringQuery::Fusion(Fusion::Rrf)),
+            query: Some(ScoringQuery::Fusion(FusionInternal::Rrf)),
             filter: Some(Filter::default()),
             score_threshold: None,
             limit: 50,
@@ -683,7 +704,7 @@ mod tests {
                 prefetches: Vec::new(),
                 query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                     NamedVectorStruct::new_from_vector(
-                        Vector::Dense(dummy_vector.clone()),
+                        VectorInternal::Dense(dummy_vector.clone()),
                         "dense",
                     ),
                 ))),
@@ -692,7 +713,7 @@ mod tests {
                 filter: dummy_filter.clone(),
                 score_threshold: Some(0.1),
             }],
-            query: Some(ScoringQuery::Fusion(Fusion::Rrf)),
+            query: Some(ScoringQuery::Fusion(FusionInternal::Rrf)),
             filter: Some(Filter::default()),
             score_threshold: Some(0.666),
             limit: 50,
@@ -721,7 +742,7 @@ mod tests {
             planned_query.searches,
             vec![CoreSearchRequest {
                 query: QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
-                    Vector::Dense(dummy_vector.clone()),
+                    VectorInternal::Dense(dummy_vector),
                     "dense",
                 ),),
                 filter: dummy_filter,
@@ -747,7 +768,7 @@ mod tests {
                         prefetches: vec![acc],
                         query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                             NamedVectorStruct::new_from_vector(
-                                Vector::Dense(vec![1.0, 2.0, 3.0]),
+                                VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
                                 "dense",
                             ),
                         ))),
@@ -763,7 +784,10 @@ mod tests {
         let prefetch = ShardPrefetch {
             prefetches: Vec::new(),
             query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
-                NamedVectorStruct::new_from_vector(Vector::Dense(vec![1.0, 2.0, 3.0]), "dense"),
+                NamedVectorStruct::new_from_vector(
+                    VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
+                    "dense",
+                ),
             ))),
             limit: 100,
             params: None,
@@ -779,7 +803,10 @@ mod tests {
         let mut request = ShardQueryRequest {
             prefetches: vec![],
             query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
-                NamedVectorStruct::new_from_vector(Vector::Dense(vec![1.0, 2.0, 3.0]), "dense"),
+                NamedVectorStruct::new_from_vector(
+                    VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
+                    "dense",
+                ),
             ))),
             filter: None,
             score_threshold: None,
@@ -798,7 +825,7 @@ mod tests {
                     prefetches: vec![],
                     query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
                         NamedVectorStruct::new_from_vector(
-                            Vector::Dense(vec![1.0, 2.0, 3.0]),
+                            VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
                             "dense",
                         ),
                     ))),
@@ -808,7 +835,10 @@ mod tests {
                     score_threshold: None,
                 }],
                 query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
-                    NamedVectorStruct::new_from_vector(Vector::Dense(vec![1.0, 2.0, 3.0]), "dense"),
+                    NamedVectorStruct::new_from_vector(
+                        VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
+                        "dense",
+                    ),
                 ))),
                 limit: 10,
                 params: None,
@@ -816,7 +846,10 @@ mod tests {
                 score_threshold: None,
             }],
             query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
-                NamedVectorStruct::new_from_vector(Vector::Dense(vec![1.0, 2.0, 3.0]), "dense"),
+                NamedVectorStruct::new_from_vector(
+                    VectorInternal::Dense(vec![1.0, 2.0, 3.0]),
+                    "dense",
+                ),
             ))),
             limit: 10,
             params: None,
@@ -901,7 +934,7 @@ mod tests {
                 prefetches: vec![
                     ShardPrefetch {
                         prefetches: vec![dummy_core_prefetch(30), dummy_core_prefetch(40)],
-                        query: Some(ScoringQuery::Fusion(Fusion::Rrf)),
+                        query: Some(ScoringQuery::Fusion(FusionInternal::Rrf)),
                         filter: None,
                         params: None,
                         score_threshold: None,
@@ -909,7 +942,7 @@ mod tests {
                     },
                     dummy_scroll_prefetch(50),
                 ],
-                query: Some(ScoringQuery::Fusion(Fusion::Rrf)),
+                query: Some(ScoringQuery::Fusion(FusionInternal::Rrf)),
                 filter: None,
                 score_threshold: None,
                 limit: 10,
@@ -938,16 +971,17 @@ mod tests {
                 },
                 MergePlan {
                     sources: vec![
-                        Source::Prefetch(MergePlan {
+                        Source::Prefetch(Box::from(MergePlan {
                             sources: vec![Source::SearchesIdx(1), Source::SearchesIdx(2),],
                             rescore_params: Some(RescoreParams {
-                                rescore: ScoringQuery::Fusion(Fusion::Rrf),
+                                rescore: ScoringQuery::Fusion(FusionInternal::Rrf),
                                 limit: 10,
                                 score_threshold: None,
                                 with_vector: WithVector::Bool(true),
                                 with_payload: WithPayloadInterface::Bool(true),
+                                params: None,
                             }),
-                        }),
+                        })),
                         Source::ScrollsIdx(1),
                     ],
                     rescore_params: None,

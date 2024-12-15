@@ -5,8 +5,10 @@ use segment::types::{
     Condition, Distance, Filter, PayloadFieldSchema, PayloadSchemaType, PointIdType,
 };
 
-use crate::config::{CollectionConfig, CollectionParams, WalConfig};
-use crate::operations::point_ops::{PointOperations, PointStruct};
+use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use crate::operations::point_ops::{
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted,
+};
 use crate::operations::types::VectorsConfig;
 use crate::operations::vector_params_builder::VectorParamsBuilder;
 use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
@@ -23,7 +25,7 @@ pub const TEST_OPTIMIZERS_CONFIG: OptimizersConfig = OptimizersConfig {
     max_optimization_threads: Some(2),
 };
 
-pub fn create_collection_config() -> CollectionConfig {
+pub fn create_collection_config() -> CollectionConfigInternal {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
@@ -39,58 +41,59 @@ pub fn create_collection_config() -> CollectionConfig {
     optimizer_config.default_segment_number = 1;
     optimizer_config.flush_interval_sec = 0;
 
-    CollectionConfig {
+    CollectionConfigInternal {
         params: collection_params,
         optimizer_config,
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
         strict_mode_config: Default::default(),
+        uuid: None,
     }
 }
 
 pub fn upsert_operation() -> CollectionUpdateOperations {
-    CollectionUpdateOperations::PointOperation(
-        vec![
-            PointStruct {
-                id: 1.into(),
-                vector: VectorStructInternal::from(vec![1.0, 2.0, 3.0, 4.0]).into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 10.12, "lon": 32.12  } }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 2.into(),
-                vector: VectorStructInternal::from(vec![2.0, 1.0, 3.0, 4.0]).into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 11.12, "lon": 34.82  } }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 3.into(),
-                vector: VectorStructInternal::from(vec![3.0, 2.0, 1.0, 4.0]).into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": [ { "lat": 12.12, "lon": 34.82  }, { "lat": 12.2, "lon": 12.82  }] }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 4.into(),
-                vector: VectorStructInternal::from(vec![4.0, 2.0, 3.0, 1.0]).into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 13.12, "lon": 34.82  } }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 5.into(),
-                vector: VectorStructInternal::from(vec![5.0, 2.0, 3.0, 4.0]).into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 14.12, "lon": 32.12  } }"#).unwrap(),
-                ),
-            },
+    let points = vec![
+        PointStructPersisted {
+            id: 1.into(),
+            vector: VectorStructInternal::from(vec![1.0, 2.0, 3.0, 4.0]).into(),
+            payload: Some(
+                serde_json::from_str(r#"{ "location": { "lat": 10.12, "lon": 32.12  } }"#).unwrap(),
+            ),
+        },
+        PointStructPersisted {
+            id: 2.into(),
+            vector: VectorStructInternal::from(vec![2.0, 1.0, 3.0, 4.0]).into(),
+            payload: Some(
+                serde_json::from_str(r#"{ "location": { "lat": 11.12, "lon": 34.82  } }"#).unwrap(),
+            ),
+        },
+        PointStructPersisted {
+            id: 3.into(),
+            vector: VectorStructInternal::from(vec![3.0, 2.0, 1.0, 4.0]).into(),
+            payload: Some(
+                serde_json::from_str(r#"{ "location": [ { "lat": 12.12, "lon": 34.82  }, { "lat": 12.2, "lon": 12.82  }] }"#).unwrap(),
+            ),
+        },
+        PointStructPersisted {
+            id: 4.into(),
+            vector: VectorStructInternal::from(vec![4.0, 2.0, 3.0, 1.0]).into(),
+            payload: Some(
+                serde_json::from_str(r#"{ "location": { "lat": 13.12, "lon": 34.82  } }"#).unwrap(),
+            ),
+        },
+        PointStructPersisted {
+            id: 5.into(),
+            vector: VectorStructInternal::from(vec![5.0, 2.0, 3.0, 4.0]).into(),
+            payload: Some(
+                serde_json::from_str(r#"{ "location": { "lat": 14.12, "lon": 32.12  } }"#).unwrap(),
+            ),
+        },
+    ];
 
-        ]
-            .into(),
-    )
+    let op = PointInsertOperationsInternal::from(points);
+
+    CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(op))
 }
 
 pub fn create_payload_index_operation() -> CollectionUpdateOperations {

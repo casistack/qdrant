@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use segment::common::operation_error::OperationResult;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::vectors::{QueryVector, Vector};
+use segment::data_types::vectors::{QueryVector, VectorInternal};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixture_for_all_indices;
 use segment::fixtures::payload_fixtures::STR_KEY;
@@ -27,7 +27,8 @@ use segment::types::PayloadFieldSchema::FieldType;
 use segment::types::PayloadSchemaType::Keyword;
 use segment::types::{
     Condition, FieldCondition, Filter, Payload, ScoredPoint, SegmentConfig, SeqNumberType,
-    SparseVectorDataConfig, VectorStorageDatatype, DEFAULT_SPARSE_FULL_SCAN_THRESHOLD,
+    SparseVectorDataConfig, SparseVectorStorageType, VectorStorageDatatype,
+    DEFAULT_SPARSE_FULL_SCAN_THRESHOLD,
 };
 use segment::vector_storage::VectorStorage;
 use serde_json::json;
@@ -409,7 +410,7 @@ fn sparse_vector_index_ram_filtered_search() {
     let mut payload_index = sparse_vector_index.payload_index().borrow_mut();
     for idx in 0..half_indexed_count {
         payload_index
-            .assign(idx as PointOffsetType, &payload, &None)
+            .set_payload(idx as PointOffsetType, &payload, &None)
             .unwrap();
     }
     drop(payload_index);
@@ -483,7 +484,7 @@ fn sparse_vector_index_plain_search() {
     let mut payload_index = sparse_vector_index.payload_index().borrow_mut();
     for idx in 0..NUM_VECTORS {
         payload_index
-            .assign(idx as PointOffsetType, &payload, &None)
+            .set_payload(idx as PointOffsetType, &payload, &None)
             .unwrap();
     }
     drop(payload_index);
@@ -579,6 +580,7 @@ fn sparse_vector_index_persistence_test() {
                     index_type: SparseIndexType::MutableRam,
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
+                storage_type: SparseVectorStorageType::default(),
             },
         )]),
         payload_storage_type: Default::default(),
@@ -586,7 +588,7 @@ fn sparse_vector_index_persistence_test() {
     let mut segment = build_segment(dir.path(), &config, true).unwrap();
 
     for n in 0..num_vectors {
-        let vector: Vector = random_sparse_vector(&mut rnd, dim).into();
+        let vector: VectorInternal = random_sparse_vector(&mut rnd, dim).into();
         let mut named_vector = NamedVectors::default();
         named_vector.insert(SPARSE_VECTOR_NAME.to_owned(), vector);
         let idx = n.into();
@@ -747,13 +749,14 @@ fn sparse_vector_test_large_index() {
                     index_type: SparseIndexType::MutableRam,
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
+                storage_type: SparseVectorStorageType::OnDisk,
             },
         )]),
         payload_storage_type: Default::default(),
     };
     let mut segment = build_segment(dir.path(), &config, true).unwrap();
 
-    let vector: Vector = SparseVector {
+    let vector: VectorInternal = SparseVector {
         indices: vec![DimId::MAX],
         values: vec![0.0],
     }

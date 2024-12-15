@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::grpc::models::{CollectionDescription, CollectionsResponse};
 use api::grpc::qdrant::CollectionExists;
+use api::rest::models::{CollectionDescription, CollectionsResponse};
 use collection::config::ShardingMethod;
 use collection::operations::cluster_ops::{
     AbortTransferOperation, ClusterOperations, DropReplicaOperation, MoveShardOperation,
@@ -15,6 +15,7 @@ use collection::operations::snapshot_ops::SnapshotDescription;
 use collection::operations::types::{
     AliasDescription, CollectionClusterInfo, CollectionInfo, CollectionsAliasesResponse,
 };
+use collection::operations::verification::new_unchecked_verification_pass;
 use collection::shards::replica_set;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
@@ -235,8 +236,11 @@ pub async fn do_update_collection_cluster(
         Ok(())
     };
 
+    // All checks should've been done at this point.
+    let pass = new_unchecked_verification_pass();
+
     let collection = dispatcher
-        .toc(&access)
+        .toc(&access, &pass)
         .get_collection(&collection_pass)
         .await?;
 
@@ -463,8 +467,8 @@ pub async fn do_update_collection_cluster(
             if !shard_keys_mapping.contains_key(&drop_sharding_key.shard_key) {
                 return Err(StorageError::BadRequest {
                     description: format!(
-                        "Sharding key {} does not exists for collection {}",
-                        drop_sharding_key.shard_key, collection_name
+                        "Sharding key {} does not exist for collection {collection_name}",
+                        drop_sharding_key.shard_key,
                     ),
                 });
             }
@@ -536,7 +540,7 @@ pub async fn do_update_collection_cluster(
             if let Some(shard_key) = &shard_key {
                 if !collection_state.shards_key_mapping.contains_key(shard_key) {
                     return Err(StorageError::bad_request(format!(
-                        "sharding key {shard_key} does not exists for collection {collection_name}"
+                        "sharding key {shard_key} does not exist for collection {collection_name}",
                     )));
                 }
             }

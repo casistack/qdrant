@@ -113,19 +113,34 @@ impl Validate for grpc::update_collection_cluster_setup_request::Operation {
 
 impl Validate for grpc::MoveShard {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
     }
 }
 
 impl Validate for grpc::ReplicateShard {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
     }
 }
 
 impl Validate for crate::grpc::qdrant::AbortShardTransfer {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
     }
 }
 
@@ -175,6 +190,7 @@ impl Validate for grpc::condition::ConditionOneOf {
             ConditionOneOf::IsEmpty(_) => Ok(()),
             ConditionOneOf::HasId(_) => Ok(()),
             ConditionOneOf::IsNull(_) => Ok(()),
+            ConditionOneOf::HasVector(_) => Ok(()),
         }
     }
 }
@@ -259,6 +275,11 @@ impl Validate for super::qdrant::query_enum::Query {
 /// Validate the value is in `[1, ]`.
 pub fn validate_u64_range_min_1(value: &u64) -> Result<(), ValidationError> {
     validate_range_generic(value, Some(&1), None)
+}
+
+/// Validate the value is in `[2, ]`.
+pub fn validate_u64_range_min_2(value: &u64) -> Result<(), ValidationError> {
+    validate_range_generic(value, Some(&2), None)
 }
 
 /// Validate the value is in `[1, ]`.

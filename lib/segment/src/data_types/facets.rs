@@ -1,5 +1,4 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::hash::Hash;
 
 use schemars::JsonSchema;
@@ -31,14 +30,16 @@ pub enum FacetValueRef<'a> {
     Keyword(&'a str),
     Int(&'a IntPayloadType),
     Uuid(&'a u128),
+    Bool(bool),
 }
 
-impl<'a> FacetValueRef<'a> {
+impl FacetValueRef<'_> {
     pub fn to_owned(&self) -> FacetValue {
         match self {
             FacetValueRef::Keyword(s) => FacetValue::Keyword((*s).to_string()),
             FacetValueRef::Int(i) => FacetValue::Int(**i),
             FacetValueRef::Uuid(uuid) => FacetValue::Uuid(**uuid),
+            FacetValueRef::Bool(b) => FacetValue::Bool(*b),
         }
     }
 }
@@ -48,6 +49,7 @@ pub enum FacetValue {
     Keyword(String),
     Int(IntPayloadType),
     Uuid(UuidIntType),
+    Bool(bool),
     // other types to add?
     // Bool(bool),
     // FloatRange(FloatRange),
@@ -85,22 +87,13 @@ impl<T: FacetValueTrait> PartialOrd for FacetHit<T> {
     }
 }
 
-pub fn aggregate_facet_hits<T: FacetValueTrait>(
-    hits: impl IntoIterator<Item = FacetHit<T>>,
-) -> HashMap<T, usize> {
-    hits.into_iter()
-        .fold(HashMap::new(), |mut map, FacetHit { value, count }| {
-            *map.entry(value).or_insert(0) += count;
-            map
-        })
-}
-
 impl From<FacetValue> for ValueVariants {
     fn from(value: FacetValue) -> Self {
         match value {
             FacetValue::Keyword(s) => ValueVariants::String(s),
             FacetValue::Int(i) => ValueVariants::Integer(i),
             FacetValue::Uuid(uuid) => ValueVariants::String(Uuid::from_u128(uuid).to_string()),
+            FacetValue::Bool(b) => ValueVariants::Bool(b),
         }
     }
 }

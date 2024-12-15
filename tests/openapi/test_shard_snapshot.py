@@ -1,25 +1,21 @@
 from time import sleep
 import hashlib
-import os
 import pytest
 import requests
 
 from .helpers.collection_setup import basic_collection_setup, drop_collection
 from .helpers.helpers import request_with_validation
-
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost:6333")
-
-collection_name = 'test_collection_snapshot'
+from .helpers.settings import QDRANT_HOST
 
 
 @pytest.fixture(autouse=True)
-def setup(on_disk_vectors):
+def setup(on_disk_vectors, collection_name):
     basic_collection_setup(collection_name=collection_name, on_disk_vectors=on_disk_vectors, wal_capacity=1)
     yield
     drop_collection(collection_name=collection_name)
 
 
-def test_shard_snapshot_operations(http_server):
+def test_shard_snapshot_operations(http_server, collection_name):
     (srv_dir, srv_url) = http_server
 
     # no snapshot on collection
@@ -112,7 +108,7 @@ def test_shard_snapshot_operations(http_server):
 
 
 @pytest.mark.timeout(20)
-def test_shard_snapshot_operations_non_wait():
+def test_shard_snapshot_operations_non_wait(collection_name):
     # there no snapshot on collection
     response = request_with_validation(
         api='/collections/{collection_name}/shards/{shard_id}/snapshots',
@@ -176,7 +172,7 @@ def test_shard_snapshot_operations_non_wait():
             continue
 
 
-def test_shard_snapshot_recovery_errors():
+def test_shard_snapshot_recovery_errors(collection_name):
 
     # Invalid collection name
     response = request_with_validation(
@@ -211,11 +207,11 @@ def test_shard_snapshot_recovery_errors():
     assert response.status_code == 400
 
 
-def test_shard_snapshot_security():
+def test_shard_snapshot_security(collection_name):
     # ensure we cannot do simple arbitrary path traversal
     snapshot_name = "/etc/passwd"
     response = requests.get(
-        f"http://{QDRANT_HOST}/collections/{collection_name}/shards/0/snapshots/{snapshot_name}",
+        f"{QDRANT_HOST}/collections/{collection_name}/shards/0/snapshots/{snapshot_name}",
         headers={"Content-Type": "application/json"},
     )
     assert not response.ok
@@ -223,7 +219,7 @@ def test_shard_snapshot_security():
 
     snapshot_name = "../../../../../../../etc/passwd"
     response = requests.get(
-        f"http://{QDRANT_HOST}/collections/{collection_name}/shards/0/snapshots/{snapshot_name}",
+        f"{QDRANT_HOST}/collections/{collection_name}/shards/0/snapshots/{snapshot_name}",
         headers={"Content-Type": "application/json"},
     )
     assert not response.ok

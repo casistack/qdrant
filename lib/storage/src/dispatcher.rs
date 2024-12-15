@@ -1,8 +1,12 @@
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use api::rest::models::HardwareUsage;
 use collection::config::ShardingMethod;
+use collection::operations::verification::VerificationPass;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::defaults::CONSENSUS_META_OP_WAIT;
 use segment::types::default_shard_number_per_node_const;
 
@@ -36,9 +40,13 @@ impl Dispatcher {
     }
 
     /// Get the table of content.
-    /// The `_access` parameter is not used, but it's required to verify caller's possession
-    /// of the [Access] object.
-    pub fn toc(&self, _access: &Access) -> &Arc<TableOfContent> {
+    /// The `_access` and `_verification_pass` parameter are not used, but it's required to verify caller's possession
+    /// of both objects.
+    pub fn toc(
+        &self,
+        _access: &Access,
+        _verification_pass: &VerificationPass,
+    ) -> &Arc<TableOfContent> {
         &self.toc
     }
 
@@ -82,14 +90,11 @@ impl Dispatcher {
 
                                 let suggested_shard_nr = number_of_peers as u32 * shard_nr_per_node;
 
-                                let shard_distribution = self
-                                    .toc
-                                    .suggest_shard_distribution(
-                                        &op,
-                                        NonZeroU32::new(suggested_shard_nr)
-                                            .expect("Peer count should be always >= 1"),
-                                    )
-                                    .await;
+                                let shard_distribution = self.toc.suggest_shard_distribution(
+                                    &op,
+                                    NonZeroU32::new(suggested_shard_nr)
+                                        .expect("Peer count should be always >= 1"),
+                                );
 
                                 // Expect all replicas to become active eventually
                                 for (shard_id, peer_ids) in &shard_distribution.distribution {
@@ -113,6 +118,18 @@ impl Dispatcher {
                             }
                         }
                     }
+
+                    if let Some(uuid) = &op.create_collection.uuid {
+                        log::warn!(
+                            "Collection UUID {uuid} explicitly specified, \
+                             when proposing create collection {} operation, \
+                             new random UUID will be generated instead",
+                            op.collection_name,
+                        );
+                    }
+
+                    op.create_collection.uuid = Some(uuid::Uuid::new_v4());
+
                     CollectionMetaOperations::CreateCollection(op)
                 }
                 CollectionMetaOperations::CreateShardKey(op) => {
@@ -230,5 +247,14 @@ impl Dispatcher {
         } else {
             Ok(())
         }
+    }
+
+    pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
+        self.toc.all_hw_metrics()
+    }
+
+    #[must_use]
+    pub fn get_collection_hw_metrics(&self, collection: String) -> Arc<HwMeasurementAcc> {
+        self.toc.get_collection_hw_metrics(collection)
     }
 }

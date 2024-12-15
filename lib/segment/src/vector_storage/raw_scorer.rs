@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::types::{PointOffsetType, ScoreType, ScoredPointOffset};
 use sparse::common::sparse_vector::SparseVector;
 
@@ -16,13 +18,15 @@ use crate::data_types::vectors::{
 };
 use crate::spaces::metric::Metric;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
-use crate::spaces::tools::peek_top_largest_iterable;
 use crate::types::Distance;
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::metric_query_scorer::MetricQueryScorer;
 use crate::vector_storage::query_scorer::multi_metric_query_scorer::MultiMetricQueryScorer;
 use crate::vector_storage::query_scorer::QueryScorer;
 
 /// RawScorer composition:
+///
+/// ```plaintext
 ///                                              Metric
 ///                                             ┌───────────────────┐
 ///                                             │  - Cosine         │
@@ -42,6 +46,8 @@ use crate::vector_storage::query_scorer::QueryScorer;
 ///                       - Vector storage       └───────────────────┘
 ///                                              - Scoring logic
 ///                                              - Complex queries
+///
+/// ```
 ///
 /// Optimized scorer for multiple scoring requests comparing with a single query
 /// Holds current query and params, receives only subset of points to score
@@ -82,6 +88,8 @@ pub trait RawScorer {
     ) -> Vec<ScoredPointOffset>;
 
     fn peek_top_all(&self, top: usize) -> Vec<ScoredPointOffset>;
+
+    fn take_hardware_counter(&self) -> HardwareCounterCell;
 }
 
 pub struct RawScorerImpl<'a, TVector: ?Sized, TQueryScorer>
@@ -164,6 +172,9 @@ pub fn new_stoppable_raw_scorer<'a>(
             raw_scorer_half_impl(query, vs.as_ref(), point_deleted, is_stopped)
         }
         VectorStorageEnum::SparseSimple(vs) => {
+            raw_sparse_scorer_impl(query, vs, point_deleted, is_stopped)
+        }
+        VectorStorageEnum::SparseMmap(vs) => {
             raw_sparse_scorer_impl(query, vs, point_deleted, is_stopped)
         }
         VectorStorageEnum::MultiDenseSimple(vs) => {
@@ -596,7 +607,7 @@ fn new_multi_scorer_with_metric<
     match query {
         QueryVector::Nearest(vector) => raw_scorer_from_query_scorer(
             MultiMetricQueryScorer::<VectorElementType, TMetric, _>::new(
-                vector.try_into()?,
+                &vector.try_into()?,
                 vector_storage,
             ),
             point_deleted,
@@ -692,7 +703,7 @@ fn new_multi_scorer_byte_with_metric<
     match query {
         QueryVector::Nearest(vector) => raw_scorer_from_query_scorer(
             MultiMetricQueryScorer::<VectorElementTypeByte, TMetric, _>::new(
-                vector.try_into()?,
+                &vector.try_into()?,
                 vector_storage,
             ),
             point_deleted,
@@ -788,7 +799,7 @@ fn new_multi_scorer_half_with_metric<
     match query {
         QueryVector::Nearest(vector) => raw_scorer_from_query_scorer(
             MultiMetricQueryScorer::<VectorElementTypeHalf, TMetric, _>::new(
-                vector.try_into()?,
+                &vector.try_into()?,
                 vector_storage,
             ),
             point_deleted,
@@ -836,7 +847,7 @@ fn new_multi_scorer_half_with_metric<
     }
 }
 
-impl<'a, TVector, TQueryScorer> RawScorer for RawScorerImpl<'a, TVector, TQueryScorer>
+impl<TVector, TQueryScorer> RawScorer for RawScorerImpl<'_, TVector, TQueryScorer>
 where
     TVector: ?Sized,
     TQueryScorer: QueryScorer<TVector>,
@@ -897,28 +908,56 @@ where
         points: &mut dyn Iterator<Item = PointOffsetType>,
         top: usize,
     ) -> Vec<ScoredPointOffset> {
-        let scores = points
-            .take_while(|_| !self.is_stopped.load(Ordering::Relaxed))
-            .filter(|point_id| self.check_vector(*point_id))
-            .map(|point_id| ScoredPointOffset {
-                idx: point_id,
-                score: self.query_scorer.score_stored(point_id),
-            });
-        peek_top_largest_iterable(scores, top)
+        if top == 0 {
+            return vec![];
+        }
+
+        let mut pq = FixedLengthPriorityQueue::new(top);
+
+        // Reuse the same buffer for all chunks, to avoid reallocation
+        let mut chunk = [0; VECTOR_READ_BATCH_SIZE];
+        let mut scores_buffer = [0.0; VECTOR_READ_BATCH_SIZE];
+        loop {
+            let mut chunk_size = 0;
+            for point_id in &mut *points {
+                if self.is_stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !self.check_vector(point_id) {
+                    continue;
+                }
+                chunk[chunk_size] = point_id;
+                chunk_size += 1;
+                if chunk_size == VECTOR_READ_BATCH_SIZE {
+                    break;
+                }
+            }
+
+            if chunk_size == 0 {
+                break;
+            }
+
+            self.query_scorer
+                .score_stored_batch(&chunk[..chunk_size], &mut scores_buffer[..chunk_size]);
+
+            for i in 0..chunk_size {
+                pq.push(ScoredPointOffset {
+                    idx: chunk[i],
+                    score: scores_buffer[i],
+                });
+            }
+        }
+
+        pq.into_vec()
     }
 
     fn peek_top_all(&self, top: usize) -> Vec<ScoredPointOffset> {
-        let scores = (0..self.point_deleted.len() as PointOffsetType)
-            .take_while(|_| !self.is_stopped.load(Ordering::Relaxed))
-            .filter(|point_id| self.check_vector(*point_id))
-            .map(|point_id| {
-                let point_id = point_id as PointOffsetType;
-                ScoredPointOffset {
-                    idx: point_id,
-                    score: self.query_scorer.score_stored(point_id),
-                }
-            });
-        peek_top_largest_iterable(scores, top)
+        let mut point_ids = 0..self.point_deleted.len() as PointOffsetType;
+        self.peek_top_iter(&mut point_ids, top)
+    }
+
+    fn take_hardware_counter(&self) -> HardwareCounterCell {
+        self.query_scorer.take_hardware_counter()
     }
 }
 

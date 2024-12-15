@@ -41,8 +41,8 @@ impl SimplePayloadStorage {
         })
     }
 
-    pub(crate) fn update_storage(&self, point_id: &PointOffsetType) -> OperationResult<()> {
-        match self.payload.get(point_id) {
+    pub(crate) fn update_storage(&self, point_id: PointOffsetType) -> OperationResult<()> {
+        match self.payload.get(&point_id) {
             None => self
                 .db_wrapper
                 .remove(serde_cbor::to_vec(&point_id).unwrap()),
@@ -55,18 +55,5 @@ impl SimplePayloadStorage {
 
     pub fn payload_ptr(&self, point_id: PointOffsetType) -> Option<&Payload> {
         self.payload.get(&point_id)
-    }
-
-    pub fn iter<F>(&self, mut callback: F) -> OperationResult<()>
-    where
-        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
-    {
-        for (key, val) in self.payload.iter() {
-            let do_continue = callback(*key, val)?;
-            if !do_continue {
-                return Ok(());
-            }
-        }
-        Ok(())
     }
 }

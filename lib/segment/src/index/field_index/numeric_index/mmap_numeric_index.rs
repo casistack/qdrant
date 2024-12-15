@@ -10,7 +10,7 @@ use memory::mmap_ops::{self, create_and_ensure_length};
 use memory::mmap_type::{MmapBitSlice, MmapSlice};
 use serde::{Deserialize, Serialize};
 
-use super::mutable_numeric_index::DynamicNumericIndex;
+use super::mutable_numeric_index::InMemoryNumericIndex;
 use super::Encodable;
 use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
 use crate::common::operation_error::OperationResult;
@@ -45,7 +45,7 @@ pub(super) struct NumericIndexPairsIterator<'a, T: Encodable + Numericable> {
     end_index: usize,
 }
 
-impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, T> {
+impl<T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'_, T> {
     type Item = Point<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -62,7 +62,7 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, 
     }
 }
 
-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'a, T> {
+impl<T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.pairs[self.end_index - 1].clone();
@@ -78,7 +78,7 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIt
 }
 
 impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
-    pub fn build(dynamic_index: DynamicNumericIndex<T>, path: &Path) -> OperationResult<Self> {
+    pub fn build(in_memory_index: InMemoryNumericIndex<T>, path: &Path) -> OperationResult<Self> {
         create_dir_all(path)?;
 
         let pairs_path = path.join(PAIRS_PATH);
@@ -88,15 +88,15 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         atomic_save_json(
             &config_path,
             &MmapNumericIndexConfig {
-                max_values_per_point: dynamic_index.max_values_per_point,
+                max_values_per_point: in_memory_index.max_values_per_point,
             },
         )?;
 
-        dynamic_index.histogram.save(path)?;
+        in_memory_index.histogram.save(path)?;
 
         MmapPointToValues::<T>::from_iter(
             path,
-            dynamic_index
+            in_memory_index
                 .point_to_values
                 .iter()
                 .enumerate()
@@ -111,18 +111,18 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         {
             let pairs_file = create_and_ensure_length(
                 &pairs_path,
-                dynamic_index.map.len() * std::mem::size_of::<Point<T>>(),
+                in_memory_index.map.len() * std::mem::size_of::<Point<T>>(),
             )?;
             let pairs_mmap = unsafe { MmapMut::map_mut(&pairs_file)? };
             let mut pairs = unsafe { MmapSlice::<Point<T>>::try_from(pairs_mmap)? };
-            for (src, dst) in dynamic_index.map.iter().zip(pairs.iter_mut()) {
+            for (src, dst) in in_memory_index.map.iter().zip(pairs.iter_mut()) {
                 *dst = src.clone();
             }
         }
 
         {
             const BITS_IN_BYTE: usize = 8;
-            let deleted_flags_count = dynamic_index.point_to_values.len();
+            let deleted_flags_count = in_memory_index.point_to_values.len();
             let deleted_file = create_and_ensure_length(
                 &deleted_path,
                 BITS_IN_BYTE
@@ -132,7 +132,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
             let mut deleted_mmap = unsafe { MmapMut::map_mut(&deleted_file)? };
             deleted_mmap.fill(0);
             let mut deleted_bitflags = MmapBitSlice::from(deleted_mmap, 0);
-            for (idx, values) in dynamic_index.point_to_values.iter().enumerate() {
+            for (idx, values) in in_memory_index.point_to_values.iter().enumerate() {
                 if values.is_empty() {
                     deleted_bitflags.set(idx, true);
                 }
@@ -149,13 +149,14 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
 
         let histogram = Histogram::<T>::load(path)?;
         let config: MmapNumericIndexConfig = read_json(&config_path)?;
-        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global)?;
+        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
         let deleted = MmapBitSlice::from(deleted, 0);
         let deleted_count = deleted.count_ones();
         let map = unsafe {
             MmapSlice::try_from(mmap_ops::open_write_mmap(
                 &pairs_path,
                 AdviceSetting::Global,
+                false,
             )?)?
         };
         let point_to_values = MmapPointToValues::open(path)?;

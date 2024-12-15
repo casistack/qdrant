@@ -7,6 +7,7 @@ use actix_web::rt::time::Instant;
 use actix_web::web::Query;
 use actix_web::{get, post, web, HttpResponse, Responder};
 use actix_web_validator::Json;
+use collection::operations::verification::new_unchecked_verification_pass;
 use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
@@ -70,7 +71,7 @@ async fn metrics(
     ActixAccess(access): ActixAccess,
 ) -> HttpResponse {
     if let Err(err) = access.check_global_access(AccessRequirements::new()) {
-        return process_response_error(err, Instant::now());
+        return process_response_error(err, Instant::now(), None);
     }
 
     let anonymize = params.anonymize.unwrap_or(false);
@@ -101,8 +102,11 @@ fn put_locks(
     locks_option: Json<LocksOption>,
     ActixAccess(access): ActixAccess,
 ) -> impl Future<Output = HttpResponse> {
+    // Not a collection level request.
+    let pass = new_unchecked_verification_pass();
+
     helpers::time(async move {
-        let toc = dispatcher.toc(&access);
+        let toc = dispatcher.toc(&access, &pass);
         access.check_global_access(AccessRequirements::new().manage())?;
         let result = LocksOption {
             write: toc.is_write_locked(),
@@ -118,9 +122,12 @@ fn get_locks(
     dispatcher: web::Data<Dispatcher>,
     ActixAccess(access): ActixAccess,
 ) -> impl Future<Output = HttpResponse> {
+    // Not a collection level request.
+    let pass = new_unchecked_verification_pass();
+
     helpers::time(async move {
         access.check_global_access(AccessRequirements::new())?;
-        let toc = dispatcher.toc(&access);
+        let toc = dispatcher.toc(&access, &pass);
         let result = LocksOption {
             write: toc.is_write_locked(),
             error_message: toc.get_lock_error_message(),
@@ -139,12 +146,12 @@ fn get_stacktrace(ActixAccess(access): ActixAccess) -> impl Future<Output = Http
 
 #[get("/healthz")]
 async fn healthz() -> impl Responder {
-    kubernetes_healthz().await
+    kubernetes_healthz()
 }
 
 #[get("/livez")]
 async fn livez() -> impl Responder {
-    kubernetes_healthz().await
+    kubernetes_healthz()
 }
 
 #[get("/readyz")]
@@ -166,7 +173,7 @@ async fn readyz(health_checker: web::Data<Option<Arc<health::HealthChecker>>>) -
 }
 
 /// Basic Kubernetes healthz endpoint
-async fn kubernetes_healthz() -> impl Responder {
+fn kubernetes_healthz() -> impl Responder {
     HttpResponse::Ok()
         .content_type(ContentType::plaintext())
         .body("healthz check passed")
@@ -176,7 +183,7 @@ async fn kubernetes_healthz() -> impl Responder {
 async fn get_logger_config(handle: web::Data<tracing::LoggerHandle>) -> impl Responder {
     let timing = Instant::now();
     let result = handle.get_config().await;
-    helpers::process_response(Ok(result), timing)
+    helpers::process_response(Ok(result), timing, None)
 }
 
 #[post("/logger")]
@@ -192,7 +199,7 @@ async fn update_logger_config(
         .map(|_| true)
         .map_err(|err| StorageError::service_error(err.to_string()));
 
-    helpers::process_response(result, timing)
+    helpers::process_response(result, timing, None)
 }
 
 // Configure services

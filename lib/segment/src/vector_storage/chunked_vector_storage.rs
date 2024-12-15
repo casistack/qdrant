@@ -30,9 +30,17 @@ pub trait ChunkedVectorStorage<T> {
         count: usize,
     ) -> OperationResult<()>;
 
+    /// Returns `count` flattened vectors starting from key. if chunk boundary is crossed, returns None
     fn get_many(&self, key: VectorOffsetType, count: usize) -> Option<&[T]>;
+
+    /// Returns batch of vectors by keys.
+    /// Underlying storage might apply some optimizations to prefetch vectors.
+    fn get_batch<'a>(&'a self, keys: &[VectorOffsetType], vectors: &mut [&'a [T]]);
 
     fn get_remaining_chunk_keys(&self, start_key: VectorOffsetType) -> usize;
 
     fn max_vector_size_bytes(&self) -> usize;
+
+    /// True, if this storage is on-disk by default.
+    fn is_on_disk(&self) -> bool;
 }

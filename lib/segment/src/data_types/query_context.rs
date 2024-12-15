@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use sparse::common::types::{DimId, DimWeight};
 
 use crate::data_types::tiny_map;
@@ -24,7 +25,6 @@ pub struct QueryContext {
     /// Statistics of the element frequency,
     /// collected over all segments.
     /// Required for processing sparse vector search with `idf-dot` similarity.
-    #[allow(dead_code)]
     idf: tiny_map::TinyMap<String, HashMap<DimId, usize>>,
 }
 
@@ -81,8 +81,9 @@ impl QueryContext {
 
     pub fn get_segment_query_context(&self) -> SegmentQueryContext {
         SegmentQueryContext {
-            query_context: Some(self),
+            query_context: self,
             deleted_points: None,
+            hardware_counter: HardwareCounterCell::new(),
         }
     }
 }
@@ -94,33 +95,50 @@ impl Default for QueryContext {
 }
 
 /// Defines context of the search query on the segment level
-#[derive(Default, Clone, Debug)]
+#[derive(Debug)]
 pub struct SegmentQueryContext<'a> {
-    query_context: Option<&'a QueryContext>,
+    query_context: &'a QueryContext,
     deleted_points: Option<&'a BitSlice>,
+    hardware_counter: HardwareCounterCell,
 }
 
 impl<'a> SegmentQueryContext<'a> {
+    pub fn available_point_count(&self) -> usize {
+        self.query_context.available_point_count()
+    }
+
     pub fn get_vector_context(&self, vector_name: &str) -> VectorQueryContext {
-        if let Some(query_context) = self.query_context {
-            VectorQueryContext {
-                available_point_count: query_context.available_point_count,
-                search_optimized_threshold_kb: query_context.search_optimized_threshold_kb,
-                is_stopped: Some(&query_context.is_stopped),
-                idf: query_context.idf.get(vector_name),
-                deleted_points: self.deleted_points,
-            }
-        } else {
-            VectorQueryContext {
-                deleted_points: self.deleted_points,
-                ..Default::default()
-            }
+        VectorQueryContext {
+            available_point_count: self.query_context.available_point_count,
+            search_optimized_threshold_kb: self.query_context.search_optimized_threshold_kb,
+            is_stopped: Some(&self.query_context.is_stopped),
+            idf: self.query_context.idf.get(vector_name),
+            deleted_points: self.deleted_points,
+            hardware_counter: Some(&self.hardware_counter),
         }
     }
 
     pub fn with_deleted_points(mut self, deleted_points: &'a BitSlice) -> Self {
         self.deleted_points = Some(deleted_points);
         self
+    }
+
+    pub fn take_hardware_counter(&self) -> HardwareCounterCell {
+        self.hardware_counter.take()
+    }
+
+    pub fn merge_hardware_counter(&self, other: HardwareCounterCell) {
+        self.hardware_counter.apply_from(other);
+    }
+
+    /// Clone the context without the hardware counters.
+    /// This is useful to avoid double counting the hardware counters.
+    pub fn clone_no_counters(&self) -> Self {
+        SegmentQueryContext {
+            query_context: self.query_context,
+            deleted_points: self.deleted_points,
+            hardware_counter: HardwareCounterCell::new(),
+        }
     }
 }
 
@@ -139,6 +157,8 @@ pub struct VectorQueryContext<'a> {
     idf: Option<&'a HashMap<DimId, usize>>,
 
     deleted_points: Option<&'a BitSlice>,
+
+    hardware_counter: Option<&'a HardwareCounterCell>,
 }
 
 pub enum SimpleCow<'a, T> {
@@ -146,7 +166,7 @@ pub enum SimpleCow<'a, T> {
     Owned(T),
 }
 
-impl<'a, T> Deref for SimpleCow<'a, T> {
+impl<T> Deref for SimpleCow<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -158,6 +178,20 @@ impl<'a, T> Deref for SimpleCow<'a, T> {
 }
 
 impl VectorQueryContext<'_> {
+    pub fn hardware_counter(&self) -> Option<&HardwareCounterCell> {
+        self.hardware_counter
+    }
+
+    pub fn apply_hardware_counter(&self, other: HardwareCounterCell) {
+        if let Some(hardware_counter) = self.hardware_counter {
+            hardware_counter.apply_from(other);
+        } else {
+            // If we don't specify a hardware counter reference when initiating a new VectorQueryContext,
+            // we don't want its result and need to discard the results here in order to not panic in tests/debug mode.
+            other.discard_results();
+        }
+    }
+
     pub fn available_point_count(&self) -> usize {
         self.available_point_count
     }
@@ -211,6 +245,7 @@ impl Default for VectorQueryContext<'_> {
             is_stopped: None,
             idf: None,
             deleted_points: None,
+            hardware_counter: None,
         }
     }
 }

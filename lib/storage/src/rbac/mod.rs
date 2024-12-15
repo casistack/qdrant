@@ -87,7 +87,9 @@ impl Access {
     ) -> Result<CollectionMultipass, StorageError> {
         match self {
             Access::Global(mode) => mode.meets_requirements(requirements)?,
-            _ => return Err(StorageError::forbidden("Global access is required")),
+            Access::Collection(_) => {
+                return Err(StorageError::forbidden("Global access is required"))
+            }
         }
         Ok(CollectionMultipass)
     }
@@ -137,7 +139,7 @@ struct CollectionAccessView<'a> {
     pub payload: &'a Option<PayloadConstraint>,
 }
 
-impl<'a> CollectionAccessView<'a> {
+impl CollectionAccessView<'_> {
     pub(self) fn check_whole_access(&self) -> Result<(), StorageError> {
         if self.payload.is_some() {
             return incompatible_with_payload_constraint(self.collection);

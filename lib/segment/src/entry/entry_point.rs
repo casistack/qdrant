@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use common::tar_ext;
 use common::types::TelemetryDetail;
 
 use crate::common::operation_error::{OperationResult, SegmentFailedState};
@@ -9,14 +10,14 @@ use crate::data_types::facets::{FacetParams, FacetValue};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::order_by::{OrderBy, OrderValue};
 use crate::data_types::query_context::{QueryContext, SegmentQueryContext};
-use crate::data_types::vectors::{QueryVector, Vector};
+use crate::data_types::vectors::{QueryVector, VectorInternal};
 use crate::index::field_index::{CardinalityEstimation, FieldIndex};
 use crate::json_path::JsonPath;
 use crate::telemetry::SegmentTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PointIdType,
-    ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType, WithPayload,
-    WithVector,
+    ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType,
+    SnapshotFormat, WithPayload, WithVector,
 };
 
 /// Define all operations which can be performed with Segment or Segment-like entity.
@@ -40,7 +41,7 @@ pub trait SegmentEntry {
         filter: Option<&Filter>,
         top: usize,
         params: Option<&SearchParams>,
-        query_context: SegmentQueryContext,
+        query_context: &SegmentQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>>;
 
     fn upsert_point(
@@ -98,7 +99,11 @@ pub trait SegmentEntry {
         point_id: PointIdType,
     ) -> OperationResult<bool>;
 
-    fn vector(&self, vector_name: &str, point_id: PointIdType) -> OperationResult<Option<Vector>>;
+    fn vector(
+        &self,
+        vector_name: &str,
+        point_id: PointIdType,
+    ) -> OperationResult<Option<VectorInternal>>;
 
     fn all_vectors(&self, point_id: PointIdType) -> OperationResult<NamedVectors>;
 
@@ -169,6 +174,15 @@ pub trait SegmentEntry {
 
     fn vector_names(&self) -> HashSet<String>;
 
+    /// Whether this segment is completely empty in terms of points
+    ///
+    /// The segment is considered to not be empty if it contains any points, even if deleted.
+    /// Deleted points still have a version which may be important at time of recovery. Deciding
+    /// this by just the reported point count is not reliable in case a proxy segment is used.
+    ///
+    /// Payload indices or type of storage are not considered here.
+    fn is_empty(&self) -> bool;
+
     /// Number of available points
     ///
     /// - excludes soft deleted points
@@ -194,6 +208,10 @@ pub trait SegmentEntry {
 
     /// Get current stats of the segment
     fn info(&self) -> SegmentInfo;
+
+    /// Get size related stats of the segment.
+    /// This returns `SegmentInfo` with some non size-related data (like `schema`) unset to improve performance.
+    fn size_info(&self) -> SegmentInfo;
 
     /// Get segment configuration
     fn config(&self) -> &SegmentConfig;
@@ -268,8 +286,14 @@ pub trait SegmentEntry {
     ///
     /// Creates a tar archive of the segment directory into `snapshot_dir_path`.
     /// Uses `temp_path` to prepare files to archive.
-    fn take_snapshot(&self, temp_path: &Path, snapshot_dir_path: &Path)
-        -> OperationResult<PathBuf>;
+    /// The `snapshotted_segments` set is used to avoid writing the same snapshot twice.
+    fn take_snapshot(
+        &self,
+        temp_path: &Path,
+        tar: &tar_ext::BuilderExt,
+        format: SnapshotFormat,
+        snapshotted_segments: &mut HashSet<String>,
+    ) -> OperationResult<()>;
 
     // Get collected telemetry data of segment
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry;

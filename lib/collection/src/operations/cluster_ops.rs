@@ -200,7 +200,12 @@ pub struct ReplicateShard {
 
 impl Validate for ReplicateShard {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
     }
 }
 
@@ -219,13 +224,23 @@ pub struct MoveShard {
 
 impl Validate for MoveShard {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
     }
 }
 
 impl Validate for AbortShardTransfer {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_shard_different_peers(self.from_peer_id, self.to_peer_id)
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
     }
 }
 
@@ -255,10 +270,11 @@ pub struct StartResharding {
 }
 
 /// Resharding direction, scale up or down in number of shards
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReshardingDirection {
     /// Scale up, add a new shard
+    #[default]
     Up,
     /// Scale down, remove a shard
     Down,

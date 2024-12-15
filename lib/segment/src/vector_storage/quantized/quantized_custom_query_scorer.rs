@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
-use itertools::Itertools;
 
 use crate::data_types::named_vectors::CowMultiVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
@@ -11,6 +11,7 @@ use crate::data_types::vectors::{
 };
 use crate::spaces::metric::Metric;
 use crate::types::QuantizationConfig;
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query::{Query, TransformInto};
 use crate::vector_storage::query_scorer::QueryScorer;
 
@@ -26,6 +27,7 @@ where
     phantom: PhantomData<TEncodedQuery>,
     metric: PhantomData<TMetric>,
     element: PhantomData<TElement>,
+    hardware_counter: HardwareCounterCell,
 }
 
 impl<'a, TElement, TMetric, TEncodedQuery, TEncodedVectors, TQuery>
@@ -58,7 +60,6 @@ where
             })
             .unwrap();
         let query: TQuery = original_query
-            .clone()
             .transform(|original_vector| {
                 let original_vector_prequantized = TElement::quantization_preprocess(
                     quantization_config,
@@ -75,6 +76,7 @@ where
             phantom: PhantomData,
             metric: PhantomData,
             element: PhantomData,
+            hardware_counter: HardwareCounterCell::new(),
         }
     }
 
@@ -92,11 +94,10 @@ where
     {
         let original_query: TOriginalQuery = raw_query
             .transform(|vector| {
-                let slices = vector.multi_vectors();
-                let preprocessed = slices
-                    .into_iter()
-                    .flat_map(|slice| TMetric::preprocess(slice.to_vec()))
-                    .collect_vec();
+                let mut preprocessed = Vec::new();
+                for slice in vector.multi_vectors() {
+                    preprocessed.extend_from_slice(&TMetric::preprocess(slice.to_vec()));
+                }
                 let preprocessed = MultiDenseVectorInternal::new(preprocessed, vector.dim);
                 let converted =
                     TElement::from_float_multivector(CowMultiVector::Owned(preprocessed))
@@ -106,7 +107,6 @@ where
             .unwrap();
 
         let query: TQuery = original_query
-            .clone()
             .transform(|original_vector| {
                 let original_vector_prequantized = TElement::quantization_preprocess(
                     quantization_config,
@@ -123,6 +123,7 @@ where
             phantom: PhantomData,
             metric: PhantomData,
             element: PhantomData,
+            hardware_counter: HardwareCounterCell::new(),
         }
     }
 }
@@ -136,8 +137,19 @@ where
     TEncodedVectors: quantization::EncodedVectors<TEncodedQuery>,
 {
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        self.query
-            .score_by(|this| self.quantized_storage.score_point(this, idx))
+        self.query.score_by(|this| {
+            self.quantized_storage
+                .score_point(this, idx, &self.hardware_counter)
+        })
+    }
+
+    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
+        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
+        debug_assert_eq!(ids.len(), scores.len());
+        // no specific implementation for batch scoring
+        for (idx, id) in ids.iter().enumerate() {
+            scores[idx] = self.score_stored(*id);
+        }
     }
 
     fn score(&self, _v2: &[TElement]) -> ScoreType {
@@ -146,5 +158,15 @@ where
 
     fn score_internal(&self, _point_a: PointOffsetType, _point_b: PointOffsetType) -> ScoreType {
         unimplemented!("Custom scorer compares against multiple vectors, not just one")
+    }
+
+    fn take_hardware_counter(&self) -> HardwareCounterCell {
+        let mut counter = self.hardware_counter.take();
+
+        counter
+            .cpu_counter_mut()
+            .multiplied_mut(size_of::<TElement>());
+
+        counter
     }
 }
