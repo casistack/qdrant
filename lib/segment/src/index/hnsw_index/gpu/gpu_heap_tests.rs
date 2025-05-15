@@ -7,9 +7,10 @@ use common::types::{PointOffsetType, ScoredPointOffset};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::index::hnsw_index::gpu::shader_builder::{ShaderBuilder, ShaderBuilderParameters};
 use crate::index::hnsw_index::gpu::GPU_TIMEOUT;
+use crate::index::hnsw_index::gpu::shader_builder::{ShaderBuilder, ShaderBuilderParameters};
 
 struct GpuHeapTestConfig {
     ef: usize,
@@ -40,6 +41,7 @@ impl ShaderBuilderParameters for GpuHeapTestConfig {
     }
 }
 
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 struct GpuHeapTestParams {
     input_counts: u32,
@@ -61,12 +63,11 @@ fn test_gpu_nearest_heap(#[values(true, false)] linear: bool) {
     let inputs_data: Vec<ScoredPointOffset> = (0..inputs_count * groups_count)
         .map(|i| ScoredPointOffset {
             idx: i as PointOffsetType,
-            score: rng.gen_range(-1.0..1.0),
+            score: rng.random_range(-1.0..1.0),
         })
         .collect();
 
-    let debug_messenger = gpu::PanicIfErrorMessenger {};
-    let instance = gpu::Instance::new(Some(&debug_messenger), None, false).unwrap();
+    let instance = gpu::GPU_TEST_INSTANCE.clone();
     let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
 
     let gpu_nearest_heap = GpuHeapTestConfig { ef, linear };
@@ -92,7 +93,9 @@ fn test_gpu_nearest_heap(#[values(true, false)] linear: bool) {
         inputs_count * groups_count * std::mem::size_of::<ScoredPointOffset>(),
     )
     .unwrap();
-    upload_staging_buffer.upload_slice(&inputs_data, 0).unwrap();
+    upload_staging_buffer
+        .upload(inputs_data.as_slice(), 0)
+        .unwrap();
 
     let mut context = gpu::Context::new(device.clone()).unwrap();
     context
@@ -196,9 +199,8 @@ fn test_gpu_nearest_heap(#[values(true, false)] linear: bool) {
         .unwrap();
     context.run().unwrap();
     context.wait_finish(GPU_TIMEOUT).unwrap();
-    let mut scores_output = vec![0.0; inputs_count * groups_count];
-    download_staging_buffer
-        .download_slice(&mut scores_output, 0)
+    let scores_output = download_staging_buffer
+        .download_vec::<f32>(0, inputs_count * groups_count)
         .unwrap();
 
     let mut scores_output_cpu = vec![0.0; inputs_count * groups_count];
@@ -210,27 +212,26 @@ fn test_gpu_nearest_heap(#[values(true, false)] linear: bool) {
             queue.push(scored_point);
             scores_output_cpu[group * inputs_count + i] = queue.top().unwrap().score;
         }
-        let sorted = queue.into_vec();
+        let sorted = queue.into_sorted_vec();
         for i in 0..ef {
             sorted_output_cpu[group * ef + i] = sorted[i].idx;
         }
     }
 
-    let mut nearest_gpu: Vec<PointOffsetType> =
-        vec![Default::default(); gpu_nearest_heap.ef * groups_count];
+    let nearest_gpu_count = gpu_nearest_heap.ef * groups_count;
     context
         .copy_gpu_buffer(
             sorted_output_buffer.clone(),
             download_staging_buffer.clone(),
             0,
             0,
-            nearest_gpu.len() * std::mem::size_of::<PointOffsetType>(),
+            nearest_gpu_count * std::mem::size_of::<PointOffsetType>(),
         )
         .unwrap();
     context.run().unwrap();
     context.wait_finish(GPU_TIMEOUT).unwrap();
-    download_staging_buffer
-        .download_slice(nearest_gpu.as_mut_slice(), 0)
+    let nearest_gpu = download_staging_buffer
+        .download_vec::<PointOffsetType>(0, nearest_gpu_count)
         .unwrap();
 
     let mut sorted_output_gpu = Vec::new();
@@ -262,12 +263,11 @@ fn test_gpu_candidates_heap(#[values(true, false)] linear: bool) {
     let inputs_data: Vec<ScoredPointOffset> = (0..inputs_count * groups_count)
         .map(|i| ScoredPointOffset {
             idx: i as PointOffsetType,
-            score: rng.gen_range(-1.0..1.0),
+            score: rng.random_range(-1.0..1.0),
         })
         .collect();
 
-    let debug_messenger = gpu::PanicIfErrorMessenger {};
-    let instance = gpu::Instance::new(Some(&debug_messenger), None, false).unwrap();
+    let instance = gpu::GPU_TEST_INSTANCE.clone();
     let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
 
     let gpu_candidates_heap = GpuHeapTestConfig {
@@ -296,7 +296,9 @@ fn test_gpu_candidates_heap(#[values(true, false)] linear: bool) {
         inputs_count * groups_count * std::mem::size_of::<ScoredPointOffset>(),
     )
     .unwrap();
-    upload_staging_buffer.upload_slice(&inputs_data, 0).unwrap();
+    upload_staging_buffer
+        .upload(inputs_data.as_slice(), 0)
+        .unwrap();
 
     let mut context = gpu::Context::new(device.clone()).unwrap();
     context
@@ -403,9 +405,8 @@ fn test_gpu_candidates_heap(#[values(true, false)] linear: bool) {
         .unwrap();
     context.run().unwrap();
     context.wait_finish(GPU_TIMEOUT).unwrap();
-    let mut scores_gpu = vec![ScoredPointOffset::default(); inputs_count * groups_count];
-    download_staging_buffer
-        .download_slice(&mut scores_gpu, 0)
+    let scores_gpu = download_staging_buffer
+        .download_vec::<ScoredPointOffset>(0, inputs_count * groups_count)
         .unwrap();
 
     assert_eq!(scores_gpu, scores_cpu);

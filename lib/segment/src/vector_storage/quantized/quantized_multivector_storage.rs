@@ -39,7 +39,6 @@ impl MultivectorOffsetsStorage for Vec<MultivectorOffset> {
         let offsets_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(false)
             .open(path)?;
         let offsets_mmap = unsafe { MmapMut::map_mut(&offsets_file) }?;
         let mut offsets_mmap_type =
@@ -71,7 +70,6 @@ impl MultivectorOffsetsStorage for MultivectorOffsetsStorageMmap {
         let offsets_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(false)
             .open(path)?;
         let offsets_mmap = unsafe { MmapMut::map_mut(&offsets_file) }?;
         let offsets = unsafe { MmapSlice::<MultivectorOffset>::try_from(offsets_mmap)? };
@@ -120,6 +118,10 @@ where
     QuantizedStorage: EncodedVectors<TEncodedQuery>,
     TMultivectorOffsetsStorage: MultivectorOffsetsStorage,
 {
+    pub fn storage(&self) -> &QuantizedStorage {
+        &self.quantized_storage
+    }
+
     pub fn new(
         dim: usize,
         quantized_storage: QuantizedStorage,
@@ -250,6 +252,10 @@ where
         unreachable!(
             "multivector quantized storage should be loaded using `self.load_multi` method"
         )
+    }
+
+    fn is_on_disk(&self) -> bool {
+        self.quantized_storage.is_on_disk()
     }
 
     fn encode_query(&self, query: &[VectorElementType]) -> Vec<TEncodedQuery> {

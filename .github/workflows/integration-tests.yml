@@ -8,38 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  POETRY_VERSION: 1.8.5
 
 jobs:
-  test:
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable 
-      - uses: actions/checkout@v4
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: |
-          sudo apt-get install clang
-          curl -sSL https://install.python-poetry.org | python3 -
-
-          poetry -C tests check --lock
-          poetry -C tests install --no-root
-      - name: Build
-        run: cargo build --features "service_debug data-consistency-check"
-      - name: Run integration tests
-        run: poetry -C tests run ./tests/integration-tests.sh
-        shell: bash
-
-  test-consensus:
+  integration-tests:
 
     runs-on: ubuntu-latest
 
@@ -52,6 +24,38 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          sudo apt-get install clang
+          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
+
+          poetry -C tests check --lock
+          poetry -C tests install --no-root
+      - name: Build
+        run: cargo build --features "service_debug data-consistency-check" --locked
+      - name: Run integration tests
+        run: poetry -C tests run ./tests/integration-tests.sh
+        shell: bash
+
+  integration-tests-consensus:
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install minimal stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-tests
       - name: Install dependencies
         run: sudo apt-get install clang
       - uses: actions/setup-python@v5
@@ -59,21 +63,21 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
 
           poetry -C tests check --lock
           poetry -C tests install --no-root
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check"
+        run: cargo build --features "service_debug data-consistency-check" --locked
       - name: Run integration tests - 1 peer
         run: poetry -C tests run ./tests/integration-tests.sh distributed
         shell: bash
       - name: Run integration tests - multiple peers - pytest
-        run: poetry -C tests run pytest tests/consensus_tests
+        run: poetry -C tests run pytest tests/consensus_tests --durations=10
         timeout-minutes: 60
-      - name: upload logs in case of failure
+      - name: upload logs
         uses: actions/upload-artifact@v4
-        if: failure() || cancelled()
+        if: always()
         with:
           name: consensus-test-logs
           retention-days: 90 # default max value
@@ -90,7 +94,7 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
 
           poetry -C tests check --lock
           poetry -C tests install --no-root
@@ -148,13 +152,15 @@ jobs:
 
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable 
+        uses: dtolnay/rust-toolchain@stable
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-tests
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Install dependencies
-        run: sudo apt-get install -y jq
+        run: sudo apt-get install -y clang jq
       - name: Docker build
         uses: docker/build-push-action@v6
         with:
@@ -182,17 +188,10 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: sudo apt-get install clang git-lfs jq
+        run: sudo apt-get install git-lfs jq
       - name: Setup git-lfs
         run: git lfs install
-      - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v4
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Docker build
@@ -242,17 +241,10 @@ jobs:
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
 
       - name: Install dependencies
-        run: sudo apt-get install clang jq
+        run: sudo apt-get install git-lfs jq
       - name: Setup git-lfs
         run: git lfs install
-      - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - uses: actions/checkout@v4
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Docker build
@@ -299,6 +291,8 @@ jobs:
       - name: Install minimal stable
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-tests
       - uses: actions/checkout@v4
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -307,7 +301,7 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get install clang jq
       - name: Build
-        run: cargo build --bin qdrant
+        run: cargo build --bin qdrant --locked
       - name: Run Shard Snapshot API Tests (local)
         shell: bash
         run: |

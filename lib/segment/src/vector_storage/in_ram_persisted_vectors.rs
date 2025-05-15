@@ -1,9 +1,11 @@
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use memory::madvise::{Advice, AdviceSetting};
 
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
 use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
 
@@ -54,13 +56,22 @@ impl<T: Sized + Copy + Clone + Default + 'static> ChunkedVectorStorage<T>
     }
 
     #[inline]
-    fn push(&mut self, vector: &[T]) -> OperationResult<VectorOffsetType> {
-        self.mmap_storage.push(vector)
+    fn push(
+        &mut self,
+        vector: &[T],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<VectorOffsetType> {
+        self.mmap_storage.push(vector, hw_counter)
     }
 
     #[inline]
-    fn insert(&mut self, key: VectorOffsetType, vector: &[T]) -> OperationResult<()> {
-        self.mmap_storage.insert(key, vector)
+    fn insert(
+        &mut self,
+        key: VectorOffsetType,
+        vector: &[T],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.mmap_storage.insert(key, vector, hw_counter)
     }
 
     #[inline]
@@ -69,8 +80,10 @@ impl<T: Sized + Copy + Clone + Default + 'static> ChunkedVectorStorage<T>
         start_key: VectorOffsetType,
         vectors: &[T],
         count: usize,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
-        self.mmap_storage.insert_many(start_key, vectors, count)
+        self.mmap_storage
+            .insert_many(start_key, vectors, count, hw_counter)
     }
 
     #[inline]
@@ -79,7 +92,11 @@ impl<T: Sized + Copy + Clone + Default + 'static> ChunkedVectorStorage<T>
     }
 
     #[inline]
-    fn get_batch<'a>(&'a self, keys: &[VectorOffsetType], vectors: &mut [&'a [T]]) {
+    fn get_batch<'a>(
+        &'a self,
+        keys: &[VectorOffsetType],
+        vectors: &'a mut [MaybeUninit<&'a [T]>],
+    ) -> &'a [&'a [T]] {
         self.mmap_storage.get_batch(keys, vectors)
     }
 
@@ -94,5 +111,13 @@ impl<T: Sized + Copy + Clone + Default + 'static> ChunkedVectorStorage<T>
 
     fn is_on_disk(&self) -> bool {
         false
+    }
+
+    fn populate(&self) -> OperationResult<()> {
+        self.mmap_storage.populate()
+    }
+
+    fn clear_cache(&self) -> OperationResult<()> {
+        self.mmap_storage.clear_cache()
     }
 }

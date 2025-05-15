@@ -15,26 +15,28 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, read_dir};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use api::rest::models::HardwareUsage;
 use collection::collection::{Collection, RequestShardTransfer};
-use collection::config::{default_replication_factor, CollectionConfigInternal};
+use collection::config::{CollectionConfigInternal, default_replication_factor};
 use collection::operations::types::*;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::replica_set::{AbortShardTransfer, ReplicaState};
 use collection::shards::shard::{PeerId, ShardId};
-use collection::shards::{replica_set, CollectionId};
-use collection::telemetry::CollectionTelemetry;
-use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::{get_num_cpus, CpuBudget};
+use collection::shards::{CollectionId, replica_set};
+use collection::telemetry::{CollectionTelemetry, CollectionsAggregatedTelemetry};
+use common::budget::ResourceBudget;
+use common::counter::hardware_accumulator::HwSharedDrain;
+use common::cpu::get_num_cpus;
 use common::types::TelemetryDetail;
 use dashmap::DashMap;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, Semaphore};
 
 use self::dispatcher::TocDispatcher;
+use crate::ConsensusOperations;
 use crate::content_manager::alias_mapping::AliasPersistence;
 use crate::content_manager::collection_meta_ops::CreateCollectionOperation;
 use crate::content_manager::collections_ops::{Checker, Collections};
@@ -43,7 +45,6 @@ use crate::content_manager::errors::StorageError;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 use crate::rbac::{Access, AccessRequirements, CollectionPass};
 use crate::types::StorageConfig;
-use crate::ConsensusOperations;
 
 pub const ALIASES_PATH: &str = "aliases";
 pub const COLLECTIONS_DIR: &str = "collections";
@@ -61,7 +62,7 @@ pub struct TableOfContent {
     general_runtime: Runtime,
     /// Global CPU budget in number of cores for all optimization tasks.
     /// Assigns CPU permits to tasks to limit overall resource utilization.
-    optimizer_cpu_budget: CpuBudget,
+    optimizer_resource_budget: ResourceBudget,
     alias_persistence: RwLock<AliasPersistence>,
     pub this_peer_id: PeerId,
     channel_service: ChannelService,
@@ -81,7 +82,7 @@ pub struct TableOfContent {
     /// Effectively, this lock ensures that `create_collection` is called sequentially.
     collection_create_lock: Mutex<()>,
     /// Aggregation of all hardware measurements for each alias or collection config.
-    collection_hw_metrics: DashMap<CollectionId, Arc<HwMeasurementAcc>>,
+    collection_hw_metrics: DashMap<CollectionId, HwSharedDrain>,
 }
 
 impl TableOfContent {
@@ -92,13 +93,11 @@ impl TableOfContent {
         search_runtime: Runtime,
         update_runtime: Runtime,
         general_runtime: Runtime,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
         channel_service: ChannelService,
         this_peer_id: PeerId,
         consensus_proposal_sender: Option<OperationSender>,
     ) -> Self {
-        let snapshots_path = Path::new(&storage_config.snapshots_path.clone()).to_owned();
-        create_dir_all(&snapshots_path).expect("Can't create Snapshots directory");
         let collections_path = Path::new(&storage_config.storage_path).join(COLLECTIONS_DIR);
         create_dir_all(&collections_path).expect("Can't create Collections directory");
         if let Some(path) = storage_config.temp_path.as_deref() {
@@ -128,11 +127,11 @@ impl TableOfContent {
                 .to_str()
                 .expect("A filename of one of the collection files is not a valid UTF-8")
                 .to_string();
+
+            let snapshots_path = Path::new(&storage_config.snapshots_path.clone()).to_owned();
             let collection_snapshots_path =
                 Self::collection_snapshots_path(&snapshots_path, &collection_name);
-            create_dir_all(&collection_snapshots_path).unwrap_or_else(|e| {
-                panic!("Can't create a directory for snapshot of {collection_name}: {e}")
-            });
+
             log::info!("Loading collection: {collection_name}");
             let collection = general_runtime.block_on(Collection::load(
                 collection_name.clone(),
@@ -158,7 +157,7 @@ impl TableOfContent {
                 ),
                 Some(search_runtime.handle().clone()),
                 Some(update_runtime.handle().clone()),
-                optimizer_cpu_budget.clone(),
+                optimizer_resource_budget.clone(),
                 storage_config.optimizers_overwrite.clone(),
             ));
 
@@ -191,7 +190,7 @@ impl TableOfContent {
             search_runtime,
             update_runtime,
             general_runtime,
-            optimizer_cpu_budget,
+            optimizer_resource_budget,
             alias_persistence: RwLock::new(alias_persistence),
             this_peer_id,
             channel_service,
@@ -216,13 +215,30 @@ impl TableOfContent {
 
     /// List of all collections to which the user has access
     pub async fn all_collections(&self, access: &Access) -> Vec<CollectionPass<'static>> {
+        self.all_collections_with_access_requirements(access, AccessRequirements::new())
+            .await
+    }
+
+    pub async fn all_collections_whole_access(
+        &self,
+        access: &Access,
+    ) -> Vec<CollectionPass<'static>> {
+        self.all_collections_with_access_requirements(access, AccessRequirements::new().whole())
+            .await
+    }
+
+    async fn all_collections_with_access_requirements(
+        &self,
+        access: &Access,
+        access_requirements: AccessRequirements,
+    ) -> Vec<CollectionPass<'static>> {
         self.collections
             .read()
             .await
             .keys()
             .filter_map(|name| {
                 access
-                    .check_collection_access(name, AccessRequirements::new())
+                    .check_collection_access(name, access_requirements)
                     .ok()
                     .map(|pass| pass.into_static())
             })
@@ -451,10 +467,24 @@ impl TableOfContent {
         access: &Access,
     ) -> Vec<CollectionTelemetry> {
         let mut result = Vec::new();
-        let all_collections = self.all_collections(access).await;
+        let all_collections = self.all_collections_whole_access(access).await;
         for collection_pass in &all_collections {
             if let Ok(collection) = self.get_collection(collection_pass).await {
                 result.push(collection.get_telemetry_data(detail).await);
+            }
+        }
+        result
+    }
+
+    pub async fn get_aggregated_telemetry_data(
+        &self,
+        access: &Access,
+    ) -> Vec<CollectionsAggregatedTelemetry> {
+        let mut result = Vec::new();
+        let all_collections = self.all_collections_whole_access(access).await;
+        for collection_pass in &all_collections {
+            if let Ok(collection) = self.get_collection(collection_pass).await {
+                result.push(collection.get_aggregated_telemetry_data().await);
             }
         }
         result
@@ -507,10 +537,14 @@ impl TableOfContent {
                     state,
                     from_state,
                 ) {
-                    log::error!("Can't send proposal to deactivate replica on peer {peer_id} of shard {shard_id} of collection {collection_name}. Error: {send_error}");
+                    log::error!(
+                        "Can't send proposal to deactivate replica on peer {peer_id} of shard {shard_id} of collection {collection_name}. Error: {send_error}",
+                    );
                 }
             } else {
-                log::error!("Can't send proposal to deactivate replica. Error: this is a single node deployment");
+                log::error!(
+                    "Can't send proposal to deactivate replica. Error: this is a single node deployment",
+                );
             }
         })
     }
@@ -545,14 +579,13 @@ impl TableOfContent {
                     ConsensusOperations::start_transfer(collection_name.clone(), shard_transfer);
                 if let Err(send_error) = proposal_sender.send(operation) {
                     log::error!(
-                        "Can't send proposal to request shard transfer to peer {} of collection {}. Error: {}",
-                        to_peer,
-                        collection_name,
-                        send_error
+                        "Can't send proposal to request shard transfer to peer {to_peer} of collection {collection_name}. Error: {send_error}"
                     );
                 }
             } else {
-                log::error!("Can't send proposal to request shard transfer. Error: this is a single node deployment");
+                log::error!(
+                    "Can't send proposal to request shard transfer. Error: this is a single node deployment",
+                );
             }
         })
     }
@@ -652,18 +685,23 @@ impl TableOfContent {
     pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
         self.collection_hw_metrics
             .iter()
-            .map(|i| (i.key().to_string(), HardwareUsage { cpu: i.get_cpu() }))
+            .map(|i| {
+                let key = i.key().to_string();
+                let hw_usage = HardwareUsage {
+                    cpu: i.get_cpu(),
+                    payload_io_read: i.get_payload_io_read(),
+                    payload_io_write: i.get_payload_io_write(),
+                    payload_index_io_read: i.get_payload_index_io_read(),
+                    payload_index_io_write: i.get_payload_index_io_write(),
+                    vector_io_read: i.get_vector_io_read(),
+                    vector_io_write: i.get_vector_io_write(),
+                };
+                (key, hw_usage)
+            })
             .collect()
     }
-}
 
-impl Drop for TableOfContent {
-    fn drop(&mut self) {
-        // When dropping `TableOfContent` we also drop the collected hardware measurements which need to be discarded
-        // to prevent panicking in debug mode and tests.
-        #[cfg(any(debug_assertions, test))]
-        for metric in self.collection_hw_metrics.iter_mut() {
-            metric.discard();
-        }
+    pub(crate) fn general_runtime_handle(&self) -> &Handle {
+        self.general_runtime.handle()
     }
 }

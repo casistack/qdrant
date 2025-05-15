@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::iter;
 
+use ahash::AHashMap;
 use common::types::ScoreType;
 use itertools::{Itertools, MinMaxResult};
 use ordered_float::OrderedFloat;
@@ -73,7 +73,7 @@ pub fn score_fusion(
         })
         // combine to deduplicate
         .fold(
-            HashMap::<PointIdType, ScoredPoint>::new(),
+            AHashMap::<PointIdType, ScoredPoint>::new(),
             |mut acc, point| {
                 acc.entry(point.id)
                     .and_modify(|entry| match method {
@@ -118,7 +118,7 @@ pub fn min_max_norm(points: Vec<ScoredPoint>) -> Vec<ScoredPoint> {
 }
 
 /// Welford's method for stable one-pass mean and variance calculation.
-/// https://jonisalonen.com/2013/deriving-welfords-method-for-computing-variance/
+/// <https://jonisalonen.com/2013/deriving-welfords-method-for-computing-variance/>
 ///
 /// # Panics
 ///

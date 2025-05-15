@@ -3,7 +3,8 @@ mod execute_read_operation;
 mod locally_disabled_peers;
 mod read_ops;
 mod shard_transfer;
-mod snapshots;
+pub mod snapshots;
+mod telemetry;
 mod update;
 
 use std::collections::{HashMap, HashSet};
@@ -12,27 +13,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::cpu::CpuBudget;
-use common::types::TelemetryDetail;
+use common::budget::ResourceBudget;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::rate_limiting::RateLimiter;
 use schemars::JsonSchema;
+use segment::common::anonymize::Anonymize;
 use segment::types::{ExtendedPointId, Filter, ShardKey};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 
-use super::local_shard::clock_map::RecoveryPoint;
+use super::CollectionId;
 use super::local_shard::LocalShard;
+use super::local_shard::clock_map::RecoveryPoint;
 use super::remote_shard::RemoteShard;
 use super::transfer::ShardTransfer;
-use super::CollectionId;
 use crate::collection::payload_index_schema::PayloadIndexSchema;
-use crate::common::local_data_stats::LocalDataStats;
+use crate::common::collection_size_stats::CollectionSizeStats;
 use crate::common::snapshots_manager::SnapshotStorageManager;
 use crate::config::CollectionConfigInternal;
-use crate::operations::point_ops::{self};
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{CollectionError, CollectionResult, UpdateResult, UpdateStatus};
-use crate::operations::CollectionUpdateOperations;
+use crate::operations::{CollectionUpdateOperations, point_ops};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::save_on_disk::SaveOnDisk;
 use crate::shards::channel_service::ChannelService;
@@ -40,7 +42,6 @@ use crate::shards::dummy_shard::DummyShard;
 use crate::shards::replica_set::clock_set::ClockSet;
 use crate::shards::shard::{PeerId, Shard, ShardId};
 use crate::shards::shard_config::ShardConfig;
-use crate::shards::telemetry::ReplicaSetTelemetry;
 
 //    │    Collection Created
 //    │
@@ -106,11 +107,12 @@ pub struct ShardReplicaSet {
     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     update_runtime: Handle,
     search_runtime: Handle,
-    optimizer_cpu_budget: CpuBudget,
+    optimizer_resource_budget: ResourceBudget,
     /// Lock to serialized write operations on the replicaset when a write ordering is used.
     write_ordering_lock: Mutex<()>,
     /// Local clock set, used to tag new operations on this shard.
     clock_set: Mutex<ClockSet>,
+    write_rate_limiter: Option<parking_lot::Mutex<RateLimiter>>,
 }
 
 pub type AbortShardTransfer = Arc<dyn Fn(ShardTransfer, &str) + Send + Sync>;
@@ -139,7 +141,7 @@ impl ShardReplicaSet {
         channel_service: ChannelService,
         update_runtime: Handle,
         search_runtime: Handle,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
         init_state: Option<ReplicaState>,
     ) -> CollectionResult<Self> {
         let shard_path = super::create_shard_dir(collection_path, shard_id).await?;
@@ -153,7 +155,7 @@ impl ShardReplicaSet {
                 payload_index_schema.clone(),
                 update_runtime.clone(),
                 search_runtime.clone(),
-                optimizer_cpu_budget.clone(),
+                optimizer_resource_budget.clone(),
                 effective_optimizers_config.clone(),
             )
             .await?;
@@ -188,6 +190,16 @@ impl ShardReplicaSet {
         let replica_set_shard_config = ShardConfig::new_replica_set();
         replica_set_shard_config.save(&shard_path)?;
 
+        // Initialize the write rate limiter
+        let config = collection_config.read().await;
+        let write_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
+            strict_mode
+                .write_rate_limit
+                .map(RateLimiter::new_per_minute)
+                .map(parking_lot::Mutex::new)
+        });
+        drop(config);
+
         Ok(Self {
             shard_id,
             shard_key,
@@ -206,9 +218,10 @@ impl ShardReplicaSet {
             payload_index_schema,
             update_runtime,
             search_runtime,
-            optimizer_cpu_budget,
+            optimizer_resource_budget,
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
+            write_rate_limiter,
         })
     }
 
@@ -223,6 +236,7 @@ impl ShardReplicaSet {
         shard_key: Option<ShardKey>,
         collection_id: CollectionId,
         shard_path: &Path,
+        is_dirty_shard: bool,
         collection_config: Arc<RwLock<CollectionConfigInternal>>,
         effective_optimizers_config: OptimizersConfig,
         shared_storage_config: Arc<SharedStorageConfig>,
@@ -233,7 +247,7 @@ impl ShardReplicaSet {
         this_peer_id: PeerId,
         update_runtime: Handle,
         search_runtime: Handle,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
     ) -> Self {
         let replica_state: SaveOnDisk<ReplicaSetState> =
             SaveOnDisk::load_or_init_default(shard_path.join(REPLICA_STATE_FILE)).unwrap();
@@ -265,6 +279,14 @@ impl ShardReplicaSet {
         let local = if replica_state.read().is_local {
             let shard = if let Some(recovery_reason) = &shared_storage_config.recovery_mode {
                 Shard::Dummy(DummyShard::new(recovery_reason))
+            } else if is_dirty_shard {
+                log::error!(
+                    "Shard {collection_id}:{shard_id} is not fully initialized - loading as dummy shard"
+                );
+                // This dummy shard will be replaced only when it rejects an update (marked as dead so recovery process kicks in)
+                Shard::Dummy(DummyShard::new(
+                    "Dirty shard - shard is not fully initialized",
+                ))
             } else {
                 let res = LocalShard::load(
                     shard_id,
@@ -276,7 +298,7 @@ impl ShardReplicaSet {
                     payload_index_schema.clone(),
                     update_runtime.clone(),
                     search_runtime.clone(),
-                    optimizer_cpu_budget.clone(),
+                    optimizer_resource_budget.clone(),
                 )
                 .await;
 
@@ -307,6 +329,16 @@ impl ShardReplicaSet {
             None
         };
 
+        // Initialize the write rate limiter
+        let config = collection_config.read().await;
+        let write_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
+            strict_mode
+                .write_rate_limit
+                .map(RateLimiter::new_per_minute)
+                .map(parking_lot::Mutex::new)
+        });
+        drop(config);
+
         let replica_set = Self {
             shard_id,
             shard_key,
@@ -326,11 +358,13 @@ impl ShardReplicaSet {
             payload_index_schema,
             update_runtime,
             search_runtime,
-            optimizer_cpu_budget,
+            optimizer_resource_budget,
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
+            write_rate_limiter,
         };
 
+        // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
         if local_load_failure && replica_set.active_remote_shards().is_empty() {
             replica_set
                 .locally_disabled_peers
@@ -343,6 +377,10 @@ impl ShardReplicaSet {
 
     pub fn this_peer_id(&self) -> PeerId {
         self.replica_state.read().this_peer_id
+    }
+
+    pub async fn has_remote_shard(&self) -> bool {
+        !self.remotes.read().await.is_empty()
     }
 
     pub async fn has_local_shard(&self) -> bool {
@@ -369,6 +407,7 @@ impl ShardReplicaSet {
     }
 
     pub fn is_last_active_replica(&self, peer_id: PeerId) -> bool {
+        // This includes `Active` and `ReshardingScaleDown` replicas!
         let active_peers = self.replica_state.read().active_peers();
         active_peers.len() == 1 && active_peers.contains(&peer_id)
     }
@@ -381,6 +420,7 @@ impl ShardReplicaSet {
     pub fn active_shards(&self) -> Vec<PeerId> {
         let replica_state = self.replica_state.read();
         replica_state
+            // This is a part of deprecated built-in resharding implementation, so we don't care
             .active_peers()
             .into_iter()
             .filter(|&peer_id| !self.is_locally_disabled(peer_id))
@@ -392,7 +432,7 @@ impl ShardReplicaSet {
         let replica_state = self.replica_state.read();
         let this_peer_id = replica_state.this_peer_id;
         replica_state
-            .active_peers()
+            .active_peers() // This includes `Active` and `ReshardingScaleDown` replicas!
             .into_iter()
             .filter(|&peer_id| !self.is_locally_disabled(peer_id) && peer_id != this_peer_id)
             .collect()
@@ -483,12 +523,13 @@ impl ShardReplicaSet {
         Ok(())
     }
 
+    /// Clears the local shard data and loads an empty local shard
     pub async fn init_empty_local_shard(&self) -> CollectionResult<()> {
         let mut local = self.local.write().await;
 
         let current_shard = local.take();
 
-        // ToDo: Remove shard files here?
+        LocalShard::clear(&self.shard_path).await?;
         let local_shard_res = LocalShard::build(
             self.shard_id,
             self.collection_id.clone(),
@@ -498,7 +539,7 @@ impl ShardReplicaSet {
             self.payload_index_schema.clone(),
             self.update_runtime.clone(),
             self.search_runtime.clone(),
-            self.optimizer_cpu_budget.clone(),
+            self.optimizer_resource_budget.clone(),
             self.optimizers_config.clone(),
         )
         .await;
@@ -529,8 +570,8 @@ impl ShardReplicaSet {
         if !self.replica_state.read().is_local || state.is_some() {
             self.replica_state.write(|rs| {
                 rs.is_local = true;
-                if let Some(active) = state {
-                    rs.set_peer_state(self.this_peer_id(), active);
+                if let Some(state) = state {
+                    rs.set_peer_state(self.this_peer_id(), state);
                 }
             })?;
         }
@@ -644,8 +685,9 @@ impl ShardReplicaSet {
     }
 
     pub async fn apply_state(
-        &self,
+        &mut self,
         replicas: HashMap<PeerId, ReplicaState>,
+        shard_key: Option<ShardKey>,
     ) -> CollectionResult<()> {
         let old_peers = self.replica_state.read().peers();
 
@@ -684,12 +726,15 @@ impl ShardReplicaSet {
                     self.payload_index_schema.clone(),
                     self.update_runtime.clone(),
                     self.search_runtime.clone(),
-                    self.optimizer_cpu_budget.clone(),
+                    self.optimizer_resource_budget.clone(),
                     self.optimizers_config.clone(),
                 )
                 .await?;
+
                 match state {
-                    ReplicaState::Active | ReplicaState::Listener => {
+                    ReplicaState::Active
+                    | ReplicaState::Listener
+                    | ReplicaState::ReshardingScaleDown => {
                         // No way we can provide up-to-date replica right away at this point,
                         // so we report a failure to consensus
                         self.set_local(local_shard, Some(state)).await?;
@@ -705,6 +750,7 @@ impl ShardReplicaSet {
                         self.set_local(local_shard, Some(state)).await?;
                     }
                 }
+
                 continue;
             }
 
@@ -718,6 +764,10 @@ impl ShardReplicaSet {
             );
             self.remotes.write().await.push(new_remote);
         }
+
+        // Apply shard key
+        self.shard_key = shard_key;
+
         Ok(())
     }
 
@@ -730,10 +780,55 @@ impl ShardReplicaSet {
         }
     }
 
-    pub(crate) async fn on_strict_mode_config_update(&self) -> CollectionResult<()> {
-        let read_local = self.local.read().await;
-        if let Some(shard) = &*read_local {
+    /// Apply shard's strict mode configuration update
+    /// - Update read and write rate limiters
+    pub(crate) async fn on_strict_mode_config_update(&mut self) -> CollectionResult<()> {
+        let mut read_local = self.local.write().await;
+        if let Some(shard) = read_local.as_mut() {
             shard.on_strict_mode_config_update().await
+        }
+        drop(read_local);
+        let config = self.collection_config.read().await;
+        if let Some(strict_mode_config) = &config.strict_mode_config {
+            if strict_mode_config.enabled == Some(true) {
+                // update write rate limiter
+                if let Some(write_rate_limit_per_min) = strict_mode_config.write_rate_limit {
+                    let new_write_rate_limiter =
+                        RateLimiter::new_per_minute(write_rate_limit_per_min);
+                    self.write_rate_limiter
+                        .replace(parking_lot::Mutex::new(new_write_rate_limiter));
+                    return Ok(());
+                }
+            }
+        }
+        // remove write rate limiter for all other situations
+        self.write_rate_limiter.take();
+        Ok(())
+    }
+
+    /// Check if the write rate limiter allows the operation to proceed
+    /// - hw_measurement_acc: the current hardware measurement accumulator
+    /// - cost_fn: the cost of the operation called lazily
+    ///
+    /// Returns an error if the rate limit is exceeded.
+    fn check_write_rate_limiter<F>(
+        &self,
+        hw_measurement_acc: &HwMeasurementAcc,
+        cost_fn: F,
+    ) -> CollectionResult<()>
+    where
+        F: FnOnce() -> usize,
+    {
+        // Do not rate limit internal operation tagged with disposable measurement
+        if hw_measurement_acc.is_disposable() {
+            return Ok(());
+        }
+        if let Some(rate_limiter) = &self.write_rate_limiter {
+            let cost = cost_fn();
+            rate_limiter
+                .lock()
+                .try_consume(cost as f64)
+                .map_err(|err| CollectionError::rate_limit_error(err, cost, true))?;
         }
         Ok(())
     }
@@ -767,30 +862,6 @@ impl ShardReplicaSet {
         Ok(())
     }
 
-    pub(crate) async fn get_telemetry_data(&self, detail: TelemetryDetail) -> ReplicaSetTelemetry {
-        let local_shard = self.local.read().await;
-        let local = local_shard.as_ref();
-
-        let local_telemetry = match local {
-            Some(local_shard) => Some(local_shard.get_telemetry_data(detail).await),
-            None => None,
-        };
-
-        ReplicaSetTelemetry {
-            id: self.shard_id,
-            key: self.shard_key.clone(),
-            local: local_telemetry,
-            remote: self
-                .remotes
-                .read()
-                .await
-                .iter()
-                .map(|remote| remote.get_telemetry_data(detail))
-                .collect(),
-            replicate_states: self.replica_state.read().peers(),
-        }
-    }
-
     pub(crate) async fn health_check(&self, peer_id: PeerId) -> CollectionResult<()> {
         let remotes = self.remotes.read().await;
 
@@ -805,7 +876,12 @@ impl ShardReplicaSet {
         Ok(())
     }
 
-    pub async fn delete_local_points(&self, filter: Filter) -> CollectionResult<UpdateResult> {
+    pub async fn delete_local_points(
+        &self,
+        filter: Filter,
+        hw_measurement_acc: HwMeasurementAcc,
+        force: bool,
+    ) -> CollectionResult<UpdateResult> {
         let local_shard_guard = self.local.read().await;
 
         let Some(local_shard) = local_shard_guard.deref() else {
@@ -831,6 +907,7 @@ impl ShardReplicaSet {
                     &self.search_runtime,
                     None,
                     None,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
 
@@ -859,12 +936,15 @@ impl ShardReplicaSet {
             });
 
         // TODO(resharding): Assign clock tag to the operation!? 🤔
-        let result = self.update_local(op.into(), false).await?.ok_or_else(|| {
-            CollectionError::bad_request(format!(
-                "local shard {}:{} does not exist or is unavailable",
-                self.collection_id, self.shard_id,
-            ))
-        })?;
+        let result = self
+            .update_local(op.into(), true, hw_measurement_acc, force)
+            .await?
+            .ok_or_else(|| {
+                CollectionError::bad_request(format!(
+                    "local shard {}:{} does not exist or is unavailable",
+                    self.collection_id, self.shard_id,
+                ))
+            })?;
 
         Ok(result)
     }
@@ -893,13 +973,22 @@ impl ShardReplicaSet {
     /// Check whether a peer is registered as `active`.
     /// Unknown peers are not active.
     fn peer_is_active(&self, peer_id: PeerId) -> bool {
-        self.peer_state(peer_id) == Some(ReplicaState::Active) && !self.is_locally_disabled(peer_id)
+        // This is used *exclusively* during `execute_*_read_operation`, and so it *should* consider
+        // `ReshardingScaleDown` replicas
+        let is_active = matches!(
+            self.peer_state(peer_id),
+            Some(ReplicaState::Active | ReplicaState::ReshardingScaleDown)
+        );
+
+        is_active && !self.is_locally_disabled(peer_id)
     }
 
     fn peer_is_active_or_resharding(&self, peer_id: PeerId) -> bool {
         let is_active_or_resharding = matches!(
             self.peer_state(peer_id),
-            Some(ReplicaState::Active | ReplicaState::Resharding)
+            Some(
+                ReplicaState::Active | ReplicaState::Resharding | ReplicaState::ReshardingScaleDown
+            )
         );
 
         let is_locally_disabled = self.is_locally_disabled(peer_id);
@@ -964,7 +1053,7 @@ impl ShardReplicaSet {
     }
 
     fn notify_peer_failure(&self, peer_id: PeerId, from_state: Option<ReplicaState>) {
-        log::debug!("Notify peer failure: {}", peer_id);
+        log::debug!("Notify peer failure: {peer_id}");
         self.notify_peer_failure_cb.deref()(peer_id, self.shard_id, from_state)
     }
 
@@ -1020,10 +1109,9 @@ impl ShardReplicaSet {
         true
     }
 
-    /// Returns the estimated size of all locally stored vectors in bytes.
-    /// Locks and iterates over all segments.
-    /// Cache this value in performance critical scenarios!
-    pub(crate) async fn calculate_local_shards_stats(&self) -> LocalDataStats {
+    /// Returns the estimated size of all local segments.
+    /// Since this locks all segments you should cache this value in performance critical scenarios!
+    pub(crate) async fn calculate_local_shard_stats(&self) -> Option<CollectionSizeStats> {
         self.local
             .read()
             .await
@@ -1031,20 +1119,26 @@ impl ShardReplicaSet {
             .map(|i| match i {
                 Shard::Local(local) => {
                     let mut total_vector_size = 0;
+                    let mut total_payload_size = 0;
+                    let mut total_points = 0;
 
                     for segment in local.segments.read().iter() {
                         let size_info = segment.1.get().read().size_info();
                         total_vector_size += size_info.vectors_size_bytes;
+                        total_payload_size += size_info.payloads_size_bytes;
+                        total_points += size_info.num_points;
                     }
 
-                    LocalDataStats {
+                    Some(CollectionSizeStats {
                         vector_storage_size: total_vector_size,
-                    }
+                        payload_storage_size: total_payload_size,
+                        points_count: total_points,
+                    })
                 }
                 Shard::Proxy(_)
                 | Shard::ForwardProxy(_)
                 | Shard::QueueProxy(_)
-                | Shard::Dummy(_) => LocalDataStats::default(),
+                | Shard::Dummy(_) => None,
             })
             .unwrap_or_default()
     }
@@ -1079,14 +1173,23 @@ impl ReplicaSetState {
         self.peers
             .iter()
             .filter_map(|(peer_id, state)| {
-                matches!(state, ReplicaState::Active).then_some(*peer_id)
+                // We consider `ReshardingScaleDown` to be `Active`!
+                matches!(
+                    state,
+                    ReplicaState::Active | ReplicaState::ReshardingScaleDown
+                )
+                .then_some(*peer_id)
             })
             .collect()
     }
 
     pub fn active_or_resharding_peers(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.peers.iter().filter_map(|(peer_id, state)| {
-            matches!(state, ReplicaState::Active | ReplicaState::Resharding).then_some(*peer_id)
+            matches!(
+                state,
+                ReplicaState::Active | ReplicaState::Resharding | ReplicaState::ReshardingScaleDown
+            )
+            .then_some(*peer_id)
         })
     }
 
@@ -1096,7 +1199,9 @@ impl ReplicaSetState {
 }
 
 /// State of the single shard within a replica set.
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Default, PartialEq, Eq, Hash, Clone, Copy, Anonymize,
+)]
 pub enum ReplicaState {
     // Active and sound
     #[default]
@@ -1114,21 +1219,40 @@ pub enum ReplicaState {
     //
     // Snapshot shard transfer is in progress, updates aren't sent to the shard
     // Normally rejects updates. Since 1.8 it allows updates if force is true.
-    #[schemars(skip)]
     PartialSnapshot,
     // Shard is undergoing recovery by an external node
     // Normally rejects updates, accepts updates if force is true
     Recovery,
-    // Points are being migrated to this shard as part of resharding
-    #[schemars(skip)]
+    // Points are being migrated to this shard as part of resharding up
     Resharding,
+    // Points are being migrated to this shard as part of resharding down
+    ReshardingScaleDown,
 }
 
 impl ReplicaState {
+    /// Check if replica state is active
+    pub fn is_active(self) -> bool {
+        match self {
+            ReplicaState::Active => true,
+            ReplicaState::ReshardingScaleDown => true,
+
+            ReplicaState::Dead => false,
+            ReplicaState::Partial => false,
+            ReplicaState::Initializing => false,
+            ReplicaState::Listener => false,
+            ReplicaState::PartialSnapshot => false,
+            ReplicaState::Recovery => false,
+            ReplicaState::Resharding => false,
+        }
+    }
+
     /// Check whether the replica state is active or listener or resharding.
     pub fn is_active_or_listener_or_resharding(self) -> bool {
         match self {
-            ReplicaState::Active | ReplicaState::Listener | ReplicaState::Resharding => true,
+            ReplicaState::Active
+            | ReplicaState::Listener
+            | ReplicaState::Resharding
+            | ReplicaState::ReshardingScaleDown => true,
 
             ReplicaState::Dead
             | ReplicaState::Initializing
@@ -1141,14 +1265,32 @@ impl ReplicaState {
     /// Check whether the replica state is partial or partial-like.
     ///
     /// In other words: is the state related to shard transfers?
+    //
+    // TODO(resharding): What's the best way to handle `ReshardingScaleDown` properly!?
     pub fn is_partial_or_recovery(self) -> bool {
         match self {
             ReplicaState::Partial
             | ReplicaState::PartialSnapshot
             | ReplicaState::Recovery
-            | ReplicaState::Resharding => true,
+            | ReplicaState::Resharding
+            | ReplicaState::ReshardingScaleDown => true,
 
             ReplicaState::Active
+            | ReplicaState::Dead
+            | ReplicaState::Initializing
+            | ReplicaState::Listener => false,
+        }
+    }
+
+    /// Returns `true` if the replica state is resharding, either up or down.
+    pub fn is_resharding(&self) -> bool {
+        match self {
+            ReplicaState::Resharding | ReplicaState::ReshardingScaleDown => true,
+
+            ReplicaState::Partial
+            | ReplicaState::PartialSnapshot
+            | ReplicaState::Recovery
+            | ReplicaState::Active
             | ReplicaState::Dead
             | ReplicaState::Initializing
             | ReplicaState::Listener => false,

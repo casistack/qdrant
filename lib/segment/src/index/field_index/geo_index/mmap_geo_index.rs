@@ -1,18 +1,21 @@
 use std::fs::{create_dir_all, remove_dir};
 use std::path::{Path, PathBuf};
 
+use common::counter::conditioned_counter::ConditionedCounter;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
 use memmap2::MmapMut;
+use memory::fadvise::clear_disk_cache;
 use memory::madvise::AdviceSetting;
 use memory::mmap_ops::{create_and_ensure_length, open_write_mmap};
 use memory::mmap_type::{MmapBitSlice, MmapSlice};
 use serde::{Deserialize, Serialize};
 
 use super::mutable_geo_index::InMemoryGeoMapIndex;
+use crate::common::Flusher;
 use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
 use crate::common::operation_error::OperationResult;
-use crate::common::Flusher;
 use crate::index::field_index::geo_hash::GeoHash;
 use crate::index::field_index::mmap_point_to_values::MmapPointToValues;
 use crate::types::GeoPoint;
@@ -71,6 +74,7 @@ pub struct MmapGeoMapIndex {
     deleted_count: usize,
     points_values_count: usize,
     max_values_per_point: usize,
+    is_on_disk: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +84,11 @@ struct MmapGeoMapIndexStat {
 }
 
 impl MmapGeoMapIndex {
-    pub fn new(dynamic_index: InMemoryGeoMapIndex, path: &Path) -> OperationResult<Self> {
+    pub fn new(
+        dynamic_index: InMemoryGeoMapIndex,
+        path: &Path,
+        is_on_disk: bool,
+    ) -> OperationResult<Self> {
         create_dir_all(path)?;
 
         let deleted_path = path.join(DELETED_PATH);
@@ -184,41 +192,42 @@ impl MmapGeoMapIndex {
             },
         )?;
 
-        Self::load(path)
+        Self::load(path, is_on_disk)
     }
 
-    pub fn load(path: &Path) -> OperationResult<Self> {
+    pub fn load(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
         let deleted_path = path.join(DELETED_PATH);
         let stats_path = path.join(STATS_PATH);
         let counts_per_hash_path = path.join(COUNTS_PER_HASH);
         let points_map_path = path.join(POINTS_MAP);
         let points_map_ids_path = path.join(POINTS_MAP_IDS);
 
+        let populate = !is_on_disk;
         let stats: MmapGeoMapIndexStat = read_json(&stats_path)?;
         let counts_per_hash = unsafe {
             MmapSlice::try_from(open_write_mmap(
                 &counts_per_hash_path,
                 AdviceSetting::Global,
-                false,
+                populate,
             )?)?
         };
         let points_map = unsafe {
             MmapSlice::try_from(open_write_mmap(
                 &points_map_path,
                 AdviceSetting::Global,
-                false,
+                populate,
             )?)?
         };
         let points_map_ids = unsafe {
             MmapSlice::try_from(open_write_mmap(
                 &points_map_ids_path,
                 AdviceSetting::Global,
-                false,
+                populate,
             )?)?
         };
-        let point_to_values = MmapPointToValues::open(path)?;
+        let point_to_values = MmapPointToValues::open(path, true)?;
 
-        let deleted = open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
+        let deleted = open_write_mmap(&deleted_path, AdviceSetting::Global, populate)?;
         let deleted = MmapBitSlice::from(deleted, 0);
         let deleted_count = deleted.count_ones();
 
@@ -232,19 +241,29 @@ impl MmapGeoMapIndex {
             deleted_count,
             points_values_count: stats.points_values_count,
             max_values_per_point: stats.max_values_per_point,
+            is_on_disk,
         })
     }
 
     pub fn check_values_any(
         &self,
         idx: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
         check_fn: impl Fn(&GeoPoint) -> bool,
     ) -> bool {
+        let hw_counter = self.make_conditioned_counter(hw_counter);
         self.deleted
             .get(idx as usize)
             .filter(|b| !b)
-            .map(|_| self.point_to_values.check_values_any(idx, |v| check_fn(&v)))
+            .map(|_| {
+                self.point_to_values
+                    .check_values_any(idx, |v| check_fn(&v), &hw_counter)
+            })
             .unwrap_or(false)
+    }
+
+    pub fn get_values(&self, idx: u32) -> Option<impl Iterator<Item = GeoPoint> + '_> {
+        self.point_to_values.get_values(idx)
     }
 
     pub fn values_count(&self, idx: PointOffsetType) -> usize {
@@ -261,7 +280,16 @@ impl MmapGeoMapIndex {
             .map(|counts| (counts.hash, counts.points as usize))
     }
 
-    pub fn points_of_hash(&self, hash: &GeoHash) -> usize {
+    pub fn points_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize {
+        let hw_counter = self.make_conditioned_counter(hw_counter);
+
+        hw_counter
+            .payload_index_io_read_counter()
+            // Simulate binary search complexity as IO read estimation
+            .incr_delta(
+                (self.counts_per_hash.len() as f32).log2().ceil() as usize * size_of::<Counts>(),
+            );
+
         if let Ok(index) = self.counts_per_hash.binary_search_by(|x| x.hash.cmp(hash)) {
             self.counts_per_hash[index].points as usize
         } else {
@@ -269,7 +297,16 @@ impl MmapGeoMapIndex {
         }
     }
 
-    pub fn values_of_hash(&self, hash: &GeoHash) -> usize {
+    pub fn values_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize {
+        let hw_counter = self.make_conditioned_counter(hw_counter);
+
+        hw_counter
+            .payload_index_io_read_counter()
+            // Simulate binary search complexity as IO read estimation
+            .incr_delta(
+                (self.counts_per_hash.len() as f32).log2().ceil() as usize * size_of::<Counts>(),
+            );
+
         if let Ok(index) = self.counts_per_hash.binary_search_by(|x| x.hash.cmp(hash)) {
             self.counts_per_hash[index].values as usize
         } else {
@@ -315,10 +352,7 @@ impl MmapGeoMapIndex {
 
     /// Returns an iterator over all point IDs which have the `geohash` prefix.
     /// Note. Point ID may be repeated multiple times in the iterator.
-    pub fn stored_sub_regions(
-        &self,
-        geohash: GeoHash,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+    pub fn stored_sub_regions(&self, geohash: GeoHash) -> impl Iterator<Item = PointOffsetType> {
         let start_index = self
             .points_map
             .binary_search_by(|point_key_value| point_key_value.hash.cmp(&geohash))
@@ -350,5 +384,43 @@ impl MmapGeoMapIndex {
 
     pub fn max_values_per_point(&self) -> usize {
         self.max_values_per_point
+    }
+
+    fn make_conditioned_counter<'a>(
+        &self,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> ConditionedCounter<'a> {
+        ConditionedCounter::new(self.is_on_disk, hw_counter)
+    }
+
+    pub fn is_on_disk(&self) -> bool {
+        self.is_on_disk
+    }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        self.counts_per_hash.populate()?;
+        self.points_map.populate()?;
+        self.points_map_ids.populate()?;
+        self.point_to_values.populate();
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        let deleted_path = self.path.join(DELETED_PATH);
+        let counts_per_hash_path = self.path.join(COUNTS_PER_HASH);
+        let points_map_path = self.path.join(POINTS_MAP);
+        let points_map_ids_path = self.path.join(POINTS_MAP_IDS);
+
+        clear_disk_cache(&deleted_path)?;
+        clear_disk_cache(&counts_per_hash_path)?;
+        clear_disk_cache(&points_map_path)?;
+        clear_disk_cache(&points_map_ids_path)?;
+
+        self.point_to_values.clear_cache()?;
+
+        Ok(())
     }
 }

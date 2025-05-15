@@ -1,11 +1,14 @@
 use bitpacking::BitPacker;
+use common::counter::conditioned_counter::ConditionedCounter;
 use common::types::PointOffsetType;
 
 use crate::index::field_index::full_text_index::compressed_posting::compressed_chunks_reader::ChunkReader;
 use crate::index::field_index::full_text_index::compressed_posting::compressed_common::{
-    compress_posting, BitPackerImpl, CompressedPostingChunksIndex,
+    BitPackerImpl, CompressedPostingChunksIndex, compress_posting,
 };
+#[cfg(feature = "testing")]
 use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_iterator::CompressedPostingIterator;
+#[cfg(feature = "testing")]
 use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_visitor::CompressedPostingVisitor;
 
 #[derive(Clone, Debug, Default)]
@@ -38,11 +41,8 @@ impl CompressedPostingList {
             &self.chunks,
             &self.data,
             &self.remainder_postings,
+            ConditionedCounter::never(),
         )
-    }
-
-    pub fn contains(&self, val: PointOffsetType) -> bool {
-        self.reader().contains(val)
     }
 
     pub fn len(&self) -> usize {
@@ -50,7 +50,8 @@ impl CompressedPostingList {
     }
 
     #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = PointOffsetType> + '_ {
+    #[cfg(feature = "testing")]
+    pub fn iter(&self) -> impl Iterator<Item = PointOffsetType> {
         let reader = self.reader();
         let visitor = CompressedPostingVisitor::new(reader);
         CompressedPostingIterator::new(visitor)
@@ -94,7 +95,10 @@ mod tests {
             let (compressed_posting_list, set) =
                 CompressedPostingList::generate_compressed_posting_list_fixture(step);
             for i in 0..step * 1000 {
-                assert_eq!(compressed_posting_list.contains(i), set.contains(&i));
+                assert_eq!(
+                    compressed_posting_list.reader().contains(i),
+                    set.contains(&i)
+                );
             }
         }
     }

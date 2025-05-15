@@ -6,12 +6,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
+use super::CollectionId;
 use super::channel_service::ChannelService;
 use super::remote_shard::RemoteShard;
 use super::replica_set::ReplicaState;
 use super::resharding::ReshardKey;
 use super::shard::{PeerId, ShardId};
-use super::CollectionId;
 use crate::operations::types::{CollectionError, CollectionResult};
 
 pub mod driver;
@@ -28,13 +28,13 @@ const CONSENSUS_CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Time after which confirming a consensus operation times out.
 const CONSENSUS_CONFIRM_TIMEOUT: Duration = defaults::CONSENSUS_META_OP_WAIT;
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardTransfer {
     pub shard_id: ShardId,
-    /// For resharding, a different target shard ID may be configured
-    /// By default the shard ID on the target peer is the same.
+    /// Target shard ID if different than source shard ID
+    ///
+    /// Used exclusively with `ReshardStreamRecords` transfer method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
     pub to_shard_id: Option<ShardId>,
     pub from: PeerId,
     pub to: PeerId,
@@ -57,11 +57,10 @@ impl ShardTransfer {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardTransferRestart {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
     pub to_shard_id: Option<ShardId>,
     pub from: PeerId,
     pub to: PeerId,
@@ -92,11 +91,10 @@ impl From<ShardTransfer> for ShardTransferRestart {
 }
 
 /// Unique identifier of a transfer, agnostic of transfer method
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardTransferKey {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
     pub to_shard_id: Option<ShardId>,
     pub from: PeerId,
     pub to: PeerId,
@@ -121,7 +119,6 @@ pub enum ShardTransferMethod {
     WalDelta,
     /// Shard transfer for resharding: stream all records in batches until all points are
     /// transferred.
-    #[schemars(skip)]
     ReshardingStreamRecords,
 }
 
@@ -214,7 +211,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                 Ok(()) => break,
                 Err(err) => {
                     log::error!("Failed to confirm recovered operation on consensus: {err}");
-                    continue;
                 }
             }
         }
@@ -268,7 +264,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                     log::error!(
                         "Failed to confirm start shard transfer operation on consensus: {err}"
                     );
-                    continue;
                 }
             }
         }
@@ -323,7 +318,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                     log::error!(
                         "Failed to confirm restart shard transfer operation on consensus: {err}"
                     );
-                    continue;
                 }
             }
         }
@@ -380,7 +374,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                     log::error!(
                         "Failed to confirm abort shard transfer operation on consensus: {err}"
                     );
-                    continue;
                 }
             }
         }
@@ -439,7 +432,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                     log::error!(
                         "Failed to confirm set shard replica set state operation on consensus: {err}"
                     );
-                    continue;
                 }
             }
         }
@@ -494,7 +486,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                     log::error!(
                         "Failed to confirm commit read hashring operation on consensus: {err}"
                     );
-                    continue;
                 }
             }
         }
@@ -549,7 +540,6 @@ pub trait ShardTransferConsensus: Send + Sync {
                     log::error!(
                         "Failed to confirm commit write hashring operation on consensus: {err}"
                     );
-                    continue;
                 }
             }
         }

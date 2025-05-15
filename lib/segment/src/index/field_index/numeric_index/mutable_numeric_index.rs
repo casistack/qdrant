@@ -3,13 +3,13 @@ use std::ops::Bound;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use delegate::delegate;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
 use super::{
-    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
+    Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION, numeric_index_storage_cf_name,
 };
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
@@ -42,13 +42,13 @@ impl<T: Encodable + Numericable> Default for InMemoryNumericIndex<T> {
     }
 }
 
-impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
-    pub fn from_iter(
-        iter: impl Iterator<Item = OperationResult<(PointOffsetType, T)>>,
-    ) -> OperationResult<Self> {
+impl<T: Encodable + Numericable + Default> FromIterator<(PointOffsetType, T)>
+    for InMemoryNumericIndex<T>
+{
+    fn from_iter<I: IntoIterator<Item = (PointOffsetType, T)>>(iter: I) -> Self {
         let mut index = InMemoryNumericIndex::default();
         for pair in iter {
-            let (idx, value) = pair?;
+            let (idx, value) = pair;
 
             if index.point_to_values.len() <= idx as usize {
                 index
@@ -67,9 +67,11 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
                 index.max_values_per_point = index.max_values_per_point.max(values.len());
             }
         }
-        Ok(index)
+        index
     }
+}
 
+impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
     pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
         self.point_to_values
             .get(idx as usize)
@@ -97,7 +99,7 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
         &self,
         start_bound: Bound<Point<T>>,
         end_bound: Bound<Point<T>>,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+    ) -> impl Iterator<Item = PointOffsetType> {
         self.map
             .range((start_bound, end_bound))
             .map(|point| point.idx)
@@ -220,8 +222,11 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
             return Ok(false);
         };
 
-        self.in_memory_index = InMemoryNumericIndex::from_iter(
-            self.db_wrapper.lock_db().iter()?.map(|(key, value)| {
+        self.in_memory_index = self
+            .db_wrapper
+            .lock_db()
+            .iter()?
+            .map(|(key, value)| {
                 let value_idx =
                     u32::from_be_bytes(value.as_ref().try_into().map_err(|_| {
                         OperationError::service_error("incorrect numeric index value")
@@ -233,8 +238,8 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
                     ));
                 }
                 Ok((idx, value))
-            }),
-        )?;
+            })
+            .collect::<Result<InMemoryNumericIndex<_>, OperationError>>()?;
 
         Ok(true)
     }
@@ -243,11 +248,18 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
         &mut self,
         idx: PointOffsetType,
         values: Vec<T>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
+        let mut hw_cell_wb = hw_counter
+            .payload_index_io_write_counter()
+            .write_back_counter();
+
         for value in &values {
             let key = value.encode_key(idx);
             self.db_wrapper.put(&key, idx.to_be_bytes())?;
+            hw_cell_wb.incr_delta(size_of_val(&key) + size_of_val(&idx));
         }
+
         self.in_memory_index.add_many_to_list(idx, values);
         Ok(())
     }
@@ -270,25 +282,49 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
         &self.in_memory_index.map
     }
 
-    delegate! {
-        to self.in_memory_index {
-            pub fn total_unique_values_count(&self) -> usize;
-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
-            pub fn get_points_count(&self) -> usize;
-            pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
-            pub fn values_count(&self, idx: PointOffsetType) -> Option<usize>;
-            pub fn values_range(
-                &self,
-                start_bound: Bound<Point<T>>,
-                end_bound: Bound<Point<T>>,
-            ) -> impl Iterator<Item = PointOffsetType> + '_;
-            pub fn orderable_values_range(
-                &self,
-                start_bound: Bound<Point<T>>,
-                end_bound: Bound<Point<T>>,
-            ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ ;
-            pub fn get_histogram(&self) -> &Histogram<T>;
-            pub fn get_max_values_per_point(&self) -> usize;
-        }
+    #[inline]
+    pub fn total_unique_values_count(&self) -> usize {
+        self.in_memory_index.total_unique_values_count()
+    }
+    #[inline]
+    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+        self.in_memory_index.check_values_any(idx, check_fn)
+    }
+    #[inline]
+    pub fn get_points_count(&self) -> usize {
+        self.in_memory_index.get_points_count()
+    }
+    #[inline]
+    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
+        self.in_memory_index.get_values(idx)
+    }
+    #[inline]
+    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
+        self.in_memory_index.values_count(idx)
+    }
+    #[inline]
+    pub fn values_range(
+        &self,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
+    ) -> impl Iterator<Item = PointOffsetType> {
+        self.in_memory_index.values_range(start_bound, end_bound)
+    }
+    #[inline]
+    pub fn orderable_values_range(
+        &self,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
+    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
+        self.in_memory_index
+            .orderable_values_range(start_bound, end_bound)
+    }
+    #[inline]
+    pub fn get_histogram(&self) -> &Histogram<T> {
+        self.in_memory_index.get_histogram()
+    }
+    #[inline]
+    pub fn get_max_values_per_point(&self) -> usize {
+        self.in_memory_index.get_max_values_per_point()
     }
 }

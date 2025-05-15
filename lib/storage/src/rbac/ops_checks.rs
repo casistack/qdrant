@@ -1,11 +1,12 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::mem::take;
 
+use ahash::AHashSet;
 use api::rest::LookupLocation;
 use collection::collection::distance_matrix::CollectionSearchMatrixRequest;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
 use collection::lookup::WithLookup;
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
 use collection::operations::point_ops::{PointIdsList, PointOperations};
 use collection::operations::types::{
@@ -16,13 +17,12 @@ use collection::operations::universal_query::collection_query::{
     CollectionPrefetch, CollectionQueryRequest, Query, VectorInputInternal, VectorQuery,
 };
 use collection::operations::vector_ops::VectorOperations;
-use collection::operations::CollectionUpdateOperations;
 use segment::data_types::facets::FacetParams;
 use segment::types::{Condition, ExtendedPointId, FieldCondition, Filter, Match, Payload};
 
 use super::{
-    incompatible_with_payload_constraint, Access, AccessRequirements, CollectionAccessList,
-    CollectionAccessView, CollectionPass, PayloadConstraint,
+    Access, AccessRequirements, CollectionAccessList, CollectionAccessView, CollectionPass,
+    PayloadConstraint, incompatible_with_payload_constraint,
 };
 use crate::content_manager::collection_meta_ops::CollectionMetaOperations;
 use crate::content_manager::errors::{StorageError, StorageResult};
@@ -65,13 +65,13 @@ impl Access {
             CollectionMetaOperations::CreatePayloadIndex(op) => {
                 self.check_collection_access(
                     &op.collection_name,
-                    AccessRequirements::new().write().whole(),
+                    AccessRequirements::new().write().whole().extras(),
                 )?;
             }
             CollectionMetaOperations::DropPayloadIndex(op) => {
                 self.check_collection_access(
                     &op.collection_name,
-                    AccessRequirements::new().write().whole(),
+                    AccessRequirements::new().write().whole().extras(),
                 )?;
             }
             CollectionMetaOperations::Nop { token: _ } => (),
@@ -133,7 +133,9 @@ impl CollectionAccessView<'_> {
     ) -> Result<(), StorageError> {
         match vector_query {
             VectorQuery::Nearest(nearest) => self.check_vector_input(nearest)?,
-            VectorQuery::RecommendBestScore(reco) | VectorQuery::RecommendAverageVector(reco) => {
+            VectorQuery::RecommendBestScore(reco)
+            | VectorQuery::RecommendSumScores(reco)
+            | VectorQuery::RecommendAverageVector(reco) => {
                 for vector_input in reco.flat_iter() {
                     self.check_vector_input(vector_input)?
                 }
@@ -167,6 +169,7 @@ impl CheckableCollectionOperation for RecommendRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -193,6 +196,7 @@ impl CheckableCollectionOperation for PointRequestInternal {
             write: false,
             manage: false,
             whole: true,
+            extras: false,
         }
     }
 
@@ -211,6 +215,7 @@ impl CheckableCollectionOperation for CoreSearchRequest {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -230,6 +235,7 @@ impl CheckableCollectionOperation for CountRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -249,6 +255,7 @@ impl CheckableCollectionOperation for GroupRequest {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -275,6 +282,7 @@ impl CheckableCollectionOperation for DiscoverRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -303,6 +311,7 @@ impl CheckableCollectionOperation for ScrollRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -322,6 +331,7 @@ impl CheckableCollectionOperation for CollectionQueryRequest {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -373,6 +383,7 @@ impl CheckableCollectionOperation for FacetParams {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -392,6 +403,7 @@ impl CheckableCollectionOperation for CollectionSearchMatrixRequest {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -414,11 +426,13 @@ impl CheckableCollectionOperation for CollectionUpdateOperations {
                 write: true,
                 manage: false,
                 whole: false, // Checked in `check_access()`
+                extras: false,
             },
             CollectionUpdateOperations::FieldIndexOperation(_) => AccessRequirements {
                 write: true,
                 manage: true,
                 whole: true,
+                extras: true,
             },
         }
     }
@@ -550,7 +564,7 @@ impl CheckableCollectionOperation for CollectionUpdateOperations {
 
 /// Create a `must` filter from a list of point IDs.
 fn make_filter_from_ids(ids: Vec<ExtendedPointId>) -> Filter {
-    let cond = ids.into_iter().collect::<HashSet<_>>().into();
+    let cond = ids.into_iter().collect::<AHashSet<_>>().into();
     Filter {
         must: Some(vec![Condition::HasId(cond)]),
         ..Default::default()
@@ -671,7 +685,7 @@ mod tests_ops {
         CollectionUpdateOperationsDiscriminants, CreateIndex, FieldIndexOperations,
         FieldIndexOperationsDiscriminants,
     };
-    use segment::data_types::vectors::NamedVectorStruct;
+    use segment::data_types::vectors::NamedQuery;
     use segment::types::{PointIdType, SearchParams, WithPayloadInterface, WithVector};
     use strum::IntoEnumIterator as _;
 
@@ -755,10 +769,10 @@ mod tests_ops {
             with_payload: Some(WithPayloadInterface::Bool(true)),
             with_vector: Some(WithVector::Bool(true)),
             score_threshold: Some(42.0),
-            using: Some(UsingVector::Name("vector".to_string())),
+            using: Some(UsingVector::Name("vector".into())),
             lookup_from: Some(LookupLocation {
                 collection: "col2".to_string(),
-                vector: Some("vector".to_string()),
+                vector: Some("vector".into()),
                 shard_key: None,
             }),
         };
@@ -845,7 +859,7 @@ mod tests_ops {
     #[test]
     fn test_core_search_request() {
         let op = CoreSearchRequest {
-            query: QueryEnum::Nearest(NamedVectorStruct::Default(vec![0.0, 1.0, 2.0])),
+            query: QueryEnum::Nearest(NamedQuery::default_dense(vec![0.0, 1.0, 2.0])),
             filter: None,
             params: Some(SearchParams::default()),
             limit: 100,
@@ -994,10 +1008,10 @@ mod tests_ops {
             offset: Some(100),
             with_payload: Some(WithPayloadInterface::Bool(true)),
             with_vector: Some(WithVector::Bool(true)),
-            using: Some(UsingVector::Name("vector".to_string())),
+            using: Some(UsingVector::Name("vector".into())),
             lookup_from: Some(LookupLocation {
                 collection: "col2".to_string(),
-                vector: Some("vector".to_string()),
+                vector: Some("vector".into()),
                 shard_key: None,
             }),
         };
@@ -1245,7 +1259,7 @@ mod tests_ops {
                             points: vec![ExtendedPointId::NumId(12345)],
                             shard_key: None,
                         },
-                        vec!["vector".to_string()],
+                        vec!["vector".into()],
                     ));
                 check_collection_update_operations_delete_vectors(&op);
             }
@@ -1253,7 +1267,7 @@ mod tests_ops {
                 let op = CollectionUpdateOperations::VectorOperation(
                     VectorOperations::DeleteVectorsByFilter(
                         make_filter_from_ids(vec![ExtendedPointId::NumId(12345)]),
-                        vec!["vector".to_string()],
+                        vec!["vector".into()],
                     ),
                 );
                 check_collection_update_operations_delete_vectors(&op);
@@ -1288,7 +1302,7 @@ mod tests_ops {
                     VectorOperations::DeleteVectorsByFilter(
                         make_filter_from_ids(vec![ExtendedPointId::NumId(12345)])
                             .merge_owned(PayloadConstraint::new_test("col").to_filter()),
-                        vec!["vector".to_string()],
+                        vec!["vector".into()],
                     ),
                 );
             },

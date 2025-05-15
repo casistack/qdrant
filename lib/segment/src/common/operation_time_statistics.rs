@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SubsecRound, Utc};
+use common::types::DetailsLevel::Level1;
 use common::types::TelemetryDetail;
 use is_sorted::IsSorted;
 use itertools::Itertools as _;
@@ -15,28 +16,33 @@ use crate::common::anonymize::Anonymize;
 const AVG_DATASET_LEN: usize = 128;
 const SLIDING_WINDOW_LEN: usize = 8;
 
-#[derive(Serialize, Clone, Default, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Default, Debug, JsonSchema, Anonymize)]
 pub struct OperationDurationStatistics {
     pub count: usize,
 
-    #[serde(skip_serializing_if = "num_traits::identities::Zero::is_zero")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub fail_count: usize,
+    pub fail_count: Option<usize>,
 
     /// The average time taken by 128 latest operations, calculated as a weighted mean.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub avg_duration_micros: Option<f32>,
 
     /// The minimum duration of the operations across all the measurements.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub min_duration_micros: Option<f32>,
 
     /// The maximum duration of the operations across all the measurements.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub max_duration_micros: Option<f32>,
 
     /// The total duration of all operations in microseconds.
-    pub total_duration_micros: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
+    pub total_duration_micros: Option<u64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_responded: Option<DateTime<Utc>>,
@@ -46,6 +52,7 @@ pub struct OperationDurationStatistics {
     /// (aka `{le="+Inf"}` in Prometheus terms) is not stored in this list, and `count` should be
     /// used instead.
     #[serde(skip)] // openapi-generator-cli crashes on this field
+    #[anonymize(with = anonymize_histogram)]
     pub duration_micros_histogram: Vec<(f32, usize)>,
 }
 
@@ -97,20 +104,11 @@ pub struct ScopeDurationMeasurer<'a> {
     success: bool,
 }
 
-impl Anonymize for OperationDurationStatistics {
-    fn anonymize(&self) -> Self {
-        Self {
-            count: self.count.anonymize(),
-            fail_count: self.fail_count.anonymize(),
-            last_responded: self.last_responded.anonymize(),
-            duration_micros_histogram: self
-                .duration_micros_histogram
-                .iter()
-                .map(|&(le, count)| (le, count.anonymize()))
-                .collect(),
-            ..*self
-        }
-    }
+fn anonymize_histogram(histogram: &[(f32, usize)]) -> Vec<(f32, usize)> {
+    histogram
+        .iter()
+        .map(|(le, count)| (*le, count.anonymize()))
+        .collect()
 }
 
 impl std::ops::Add for OperationDurationStatistics {
@@ -119,7 +117,10 @@ impl std::ops::Add for OperationDurationStatistics {
     fn add(self, other: Self) -> Self {
         Self {
             count: self.count + other.count,
-            fail_count: self.fail_count + other.fail_count,
+            fail_count: match (self.fail_count, other.fail_count) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => self.fail_count.or(other.fail_count),
+            },
             avg_duration_micros: Self::weighted_mean_duration(
                 self.avg_duration_micros,
                 self.count,
@@ -136,7 +137,10 @@ impl std::ops::Add for OperationDurationStatistics {
                 other.max_duration_micros,
                 |a, b| a > b,
             ),
-            total_duration_micros: self.total_duration_micros + other.total_duration_micros,
+            total_duration_micros: match (self.total_duration_micros, other.total_duration_micros) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => self.total_duration_micros.or(other.total_duration_micros),
+            },
             last_responded: std::cmp::max(self.last_responded, other.last_responded),
             duration_micros_histogram: merge_histograms(
                 &self.duration_micros_histogram,
@@ -294,18 +298,16 @@ impl OperationDurationsAggregator {
             Vec::new()
         };
 
+        let detailed = detail.level >= Level1;
+
         OperationDurationStatistics {
             count: self.ok_count,
-            fail_count: self.fail_count,
-            avg_duration_micros: if self.ok_count > 0 {
-                Some(self.calculate_avg())
-            } else {
-                None
-            },
-            min_duration_micros: self.min_value,
-            max_duration_micros: self.max_value,
-            total_duration_micros: self.total_value,
-            last_responded: self.last_response_date,
+            fail_count: (self.fail_count > 0).then_some(self.fail_count),
+            avg_duration_micros: (self.ok_count > 0).then(|| self.calculate_avg()),
+            min_duration_micros: detailed.then_some(self.min_value).flatten(),
+            max_duration_micros: detailed.then_some(self.max_value).flatten(),
+            total_duration_micros: detailed.then_some(self.total_value),
+            last_responded: detailed.then_some(self.last_response_date).flatten(),
             duration_micros_histogram,
         }
     }

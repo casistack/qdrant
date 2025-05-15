@@ -15,6 +15,7 @@ use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::index::field_index::immutable_point_to_values::ImmutablePointToValues;
+use crate::index::field_index::mmap_point_to_values::MmapValue;
 
 pub struct ImmutableMapIndex<N: MapIndexKey + ?Sized> {
     value_to_points: HashMap<N::Owned, ContainerSegment>,
@@ -248,8 +249,15 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
     }
 
     pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&N) -> bool) -> bool {
-        self.point_to_values
-            .check_values_any(idx, |v| check_fn(v.borrow()))
+        let mut hw_count_val = 0;
+
+        let res = self.point_to_values.check_values_any(idx, |v| {
+            let v = v.borrow();
+            hw_count_val += <N as MmapValue>::mmapped_size(v.as_referenced());
+            check_fn(v)
+        });
+
+        res
     }
 
     pub fn get_values(&self, idx: PointOffsetType) -> Option<impl Iterator<Item = &N> + '_> {
@@ -284,8 +292,8 @@ impl<N: MapIndexKey + ?Sized> ImmutableMapIndex<N> {
             .map(|(k, entry)| (k.borrow(), entry.count as usize))
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter<'_>)> + '_ {
-        self.value_to_points.keys().map(|k| {
+    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter)> {
+        self.value_to_points.keys().map(move |k| {
             (
                 k.borrow(),
                 Box::new(self.get_iterator(k.borrow()).copied()) as IdIter,

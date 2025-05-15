@@ -8,7 +8,6 @@ use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{DenseVector, MultiDenseVectorInternal};
 use crate::spaces::metric::Metric;
 use crate::types::QuantizationConfig;
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::QueryScorer;
 
 pub struct QuantizedQueryScorer<'a, TElement, TMetric, TEncodedQuery, TEncodedVectors>
@@ -35,6 +34,7 @@ where
         raw_query: DenseVector,
         quantized_data: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        mut hardware_counter: HardwareCounterCell,
     ) -> Self {
         let raw_preprocessed_query = TMetric::preprocess(raw_query);
         let original_query = TElement::slice_from_float_cow(Cow::Owned(raw_preprocessed_query));
@@ -45,12 +45,14 @@ where
         );
         let query = quantized_data.encode_query(&original_query_prequantized);
 
+        hardware_counter.set_vector_io_read_multiplier(usize::from(quantized_data.is_on_disk()));
+
         Self {
             query,
             quantized_data,
             metric: PhantomData,
             element: PhantomData,
-            hardware_counter: HardwareCounterCell::new(),
+            hardware_counter,
         }
     }
 
@@ -58,6 +60,7 @@ where
         raw_query: &MultiDenseVectorInternal,
         quantized_data: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        mut hardware_counter: HardwareCounterCell,
     ) -> Self {
         let mut query = Vec::new();
         for inner_vector in raw_query.multi_vectors() {
@@ -73,12 +76,14 @@ where
 
         let query = quantized_data.encode_query(&query);
 
+        hardware_counter.set_vector_io_read_multiplier(usize::from(quantized_data.is_on_disk()));
+
         Self {
             query,
             quantized_data,
             metric: PhantomData,
             element: PhantomData,
-            hardware_counter: HardwareCounterCell::new(),
+            hardware_counter,
         }
     }
 }
@@ -94,15 +99,6 @@ where
             .score_point(&self.query, idx, &self.hardware_counter)
     }
 
-    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
-        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
-        debug_assert_eq!(ids.len(), scores.len());
-        // no specific implementation for batch scoring
-        for (idx, id) in ids.iter().enumerate() {
-            scores[idx] = self.score_stored(*id);
-        }
-    }
-
     fn score(&self, _v2: &[TElement]) -> ScoreType {
         unimplemented!("This method is not expected to be called for quantized scorer");
     }
@@ -110,15 +106,5 @@ where
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
         self.quantized_data
             .score_internal(point_a, point_b, &self.hardware_counter)
-    }
-
-    fn take_hardware_counter(&self) -> HardwareCounterCell {
-        let mut counter = self.hardware_counter.take();
-
-        counter
-            .cpu_counter_mut()
-            .multiplied_mut(size_of::<TElement>());
-
-        counter
     }
 }

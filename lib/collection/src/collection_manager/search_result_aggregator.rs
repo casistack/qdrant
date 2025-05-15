@@ -30,7 +30,7 @@ impl SearchResultAggregator {
     }
 
     pub fn into_vec(self) -> Vec<ScoredPoint> {
-        self.queue.into_vec()
+        self.queue.into_sorted_vec()
     }
 
     pub fn lowest(&self) -> Option<&ScoredPoint> {
@@ -58,16 +58,16 @@ impl BatchResultAggregator {
         }
     }
 
-    pub fn update_point_versions(&mut self, search_results: &Vec<Vec<Vec<ScoredPoint>>>) {
-        for segment_result in search_results {
-            for segment_batch_result in segment_result {
-                for point in segment_batch_result {
-                    let point_id = point.id;
-                    let point_version =
-                        self.point_versions.entry(point_id).or_insert(point.version);
-                    *point_version = max(*point_version, point.version);
-                }
-            }
+    pub fn update_point_versions<'a>(
+        &mut self,
+        all_searches_results: impl Iterator<Item = &'a ScoredPoint>,
+    ) {
+        for point in all_searches_results {
+            let point_id = point.id;
+            self.point_versions
+                .entry(point_id)
+                .and_modify(|version| *version = max(*version, point.version))
+                .or_insert(point.version);
         }
     }
 
@@ -85,13 +85,10 @@ impl BatchResultAggregator {
         let aggregator = &mut self.batch_aggregators[batch_id];
         for scored_point in search_results {
             debug_assert!(self.point_versions.contains_key(&scored_point.id));
-            let point_max_version = self
-                .point_versions
-                .get(&scored_point.id)
-                .copied()
-                .unwrap_or(0);
-            if scored_point.version >= point_max_version {
-                aggregator.push(scored_point);
+            if let Some(point_max_version) = self.point_versions.get(&scored_point.id) {
+                if scored_point.version >= *point_max_version {
+                    aggregator.push(scored_point);
+                }
             }
         }
     }

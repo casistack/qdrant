@@ -1,4 +1,5 @@
 mod resharding;
+pub(crate) mod shard_mapping;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -7,23 +8,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::cpu::CpuBudget;
+use common::budget::ResourceBudget;
 use common::tar_ext::BuilderExt;
-use futures::{Future, TryStreamExt as _};
+use futures::{Future, StreamExt, TryStreamExt as _, stream};
 use itertools::Itertools;
 use segment::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
 use segment::types::{ShardKey, SnapshotFormat};
+use shard_mapping::ShardKeyMapping;
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, broadcast};
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::SyncIoBridge;
 
+use super::replica_set::snapshots::RecoveryType;
 use super::replica_set::{AbortShardTransfer, ChangePeerFromState};
-use super::resharding::tasks_pool::ReshardTasksPool;
 use super::resharding::{ReshardStage, ReshardState};
 use super::transfer::transfer_tasks_pool::TransferTasksPool;
 use crate::collection::payload_index_schema::PayloadIndexSchema;
-use crate::common::local_data_stats::LocalDataStats;
+use crate::common::collection_size_stats::CollectionSizeStats;
 use crate::common::snapshot_stream::SnapshotStream;
 use crate::config::{CollectionConfigInternal, ShardingMethod};
 use crate::hash_ring::HashRingRouter;
@@ -38,19 +40,15 @@ use crate::operations::{OperationToShard, SplitByShard};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::save_on_disk::SaveOnDisk;
 use crate::shards::channel_service::ChannelService;
-use crate::shards::local_shard::LocalShard;
 use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
 use crate::shards::shard::{PeerId, ShardId};
-use crate::shards::shard_config::{ShardConfig, ShardType};
-use crate::shards::shard_versioning::latest_shard_paths;
+use crate::shards::shard_config::ShardConfig;
 use crate::shards::transfer::{ShardTransfer, ShardTransferKey};
-use crate::shards::CollectionId;
+use crate::shards::{CollectionId, check_shard_path, shard_initializing_flag_path};
 
 const SHARD_TRANSFERS_FILE: &str = "shard_transfers";
 const RESHARDING_STATE_FILE: &str = "resharding_state.json";
 pub const SHARD_KEY_MAPPING_FILE: &str = "shard_key_mapping.json";
-
-pub type ShardKeyMapping = HashMap<ShardKey, HashSet<ShardId>>;
 
 pub struct ShardHolder {
     shards: HashMap<ShardId, ShardReplicaSet>,
@@ -59,8 +57,7 @@ pub struct ShardHolder {
     pub(crate) resharding_state: SaveOnDisk<Option<ReshardState>>,
     pub(crate) rings: HashMap<Option<ShardKey>, HashRingRouter>,
     key_mapping: SaveOnDisk<ShardKeyMapping>,
-    // Duplicates the information from `key_mapping` for faster access
-    // Do not require locking
+    // Duplicates the information from `key_mapping` for faster access, does not use locking
     shard_id_to_key_mapping: HashMap<ShardId, ShardKey>,
 }
 
@@ -123,6 +120,27 @@ impl ShardHolder {
         self.key_mapping.read().clone()
     }
 
+    /// Set the shard key mappings
+    ///
+    /// # Warning
+    ///
+    /// This does not update the shard key inside replica sets. If the shard key mapping changes
+    /// and we have existing replica sets, they must be updated as well to reflect the changed
+    /// mappings.
+    pub fn set_shard_key_mappings(
+        &mut self,
+        shard_key_mapping: ShardKeyMapping,
+    ) -> CollectionResult<()> {
+        let shard_id_to_key_mapping = shard_key_mapping.shard_id_to_shard_key();
+
+        self.key_mapping
+            .write_optional(move |_| Some(shard_key_mapping))?;
+
+        self.shard_id_to_key_mapping = shard_id_to_key_mapping;
+
+        Ok(())
+    }
+
     pub async fn drop_and_remove_shard(
         &mut self,
         shard_id: ShardId,
@@ -137,7 +155,9 @@ impl ShardHolder {
             // we don't attempt to load this shard anymore on restart.
             let shard_config_path = ShardConfig::get_config_path(&shard_path);
             if let Err(err) = tokio::fs::remove_file(shard_config_path).await {
-                log::error!("Failed to remove shard config file before removing the rest of the files: {err}");
+                log::error!(
+                    "Failed to remove shard config file before removing the rest of the files: {err}",
+                );
             }
 
             tokio::fs::remove_dir_all(shard_path).await?;
@@ -259,8 +279,7 @@ impl ShardHolder {
 
         let all_shard_ids = self.shards.keys().cloned().collect::<HashSet<_>>();
 
-        self.key_mapping
-            .write_optional(|_key_mapping| Some(shard_key_mapping))?;
+        self.set_shard_key_mappings(shard_key_mapping)?;
 
         for shard_id in all_shard_ids {
             if !shard_ids.contains(&shard_id) {
@@ -281,12 +300,20 @@ impl ShardHolder {
         self.shards.get(&shard_id)
     }
 
+    pub fn get_shard_mut(&mut self, shard_id: ShardId) -> Option<&mut ShardReplicaSet> {
+        self.shards.get_mut(&shard_id)
+    }
+
     pub fn get_shards(&self) -> impl Iterator<Item = (ShardId, &ShardReplicaSet)> {
         self.shards.iter().map(|(id, shard)| (*id, shard))
     }
 
     pub fn all_shards(&self) -> impl Iterator<Item = &ShardReplicaSet> {
         self.shards.values()
+    }
+
+    pub fn all_shards_mut(&mut self) -> impl Iterator<Item = &mut ShardReplicaSet> {
+        self.shards.values_mut()
     }
 
     pub fn split_by_shard<O: SplitByShard + Clone>(
@@ -387,15 +414,19 @@ impl ShardHolder {
         let receiver = async move {
             loop {
                 match subscriber.recv().await {
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(CollectionError::service_error(
-                        "Failed to await shard transfer end: failed to listen for shard transfer changes, channel closed"
-                    )),
-                    Err(err @ tokio::sync::broadcast::error::RecvError::Lagged(_)) => return Err(CollectionError::service_error(format!(
-                        "Failed to await shard transfer end: failed to listen for shard transfer changes, channel lagged behind: {err}"
-                    ))),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(CollectionError::service_error(
+                            "Failed to await shard transfer end: failed to listen for shard transfer changes, channel closed",
+                        ));
+                    }
+                    Err(err @ tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        return Err(CollectionError::service_error(format!(
+                            "Failed to await shard transfer end: failed to listen for shard transfer changes, channel lagged behind: {err}",
+                        )));
+                    }
                     Ok(ShardTransferChange::Finish(key)) if key == transfer => return Ok(Ok(())),
                     Ok(ShardTransferChange::Abort(key)) if key == transfer => return Ok(Err(())),
-                    Ok(_) => {},
+                    Ok(_) => {}
                 }
             }
         };
@@ -453,10 +484,7 @@ impl ShardHolder {
         shard_transfers
     }
 
-    pub fn get_resharding_operations_info(
-        &self,
-        tasks_pool: &ReshardTasksPool,
-    ) -> Option<Vec<ReshardingInfo>> {
+    pub fn get_resharding_operations_info(&self) -> Option<Vec<ReshardingInfo>> {
         let mut resharding_operations = vec![];
 
         // We eventually expect to extend this to multiple concurrent operations, which is why
@@ -465,13 +493,12 @@ impl ShardHolder {
             return None;
         };
 
-        let status = tasks_pool.get_task_status(&resharding_state.key());
         resharding_operations.push(ReshardingInfo {
+            uuid: resharding_state.uuid,
             shard_id: resharding_state.shard_id,
             peer_id: resharding_state.peer_id,
             direction: resharding_state.direction,
             shard_key: resharding_state.shard_key.clone(),
-            comment: status.map(|p| p.comment),
         });
 
         resharding_operations.sort_by_key(|k| k.shard_id);
@@ -484,7 +511,7 @@ impl ShardHolder {
         })
     }
 
-    fn get_shard_ids_by_key(&self, shard_key: &ShardKey) -> CollectionResult<HashSet<ShardId>> {
+    pub fn get_shard_ids_by_key(&self, shard_key: &ShardKey) -> CollectionResult<HashSet<ShardId>> {
         match self.key_mapping.read().get(shard_key).cloned() {
             None => Err(CollectionError::bad_request(format!(
                 "Shard key {shard_key} not found"
@@ -575,7 +602,7 @@ impl ShardHolder {
         this_peer_id: PeerId,
         update_runtime: Handle,
         search_runtime: Handle,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
     ) {
         let shard_number = collection_config.read().await.params.shard_number.get();
 
@@ -602,114 +629,59 @@ impl ShardHolder {
             }
         };
 
-        // ToDo: remove after version 0.11.0
         for shard_id in shard_ids_list {
-            let shard_key = self.get_shard_id_to_key_mapping().get(&shard_id).cloned();
+            // Check if shard is fully initialized on disk
+            // The initialization flag should be absent for a well-formed replica set
+            let initializing_flag = shard_initializing_flag_path(collection_path, shard_id);
+            let is_dirty_shard = tokio::fs::try_exists(&initializing_flag)
+                .await
+                .unwrap_or(false);
 
-            for (path, _shard_version, shard_type) in
-                latest_shard_paths(collection_path, shard_id).await.unwrap()
-            {
-                let replica_set = ShardReplicaSet::load(
-                    shard_id,
-                    shard_key.clone(),
-                    collection_id.clone(),
-                    &path,
-                    collection_config.clone(),
-                    effective_optimizers_config.clone(),
-                    shared_storage_config.clone(),
-                    payload_index_schema.clone(),
-                    channel_service.clone(),
-                    on_peer_failure.clone(),
-                    abort_shard_transfer.clone(),
-                    this_peer_id,
-                    update_runtime.clone(),
-                    search_runtime.clone(),
-                    optimizer_cpu_budget.clone(),
-                )
-                .await;
+            // Validate that shard exists on disk
+            let shard_path = check_shard_path(collection_path, shard_id)
+                .await
+                .expect("Failed to check shard path");
 
-                let mut require_migration = true;
-                match shard_type {
-                    ShardType::Local => {
-                        // deprecated
-                        let local_shard = LocalShard::load(
-                            shard_id,
-                            collection_id.clone(),
-                            &path,
-                            collection_config.clone(),
-                            effective_optimizers_config.clone(),
-                            shared_storage_config.clone(),
-                            payload_index_schema.clone(),
-                            update_runtime.clone(),
-                            search_runtime.clone(),
-                            optimizer_cpu_budget.clone(),
-                        )
-                        .await
-                        .unwrap();
-                        replica_set
-                            .set_local(local_shard, Some(ReplicaState::Active))
-                            .await
-                            .unwrap();
-                    }
-                    ShardType::Remote { peer_id } => {
-                        // deprecated
-                        replica_set
-                            .add_remote(peer_id, ReplicaState::Active)
-                            .await
-                            .unwrap();
-                    }
-                    ShardType::Temporary => {
-                        // deprecated
-                        let temp_shard = LocalShard::load(
-                            shard_id,
-                            collection_id.clone(),
-                            &path,
-                            collection_config.clone(),
-                            effective_optimizers_config.clone(),
-                            shared_storage_config.clone(),
-                            payload_index_schema.clone(),
-                            update_runtime.clone(),
-                            search_runtime.clone(),
-                            optimizer_cpu_budget.clone(),
-                        )
-                        .await
-                        .unwrap();
+            // Load replica set
+            let shard_key = self.get_shard_id_to_key_mapping().get(&shard_id);
+            let replica_set = ShardReplicaSet::load(
+                shard_id,
+                shard_key.cloned(),
+                collection_id.clone(),
+                &shard_path,
+                is_dirty_shard,
+                collection_config.clone(),
+                effective_optimizers_config.clone(),
+                shared_storage_config.clone(),
+                payload_index_schema.clone(),
+                channel_service.clone(),
+                on_peer_failure.clone(),
+                abort_shard_transfer.clone(),
+                this_peer_id,
+                update_runtime.clone(),
+                search_runtime.clone(),
+                optimizer_resource_budget.clone(),
+            )
+            .await;
 
-                        replica_set
-                            .set_local(temp_shard, Some(ReplicaState::Partial))
-                            .await
-                            .unwrap();
-                    }
-                    ShardType::ReplicaSet => {
-                        require_migration = false;
-                        // nothing to do, replicate set should be loaded already
-                    }
-                }
-                // Migrate shard config to replica set
-                // Override existing shard configuration
-                if require_migration {
-                    ShardConfig::new_replica_set()
-                        .save(&path)
-                        .map_err(|e| panic!("Failed to save shard config {path:?}: {e}"))
-                        .unwrap();
-                }
-
-                // Change local shards stuck in Initializing state to Active
-                let local_peer_id = replica_set.this_peer_id();
-                let not_distributed = !shared_storage_config.is_distributed;
-                let is_local =
-                    replica_set.this_peer_id() == local_peer_id && replica_set.is_local().await;
-                let is_initializing =
-                    replica_set.peer_state(local_peer_id) == Some(ReplicaState::Initializing);
-                if not_distributed && is_local && is_initializing {
-                    log::warn!("Local shard {collection_id}:{} stuck in Initializing state, changing to Active", replica_set.shard_id);
-                    replica_set
-                        .set_replica_state(local_peer_id, ReplicaState::Active)
-                        .expect("Failed to set local shard state");
-                }
-                let shard_key = shard_id_to_key_mapping.get(&shard_id).cloned();
-                self.add_shard(shard_id, replica_set, shard_key).unwrap();
+            // Change local shards stuck in Initializing state to Active
+            let local_peer_id = replica_set.this_peer_id();
+            let not_distributed = !shared_storage_config.is_distributed;
+            let is_local =
+                replica_set.this_peer_id() == local_peer_id && replica_set.is_local().await;
+            let is_initializing =
+                replica_set.peer_state(local_peer_id) == Some(ReplicaState::Initializing);
+            if not_distributed && is_local && is_initializing {
+                log::warn!(
+                    "Local shard {collection_id}:{} stuck in Initializing state, changing to Active",
+                    replica_set.shard_id,
+                );
+                replica_set
+                    .set_replica_state(local_peer_id, ReplicaState::Active)
+                    .expect("Failed to set local shard state");
             }
+            let shard_key = shard_id_to_key_mapping.get(&shard_id).cloned();
+            self.add_shard(shard_id, replica_set, shard_key).unwrap();
         }
 
         // If resharding, rebuild the hash rings because they'll be messed up
@@ -942,7 +914,7 @@ impl ShardHolder {
 
         let (read_half, write_half) = tokio::io::duplex(4096);
 
-        tokio::spawn(async move {
+        let future = async move {
             let tar = BuilderExt::new_streaming_owned(SyncIoBridge::new(write_half));
 
             shard
@@ -965,6 +937,12 @@ impl ShardHolder {
             tar.finish().await?;
 
             CollectionResult::Ok(())
+        };
+
+        tokio::spawn(async move {
+            if let Err(err) = future.await {
+                log::error!("Failed to stream shard snapshot: {err}");
+            }
         });
 
         Ok(SnapshotStream::new_stream(
@@ -980,6 +958,7 @@ impl ShardHolder {
     pub async fn restore_shard_snapshot(
         &self,
         snapshot_path: &Path,
+        collection_path: &Path,
         collection_name: &str,
         shard_id: ShardId,
         this_peer_id: PeerId,
@@ -1039,7 +1018,7 @@ impl ShardHolder {
         // `ShardHolder::recover_local_shard_from` is *not* cancel safe
         // (see `ShardReplicaSet::restore_local_replica_from`)
         let recovered = self
-            .recover_local_shard_from(snapshot_temp_dir.path(), shard_id, cancel)
+            .recover_local_shard_from(snapshot_temp_dir.path(), collection_path, shard_id, cancel)
             .await?;
 
         if !recovered {
@@ -1057,6 +1036,7 @@ impl ShardHolder {
     pub async fn recover_local_shard_from(
         &self,
         snapshot_shard_path: &Path,
+        collection_path: &Path,
         shard_id: ShardId,
         cancel: cancel::CancellationToken,
     ) -> CollectionResult<bool> {
@@ -1069,9 +1049,16 @@ impl ShardHolder {
             .ok_or_else(|| shard_not_found_error(shard_id))?;
 
         // `ShardReplicaSet::restore_local_replica_from` is *not* cancel safe
-        replica_set
-            .restore_local_replica_from(snapshot_shard_path, cancel)
-            .await
+        let res = replica_set
+            .restore_local_replica_from(
+                snapshot_shard_path,
+                RecoveryType::Full,
+                collection_path,
+                cancel,
+            )
+            .await?;
+
+        Ok(res)
     }
 
     /// # Cancel safety
@@ -1119,13 +1106,38 @@ impl ShardHolder {
         Ok(())
     }
 
-    /// Queries and accumulates the statistics for local data, uncached.
-    pub async fn calculate_local_segments_stats(&self) -> LocalDataStats {
-        let mut stats = LocalDataStats::default();
-        for shard in self.shards.iter() {
-            stats.accumulate_from(&shard.1.calculate_local_shards_stats().await)
+    /// Estimates the collections size based on local shard data. Returns `None` if no shard for the collection was found locally.
+    pub async fn estimate_collection_size_stats(&self) -> Option<CollectionSizeStats> {
+        if self.is_distributed().await {
+            // In distributed, we estimate the whole collection size by using a single local shard and multiply by amount of shards in the collection.
+            for shard in self.shards.iter() {
+                if let Some(shard_stats) = shard.1.calculate_local_shard_stats().await {
+                    // TODO(resharding) take into account the ongoing resharding and exclude shards that are being filled from multiplication.
+                    // Project the single shards size to the full collection.
+                    let collection_estimate = shard_stats.multiplied_with(self.shards.len());
+                    return Some(collection_estimate);
+                }
+            }
+
+            return None;
         }
-        stats
+
+        // Local mode: return collection size estimations using all shards.
+        let mut stats = CollectionSizeStats::default();
+        for shard in self.shards.iter() {
+            if let Some(shard_stats) = shard.1.calculate_local_shard_stats().await {
+                stats.accumulate_metrics_from(&shard_stats);
+            }
+        }
+
+        Some(stats)
+    }
+
+    /// Returns `true` if the collection is distributed across multiple nodes.
+    async fn is_distributed(&self) -> bool {
+        stream::iter(self.shards.iter())
+            .any(|i| async { i.1.has_remote_shard().await })
+            .await
     }
 }
 

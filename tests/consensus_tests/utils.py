@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import signal
 from subprocess import Popen
 import time
 from typing import Tuple, Callable, Dict, List
@@ -14,16 +15,16 @@ from .assertions import assert_http_ok
 
 
 WAIT_TIME_SEC = 30
-RETRY_INTERVAL_SEC = 0.5
+RETRY_INTERVAL_SEC = 0.2
 
 
 # Tracks processes that need to be killed at the end of the test
-processes = []
+processes: List['PeerProcess'] = []
 busy_ports = {}
 
 
 class PeerProcess:
-    def __init__(self, proc, http_port, grpc_port, p2p_port):
+    def __init__(self, proc: Popen, http_port, grpc_port, p2p_port):
         self.proc = proc
         self.http_port = http_port
         self.grpc_port = grpc_port
@@ -34,6 +35,14 @@ class PeerProcess:
         self.proc.kill()
         # remove allocated ports from the dictionary
         # so they can be used afterwards
+        del busy_ports[self.http_port]
+        del busy_ports[self.grpc_port]
+        del busy_ports[self.p2p_port]
+
+    def interrupt(self):
+        self.proc.send_signal(signal.SIGINT)
+        self.proc.wait()
+
         del busy_ports[self.http_port]
         del busy_ports[self.grpc_port]
         del busy_ports[self.p2p_port]
@@ -50,8 +59,12 @@ def kill_all_processes():
     print()
     while len(processes) > 0:
         p = processes.pop(0)
-        print(f"Killing {p.pid}")
-        p.kill()
+        if is_coverage_mode():
+            print(f"Interrupting {p.pid}")
+            p.interrupt()
+        else:
+            print(f"Killing {p.pid}")
+            p.kill()
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +84,9 @@ def get_port() -> int:
                 continue
             return allocated_port
 
+def is_coverage_mode() -> bool:
+    return os.getenv("COVERAGE") == "1"
+
 
 def get_env(p2p_port: int, grpc_port: int, http_port: int) -> Dict[str, str]:
     env = os.environ.copy()
@@ -79,6 +95,11 @@ def get_env(p2p_port: int, grpc_port: int, http_port: int) -> Dict[str, str]:
     env["QDRANT__SERVICE__HTTP_PORT"] = str(http_port)
     env["QDRANT__SERVICE__GRPC_PORT"] = str(grpc_port)
     env["QDRANT__LOG_LEVEL"] = "DEBUG,raft::raft=info"
+    env["QDRANT__SERVICE__HARDWARE_REPORTING"] = "true"
+
+    if is_coverage_mode():
+        env["LLVM_PROFILE_FILE"] = get_llvm_profile_file()
+
     return env
 
 
@@ -94,8 +115,19 @@ def assert_project_root():
 
 def get_qdrant_exec() -> str:
     directory_path = os.getcwd()
-    qdrant_exec = directory_path + "/target/debug/qdrant"
+    if is_coverage_mode():
+        qdrant_exec = directory_path + "/target/llvm-cov-target/debug/qdrant"
+    else:
+        qdrant_exec = directory_path + "/target/debug/qdrant"
     return qdrant_exec
+
+def get_llvm_profile_file() -> str:
+    project_root = os.getcwd()
+    # %m: keep merging results from each test into the same file
+    # If you have multiple tests running in parallel, you can use -%p OR -%{thread_count}m to have different files
+    # Not using -%p since each test will generate a new file
+    llvm_profile_file = project_root + "/target/llvm-cov-target/qdrant-consensus-tests-%m.profraw"
+    return llvm_profile_file
 
 
 def get_pytest_current_test_name() -> str:
@@ -112,7 +144,7 @@ def init_pytest_log_folder() -> str:
 
 
 # Starts a peer and returns its api_uri
-def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None, reinit=False) -> str:
+def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None, reinit=False, uris_in_env=False) -> str:
     if extra_env is None:
         extra_env = {}
     p2p_port = get_port() if port is None else port + 0
@@ -122,28 +154,34 @@ def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, ext
     http_port = get_port() if port is None else port + 2
     _occupy_port(http_port)
 
+    test_log_folder = init_pytest_log_folder()
+    log_file = open(f"{test_log_folder}/{log_file}", "w")
+    this_peer_consensus_uri = get_uri(p2p_port)
+    print(f"Starting follower peer with bootstrap uri {bootstrap_uri},"
+          f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
+
+    args = [get_qdrant_exec()]
     env = {
         **get_env(p2p_port, grpc_port, http_port),
         **extra_env
     }
-    test_log_folder = init_pytest_log_folder()
-    log_file = open(f"{test_log_folder}/{log_file}", "w")
-    print(f"Starting follower peer with bootstrap uri {bootstrap_uri},"
-          f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
 
-    this_peer_consensus_uri = get_uri(p2p_port)
-    if reinit:
-        proc = Popen([get_qdrant_exec(), "--bootstrap", bootstrap_uri, "--uri", this_peer_consensus_uri, "--reinit"], env=env,
-                     cwd=peer_dir, stdout=log_file)
+    if uris_in_env:
+        env["QDRANT_BOOTSTRAP"] = bootstrap_uri
+        env["QDRANT_URI"] = this_peer_consensus_uri
     else:
-        proc = Popen([get_qdrant_exec(), "--bootstrap", bootstrap_uri, "--uri", this_peer_consensus_uri], env=env,
-                 cwd=peer_dir, stdout=log_file)
+        args.extend(["--bootstrap", bootstrap_uri, "--uri", this_peer_consensus_uri])
+
+    if reinit:
+        args.append("--reinit")
+
+    proc = Popen(args, env=env, cwd=peer_dir, stdout=log_file)
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port)
 
 
 # Starts a peer and returns its api_uri and p2p_uri
-def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, reinit=False) -> Tuple[str, str]:
+def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, reinit=False, uris_in_env=False) -> Tuple[str, str]:
     if extra_env is None:
         extra_env = {}
 
@@ -154,25 +192,32 @@ def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, r
     http_port = get_port() if port is None else port + 2
     _occupy_port(http_port)
 
-    env = {
-        **get_env(p2p_port, grpc_port, http_port),
-        **extra_env
-    }
     test_log_folder = init_pytest_log_folder()
     log_file = open(f"{test_log_folder}/{log_file}", "w")
     bootstrap_uri = get_uri(p2p_port)
     print(f"\nStarting first peer with uri {bootstrap_uri},"
           f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
 
-    if reinit:
-        proc = Popen([get_qdrant_exec(), "--uri", bootstrap_uri, "--reinit"], env=env, cwd=peer_dir, stdout=log_file)
+    args = [get_qdrant_exec()]
+    env = {
+        **get_env(p2p_port, grpc_port, http_port),
+        **extra_env
+    }
+
+    if uris_in_env:
+        env["QDRANT_URI"] = bootstrap_uri
     else:
-        proc = Popen([get_qdrant_exec(), "--uri", bootstrap_uri], env=env, cwd=peer_dir, stdout=log_file)
+        args.extend(["--uri", bootstrap_uri])
+
+    if reinit:
+        args.append("--reinit")
+
+    proc = Popen(args, env=env, cwd=peer_dir, stdout=log_file)
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port), bootstrap_uri
 
 
-def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={}):
+def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={}, uris_in_env=False):
     assert_project_root()
     peer_dirs = make_peer_folders(tmp_path, num_peers)
 
@@ -181,7 +226,7 @@ def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={
 
     # Start bootstrap
     (bootstrap_api_uri, bootstrap_uri) = start_first_peer(peer_dirs[0], "peer_0_0.log", port=port_seed,
-                                                          extra_env=extra_env)
+                                                          extra_env=extra_env, uris_in_env=uris_in_env)
     peer_api_uris.append(bootstrap_api_uri)
 
     # Wait for leader
@@ -192,7 +237,7 @@ def start_cluster(tmp_path, num_peers, port_seed=None, extra_env=None, headers={
     for i in range(1, len(peer_dirs)):
         if port_seed is not None:
             port = port_seed + i * 100
-        peer_api_uris.append(start_peer(peer_dirs[i], f"peer_0_{i}.log", bootstrap_uri, port=port, extra_env=extra_env))
+        peer_api_uris.append(start_peer(peer_dirs[i], f"peer_0_{i}.log", bootstrap_uri, port=port, extra_env=extra_env, uris_in_env=uris_in_env))
 
     # Wait for cluster
     wait_for_uniform_cluster_status(peer_api_uris, leader, headers=headers)
@@ -378,7 +423,7 @@ def check_collection_local_shards_count(peer_api_uri: str, collection_name: str,
     return get_collection_local_shards_count(peer_api_uri, collection_name) == expected_local_shard_count
 
 
-def get_collection_local_shards_count(peer_api_uri: str, collection_name: str) -> bool:
+def get_collection_local_shards_count(peer_api_uri: str, collection_name: str) -> int:
     collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name)
     return len(collection_cluster_info["local_shards"])
 
@@ -461,13 +506,16 @@ def check_collection_shard_transfer_progress(peer_api_uri: str, collection_name:
 
 
 def check_all_replicas_active(peer_api_uri: str, collection_name: str, headers={}) -> bool:
-    collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
-    for shard in collection_cluster_info["local_shards"]:
-        if shard['state'] != 'Active':
-            return False
-    for shard in collection_cluster_info["remote_shards"]:
-        if shard['state'] != 'Active':
-            return False
+    try:
+        collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
+        for shard in collection_cluster_info["local_shards"]:
+            if shard['state'] != 'Active':
+                return False
+        for shard in collection_cluster_info["remote_shards"]:
+            if shard['state'] != 'Active':
+                return False
+    except requests.exceptions.ConnectionError:
+        return False
     return True
 
 
@@ -480,6 +528,16 @@ def check_collection_cluster(peer_url, collection_name):
     assert_http_ok(res)
     return res.json()["result"]['local_shards'][0]
 
+
+def check_strict_mode_enabled(peer_api_uri: str, collection_name: str) -> bool:
+    collection_info = get_collection_info(peer_api_uri, collection_name)
+    strict_mode_enabled = collection_info["config"]["strict_mode_config"]["enabled"]
+    return strict_mode_enabled == True
+
+def check_strict_mode_disabled(peer_api_uri: str, collection_name: str) -> bool:
+    collection_info = get_collection_info(peer_api_uri, collection_name)
+    strict_mode_enabled = collection_info["config"]["strict_mode_config"]["enabled"]
+    return strict_mode_enabled == False
 
 def wait_peer_added(peer_api_uri: str, expected_size: int = 1, headers={}) -> str:
     wait_for(check_cluster_size, peer_api_uri, expected_size, headers=headers)
@@ -507,7 +565,7 @@ def wait_for_all_replicas_active(peer_api_uri: str, collection_name: str, header
     try:
         wait_for(check_all_replicas_active, peer_api_uri, collection_name, headers=headers)
     except Exception as e:
-        print_clusters_info([peer_api_uri], headers=headers)
+        print_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
         raise e
 
 
@@ -599,6 +657,21 @@ def wait_for_collection_local_shards_count(peer_api_uri: str, collection_name: s
         raise e
 
 
+def wait_for_strict_mode_enabled(peer_api_uri: str, collection_name: str):
+    try:
+        wait_for(check_strict_mode_enabled, peer_api_uri, collection_name)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name)
+        raise e
+
+def wait_for_strict_mode_disabled(peer_api_uri: str, collection_name: str):
+    try:
+        wait_for(check_strict_mode_disabled, peer_api_uri, collection_name)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name)
+        raise e
+
+
 def wait_for(condition: Callable[..., bool], *args, wait_for_timeout=WAIT_TIME_SEC, wait_for_interval=RETRY_INTERVAL_SEC, **kwargs):
     start = time.time()
     while not condition(*args, **kwargs):
@@ -670,3 +743,49 @@ def wait_collection_exists_and_active_on_all_peers(collection_name: str, peer_ap
     for peer_uri in peer_api_uris:
         # Collection is active on all peers
         wait_for_all_replicas_active(collection_name=collection_name, peer_api_uri=peer_uri, headers=headers)
+
+
+def create_shard_key(
+    shard_key,
+    peer_url,
+    collection="test_collection",
+    shard_number=None,
+    replication_factor=None,
+    placement=None,
+    timeout=10,
+    headers={},
+):
+    r_create = requests.put(
+        f"{peer_url}/collections/{collection}/shards?timeout={timeout}",
+        json={
+            "shard_key": shard_key,
+            "shards_number": shard_number,
+            "replication_factor": replication_factor,
+            "placement": placement,
+        },
+        headers=headers,
+    )
+    assert_http_ok(r_create)
+
+
+def move_shard(source_uri, collection_name, shard_id, source_peer_id, target_peer_id):
+    r = requests.post(
+        f"{source_uri}/collections/{collection_name}/cluster", json={
+            "move_shard": {
+                "shard_id": shard_id,
+                "from_peer_id": source_peer_id,
+                "to_peer_id": target_peer_id
+            }
+        })
+    assert_http_ok(r)
+
+def replicate_shard(source_uri, collection_name, shard_id, source_peer_id, target_peer_id):
+    r = requests.post(
+        f"{source_uri}/collections/{collection_name}/cluster", json={
+            "replicate_shard": {
+                "shard_id": shard_id,
+                "from_peer_id": source_peer_id,
+                "to_peer_id": target_peer_id
+            }
+        })
+    assert_http_ok(r)

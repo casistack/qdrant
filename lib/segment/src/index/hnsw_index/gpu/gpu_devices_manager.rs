@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use itertools::Itertools;
 use parking_lot::{Mutex, MutexGuard};
@@ -37,7 +37,7 @@ impl GpuDevicesMaganer {
         wait_free: bool,
         parallel_indexes: usize,
     ) -> OperationResult<Self> {
-        let instance = gpu::Instance::new(None, None, false)?;
+        let instance = gpu::Instance::builder().build()?;
 
         // Device filter is case-insensitive and comma-separated.
         let filter = filter.to_lowercase();
@@ -80,10 +80,11 @@ impl GpuDevicesMaganer {
                     .filter_map(|&device_index| filtered_physical_devices.get(device_index))
                     // Try to create a gpu device.
                     .filter_map(|physical_device| {
-                        match gpu::Device::new_with_queue_index(
+                        match gpu::Device::new_with_params(
                             instance.clone(),
                             physical_device,
                             queue_index,
+                            false,
                         ) {
                             Ok(device) => {
                                 log::info!("Initialized GPU device: {:?}", &physical_device.name);

@@ -1,7 +1,7 @@
 use std::ops::{Index, Range};
 
 use geo::{Coord, Distance, Haversine, Intersects, LineString, Point, Polygon};
-use geohash::{decode, decode_bbox, encode, Direction, GeohashError};
+use geohash::{Direction, GeohashError, decode, decode_bbox, encode};
 use itertools::Itertools;
 use smol_str::SmolStr;
 
@@ -358,10 +358,10 @@ fn check_circle_intersection(geohash: &str, circle: &GeoRadius) -> bool {
     let c1 = rect.max();
 
     let bbox_center = Point::new((c0.x + c1.x) / 2f64, (c0.y + c1.y) / 2f64);
-    let half_diagonal = Haversine::distance(bbox_center, Point(c0));
+    let half_diagonal = Haversine.distance(bbox_center, Point(c0));
 
     half_diagonal + circle.radius
-        > Haversine::distance(
+        > Haversine.distance(
             bbox_center,
             Point::new(circle.center.lon, circle.center.lat),
         )
@@ -939,15 +939,15 @@ mod tests {
     fn random_circles() {
         let mut rnd = StdRng::seed_from_u64(42);
         for _ in 0..1000 {
-            let r_meters = rnd.gen_range(1.0..10000.0);
+            let r_meters = rnd.random_range(1.0..10000.0);
             let query = GeoRadius {
                 center: GeoPoint {
-                    lon: rnd.gen_range(LON_RANGE),
-                    lat: rnd.gen_range(LAT_RANGE),
+                    lon: rnd.random_range(LON_RANGE),
+                    lat: rnd.random_range(LAT_RANGE),
                 },
                 radius: r_meters,
             };
-            let max_hashes = rnd.gen_range(1..32);
+            let max_hashes = rnd.random_range(1..32);
             let hashes = circle_hashes(&query, max_hashes);
             assert!(hashes.unwrap().len() <= max_hashes);
         }
@@ -1288,10 +1288,10 @@ mod tests {
 
     #[test]
     fn long_overflow_distance() {
-        let dist = Haversine::distance(Point::new(-179.999, 66.0), Point::new(179.999, 66.0));
+        let dist = Haversine.distance(Point::new(-179.999, 66.0), Point::new(179.999, 66.0));
         eprintln!("dist` = {dist:#?}");
         assert_eq!(dist, 90.45422731917998);
-        let dist = Haversine::distance(Point::new(0.99, 90.), Point::new(0.99, -90.0));
+        let dist = Haversine.distance(Point::new(0.99, 90.), Point::new(0.99, -90.0));
         assert_eq!(dist, 20015114.442035925);
     }
 

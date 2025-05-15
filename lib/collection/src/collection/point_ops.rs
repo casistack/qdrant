@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::stream::FuturesUnordered;
-use futures::{future, StreamExt as _, TryFutureExt, TryStreamExt as _};
+use futures::{StreamExt as _, TryFutureExt, TryStreamExt as _, future};
 use itertools::Itertools;
 use segment::data_types::order_by::{Direction, OrderBy};
 use segment::types::{ShardKey, WithPayload, WithPayloadInterface};
@@ -28,6 +28,7 @@ impl Collection {
         &self,
         operation: CollectionUpdateOperations,
         wait: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Option<UpdateResult>> {
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
@@ -49,7 +50,12 @@ impl Collection {
                     //
                     // We update *all* shards with a single operation, but each shard has it's own clock,
                     // so it's *impossible* to assign any single clock tag to this operation.
-                    shard.update_local(OperationWithClockTag::from(operation.clone()), wait)
+                    shard.update_local(
+                        OperationWithClockTag::from(operation.clone()),
+                        wait,
+                        hw_measurement_acc.clone(),
+                        false,
+                    )
                 })
                 .collect();
 
@@ -85,6 +91,7 @@ impl Collection {
         shard_selection: ShardId,
         wait: bool,
         ordering: WriteOrdering,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
@@ -97,7 +104,7 @@ impl Collection {
             };
 
             match ordering {
-                WriteOrdering::Weak => shard.update_local(operation, wait).await,
+                WriteOrdering::Weak => shard.update_local(operation, wait, hw_measurement_acc.clone(), false).await,
                 WriteOrdering::Medium | WriteOrdering::Strong => {
                     if let Some(clock_tag) = operation.clock_tag {
                         log::warn!(
@@ -108,7 +115,7 @@ impl Collection {
                     }
 
                     shard
-                        .update_with_consistency(operation.operation, wait, ordering, false)
+                        .update_with_consistency(operation.operation, wait, ordering, false, hw_measurement_acc)
                         .await
                         .map(Some)
                 }
@@ -136,6 +143,7 @@ impl Collection {
         wait: bool,
         ordering: WriteOrdering,
         shard_keys_selection: Option<ShardKey>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
@@ -149,6 +157,7 @@ impl Collection {
             for (shard, operation) in operations {
                 let operation = shard_holder.split_by_mode(shard.shard_id, operation);
 
+                let hw_acc = hw_measurement_acc.clone();
                 updates.push(async move {
                     let mut result = UpdateResult {
                         operation_id: None,
@@ -158,13 +167,25 @@ impl Collection {
 
                     for operation in operation.update_all {
                         result = shard
-                            .update_with_consistency(operation, wait, ordering, false)
+                            .update_with_consistency(
+                                operation,
+                                wait,
+                                ordering,
+                                false,
+                                hw_acc.clone(),
+                            )
                             .await?;
                     }
 
                     for operation in operation.update_only_existing {
                         let res = shard
-                            .update_with_consistency(operation, wait, ordering, true)
+                            .update_with_consistency(
+                                operation,
+                                wait,
+                                ordering,
+                                true,
+                                hw_acc.clone(),
+                            )
                             .await;
 
                         if let Err(err) = &res {
@@ -228,8 +249,9 @@ impl Collection {
         operation: CollectionUpdateOperations,
         wait: bool,
         ordering: WriteOrdering,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
-        self.update_from_client(operation, wait, ordering, None)
+        self.update_from_client(operation, wait, ordering, None, hw_measurement_acc)
             .await
     }
 
@@ -239,6 +261,7 @@ impl Collection {
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<ScrollResult> {
         let default_request = ScrollRequestInternal::default();
 
@@ -290,6 +313,7 @@ impl Collection {
                         local_only,
                         order_by.as_ref(),
                         timeout,
+                        hw_measurement_acc.clone(),
                     )
                     .and_then(move |mut records| async move {
                         if shard_key.is_none() {
@@ -317,42 +341,15 @@ impl Collection {
                 .collect_vec(),
             Some(order_by) => {
                 retrieved_iter
-                    // Extract and remove order value from payload
-                    .map(|records| {
-                        // TODO(1.11): read value only from record.order_value, remove & cleanup this part
-                        records.into_iter().map(|mut record| {
-                            let value;
-                            if local_only {
-                                value = record.order_value.unwrap_or_else(|| {
-                                    order_by.get_order_value_from_payload(record.payload.as_ref())
-                                });
-                            } else {
-                                value = if let Some(order_value) = record.order_value {
-                                    order_by
-                                        .remove_order_value_from_payload(record.payload.as_mut());
-                                    order_value
-                                } else {
-                                    order_by
-                                        .remove_order_value_from_payload(record.payload.as_mut())
-                                };
-                                if !with_payload_interface.is_required() {
-                                    // Use None instead of empty hashmap
-                                    record.payload = None;
-                                }
-                            };
-                            (value, record)
-                        })
-                    })
                     // Get top results
-                    .kmerge_by(|(value_a, record_a), (value_b, record_b)| {
-                        match order_by.direction() {
-                            Direction::Asc => (value_a, record_a.id) < (value_b, record_b.id),
-                            Direction::Desc => (value_a, record_a.id) > (value_b, record_b.id),
-                        }
+                    .kmerge_by(|a, b| match order_by.direction() {
+                        Direction::Asc => (a.order_value, a.id) < (b.order_value, b.id),
+                        Direction::Desc => (a.order_value, a.id) > (b.order_value, b.id),
                     })
-                    // Only keep the point with the most "valuable" order value
-                    .dedup_by(|(_, record_a), (_, record_b)| record_a.id == record_b.id)
-                    .map(|(_, record)| api::rest::Record::from(record))
+                    .dedup_by(|record_a, record_b| {
+                        (record_a.order_value, record_a.id) == (record_b.order_value, record_b.id)
+                    })
+                    .map(api::rest::Record::from)
                     .take(limit)
                     .collect_vec()
             }
@@ -377,7 +374,7 @@ impl Collection {
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<CountResult> {
         let shards_holder = self.shards_holder.read().await;
         let shards = shards_holder.select_shards(shard_selection)?;
@@ -393,7 +390,7 @@ impl Collection {
                     read_consistency,
                     timeout,
                     shard_selection.is_shard_id(),
-                    hw_measurement_acc,
+                    hw_measurement_acc.clone(),
                 )
             })
             .collect();
@@ -412,7 +409,11 @@ impl Collection {
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
+        if request.ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let with_payload_interface = request
             .with_payload
             .as_ref()
@@ -431,6 +432,8 @@ impl Collection {
                 let request = &request;
                 let with_payload = &with_payload;
 
+                let hw_acc = hw_measurement_acc.clone();
+
                 async move {
                     let mut records = shard
                         .retrieve(
@@ -440,6 +443,7 @@ impl Collection {
                             read_consistency,
                             timeout,
                             shard_selection.is_shard_id(),
+                            hw_acc,
                         )
                         .await?;
 
@@ -473,13 +477,5 @@ impl Collection {
             .collect();
 
         Ok(points)
-    }
-
-    pub async fn cleanup_local_shard(&self, shard_id: ShardId) -> CollectionResult<UpdateResult> {
-        self.shards_holder
-            .read()
-            .await
-            .cleanup_local_shard(shard_id)
-            .await
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::ShardKey;
 
 use crate::collection::Collection;
@@ -46,7 +47,7 @@ impl Collection {
             self.channel_service.clone(),
             self.update_runtime.clone(),
             self.search_runtime.clone(),
-            self.optimizer_cpu_budget.clone(),
+            self.optimizer_resource_budget.clone(),
             Some(init_state.unwrap_or(ReplicaState::Active)),
         )
         .await
@@ -60,6 +61,8 @@ impl Collection {
         shard_key: ShardKey,
         placement: ShardsPlacement,
     ) -> Result<(), CollectionError> {
+        let hw_counter = HwMeasurementAcc::disposable(); // Internal operation. No measurement needed.
+
         let state = self.state().await;
         match state.config.params.sharding_method.unwrap_or_default() {
             ShardingMethod::Auto => {
@@ -121,7 +124,12 @@ impl Collection {
                 );
 
                 replica_set
-                    .update_local(OperationWithClockTag::from(create_index_op), true) // TODO: Assign clock tag!? 🤔
+                    .update_local(
+                        OperationWithClockTag::from(create_index_op),
+                        true,
+                        hw_counter.clone(),
+                        false,
+                    ) // TODO: Assign clock tag!? 🤔
                     .await?;
             }
 
@@ -157,6 +165,19 @@ impl Collection {
                     "failed to abort resharding {} while deleting shard key {shard_key}: {err}",
                     state.key(),
                 );
+            }
+        }
+
+        // Invalidate local shard cleaning tasks
+        match self
+            .shards_holder
+            .read()
+            .await
+            .get_shard_ids_by_key(&shard_key)
+        {
+            Ok(shard_ids) => self.invalidate_clean_local_shards(shard_ids).await,
+            Err(err) => {
+                log::warn!("Failed to invalidate local shard cleaning task, ignoring: {err}");
             }
         }
 

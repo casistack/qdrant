@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use memory::mmap_type::MmapSlice;
 use parking_lot::{Mutex, RwLock};
 
@@ -10,6 +10,8 @@ use crate::common::Flusher;
 /// A wrapper around `MmapSlice` that delays writing changes to the underlying file until they get
 /// flushed manually.
 /// This expects the underlying MmapSlice not to grow in size.
+///
+/// WARN: this structure is expected to be write-only.
 #[derive(Debug)]
 pub struct MmapSliceBufferedUpdateWrapper<T>
 where
@@ -17,7 +19,7 @@ where
 {
     mmap_slice: Arc<RwLock<MmapSlice<T>>>,
     len: usize,
-    pending_updates: Mutex<HashMap<usize, T>>,
+    pending_updates: Mutex<AHashMap<usize, T>>,
 }
 
 impl<T> MmapSliceBufferedUpdateWrapper<T>
@@ -29,7 +31,7 @@ where
         Self {
             mmap_slice: Arc::new(RwLock::new(mmap_slice)),
             len,
-            pending_updates: Mutex::new(HashMap::new()),
+            pending_updates: Mutex::new(AHashMap::new()),
         }
     }
 

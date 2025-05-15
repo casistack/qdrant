@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 use std::future::{self, Future};
-use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
+use std::sync::atomic::{self, AtomicBool};
 use std::time::Duration;
 use std::{panic, thread};
 
 use api::grpc::qdrant::qdrant_internal_client::QdrantInternalClient;
 use api::grpc::qdrant::{GetConsensusCommitRequest, GetConsensusCommitResponse};
 use api::grpc::transport_channel_pool::{self, TransportChannelPool};
-use collection::shards::shard::ShardId;
 use collection::shards::CollectionId;
+use collection::shards::shard::ShardId;
 use common::defaults;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
@@ -34,7 +34,7 @@ pub struct HealthChecker {
     // Signal to the health checker task, that the API was called.
     // Used to drive the health checker task and avoid constant polling.
     check_ready_signal: Arc<sync::Notify>,
-    cancel: cancel::DropGuard,
+    _cancel: cancel::DropGuard,
 }
 
 impl HealthChecker {
@@ -58,7 +58,7 @@ impl HealthChecker {
             is_ready: task.is_ready.clone(),
             is_ready_signal: task.is_ready_signal.clone(),
             check_ready_signal: task.check_ready_signal.clone(),
-            cancel: task.cancel.clone().drop_guard(),
+            _cancel: task.cancel.clone().drop_guard(),
         };
 
         let task = runtime.spawn(task.exec());

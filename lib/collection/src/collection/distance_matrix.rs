@@ -1,14 +1,15 @@
-use std::collections::HashSet;
 use std::time::Duration;
 
+use ahash::AHashSet;
 use api::rest::{
     SearchMatrixOffsetsResponse, SearchMatrixPair, SearchMatrixPairsResponse,
     SearchMatrixRequestInternal,
 };
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use segment::data_types::vectors::{NamedVectorStruct, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, NamedQuery};
 use segment::types::{
-    Condition, Filter, HasIdCondition, HasVectorCondition, PointIdType, ScoredPoint, WithVector,
+    Condition, Filter, HasIdCondition, HasVectorCondition, PointIdType, ScoredPoint, VectorNameBuf,
+    WithVector,
 };
 
 use crate::collection::Collection;
@@ -31,7 +32,7 @@ pub struct CollectionSearchMatrixRequest {
     pub sample_size: usize,
     pub limit_per_sample: usize,
     pub filter: Option<Filter>,
-    pub using: String,
+    pub using: VectorNameBuf,
 }
 
 impl CollectionSearchMatrixRequest {
@@ -52,7 +53,7 @@ impl From<SearchMatrixRequestInternal> for CollectionSearchMatrixRequest {
             limit_per_sample: limit
                 .unwrap_or(CollectionSearchMatrixRequest::DEFAULT_LIMIT_PER_SAMPLE),
             filter,
-            using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
+            using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
         }
     }
 }
@@ -140,7 +141,7 @@ impl Collection {
         shard_selection: ShardSelectorInternal,
         read_consistency: Option<ReadConsistency>,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<CollectionSearchMatrixResponse> {
         let start = std::time::Instant::now();
         let CollectionSearchMatrixRequest {
@@ -184,7 +185,7 @@ impl Collection {
                 read_consistency,
                 shard_selection.clone(),
                 timeout,
-                hw_measurement_acc,
+                hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -203,7 +204,7 @@ impl Collection {
         // filter to only include the sampled points in the search
         // use the same filter for all requests to leverage batch search
         let filter = Filter::new_must(Condition::HasId(HasIdCondition::from(
-            sampled_point_ids.iter().copied().collect::<HashSet<_>>(),
+            sampled_point_ids.iter().copied().collect::<AHashSet<_>>(),
         )));
 
         // Perform nearest neighbor search for each sampled point
@@ -217,7 +218,7 @@ impl Collection {
                 .expect("Vector not found in the point");
 
             // nearest query on the sample vector
-            let named_vector = NamedVectorStruct::new_from_vector(vector, using.clone());
+            let named_vector = NamedQuery::new_from_vector(vector, using.clone());
             let query = QueryEnum::Nearest(named_vector);
 
             searches.push(CoreSearchRequest {

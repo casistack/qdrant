@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 use serde_json::Value;
 
 use self::memory::{BoolMemory, BooleanItem};
+use super::BoolIndex;
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
@@ -20,6 +22,7 @@ use crate::types::{FieldCondition, Match, MatchValue, PayloadKeyType, ValueVaria
 
 mod memory {
     use bitvec::vec::BitVec;
+    use common::ext::BitSliceExt as _;
     use common::types::PointOffsetType;
 
     pub struct BooleanItem {
@@ -90,8 +93,8 @@ mod memory {
         pub fn get(&self, id: PointOffsetType) -> BooleanItem {
             debug_assert!(self.trues.len() == self.falses.len());
 
-            let has_true = self.trues.get(id as usize).map(|v| *v).unwrap_or(false);
-            let has_false = self.falses.get(id as usize).map(|v| *v).unwrap_or(false);
+            let has_true = self.trues.get_bit(id as usize).unwrap_or(false);
+            let has_false = self.falses.get_bit(id as usize).unwrap_or(false);
 
             BooleanItem::from_bools(has_true, has_false)
         }
@@ -178,13 +181,13 @@ mod memory {
 }
 
 /// Payload index for boolean values, persisted in a RocksDB column family
-pub struct BoolIndex {
+pub struct SimpleBoolIndex {
     memory: BoolMemory,
     db_wrapper: DatabaseColumnScheduledDeleteWrapper,
 }
 
-impl BoolIndex {
-    pub fn new(db: Arc<RwLock<DB>>, field_name: &str) -> BoolIndex {
+impl SimpleBoolIndex {
+    pub fn new(db: Arc<RwLock<DB>>, field_name: &str) -> SimpleBoolIndex {
         let store_cf_name = Self::storage_cf_name(field_name);
         let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
             db,
@@ -210,6 +213,15 @@ impl BoolIndex {
             points_count: self.memory.indexed_count(),
             points_values_count: self.memory.trues_count() + self.memory.falses_count(),
             histogram_bucket_size: None,
+            index_type: "simple_bool",
+        }
+    }
+
+    pub fn check_values_any(&self, point_id: PointOffsetType, is_true: bool) -> bool {
+        if is_true {
+            self.values_has_true(point_id)
+        } else {
+            self.values_has_false(point_id)
         }
     }
 
@@ -232,12 +244,21 @@ impl BoolIndex {
         self.memory.get(point_id).has_false()
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (bool, IdIter<'_>)> + '_ {
-        vec![
+    pub fn iter_values_map(&self) -> impl Iterator<Item = (bool, IdIter)> {
+        [
             (false, Box::new(self.memory.iter_has_false()) as IdIter),
             (true, Box::new(self.memory.iter_has_true()) as IdIter),
         ]
         .into_iter()
+    }
+
+    pub fn iter_values(&self) -> impl Iterator<Item = bool> + '_ {
+        [
+            self.memory.iter_has_true().next().map(|_| true),
+            self.memory.iter_has_false().next().map(|_| false),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     pub fn iter_counts_per_value(&self) -> impl Iterator<Item = (bool, usize)> + '_ {
@@ -247,9 +268,20 @@ impl BoolIndex {
         ]
         .into_iter()
     }
+
+    pub(crate) fn get_point_values(&self, point_id: u32) -> Vec<bool> {
+        let boolean_item = self.memory.get(point_id);
+        [
+            boolean_item.has_true().then_some(true),
+            boolean_item.has_false().then_some(false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
 }
 
-pub struct BoolIndexBuilder(BoolIndex);
+pub struct BoolIndexBuilder(SimpleBoolIndex);
 
 impl FieldIndexBuilderTrait for BoolIndexBuilder {
     type FieldIndexType = BoolIndex;
@@ -258,16 +290,21 @@ impl FieldIndexBuilderTrait for BoolIndexBuilder {
         self.0.db_wrapper.recreate_column_family()
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.0.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.0.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
-        Ok(self.0)
+        Ok(BoolIndex::Simple(self.0))
     }
 }
 
-impl PayloadFieldIndex for BoolIndex {
+impl PayloadFieldIndex for SimpleBoolIndex {
     fn load(&mut self) -> OperationResult<bool> {
         if !self.db_wrapper.has_column_family()? {
             return Ok(false);
@@ -299,6 +336,7 @@ impl PayloadFieldIndex for BoolIndex {
     fn filter<'a>(
         &'a self,
         condition: &'a crate::types::FieldCondition,
+        _: &'a HardwareCounterCell,
     ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
         match &condition.r#match {
             Some(Match::Value(MatchValue {
@@ -314,7 +352,11 @@ impl PayloadFieldIndex for BoolIndex {
         }
     }
 
-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+    fn estimate_cardinality(
+        &self,
+        condition: &FieldCondition,
+        _: &HardwareCounterCell,
+    ) -> Option<CardinalityEstimation> {
         match &condition.r#match {
             Some(Match::Value(MatchValue {
                 value: ValueVariants::Bool(value),
@@ -371,10 +413,15 @@ impl PayloadFieldIndex for BoolIndex {
     }
 }
 
-impl ValueIndexer for BoolIndex {
+impl ValueIndexer for SimpleBoolIndex {
     type ValueType = bool;
 
-    fn add_many(&mut self, id: PointOffsetType, values: Vec<bool>) -> OperationResult<()> {
+    fn add_many(
+        &mut self,
+        id: PointOffsetType,
+        values: Vec<bool>,
+        _: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         if values.is_empty() {
             return Ok(());
         }
@@ -386,7 +433,9 @@ impl ValueIndexer for BoolIndex {
 
         self.memory.set_or_insert(id, &item);
 
-        self.db_wrapper.put(id.to_be_bytes(), item.as_bytes())?;
+        let item_bytes = item.as_bytes();
+
+        self.db_wrapper.put(id.to_be_bytes(), item_bytes)?;
 
         Ok(())
     }

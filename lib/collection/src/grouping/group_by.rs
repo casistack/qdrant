@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use api::rest::{BaseGroupRequest, SearchGroupsRequestInternal, SearchRequestInternal};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use fnv::FnvBuildHasher;
@@ -88,6 +88,7 @@ impl GroupRequest {
         read_consistency: Option<ReadConsistency>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<QueryGroupRequest>
     where
         F: Fn(String) -> Fut,
@@ -102,6 +103,7 @@ impl GroupRequest {
                     collection_by_name,
                     read_consistency,
                     timeout,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
 
@@ -119,6 +121,7 @@ impl GroupRequest {
                     collection_by_name,
                     read_consistency,
                     timeout,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
                 query_req.try_into_shard_request(&collection.id, &referenced_vectors)?
@@ -147,7 +150,7 @@ impl QueryGroupRequest {
         read_consistency: Option<ReadConsistency>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let mut request = self.source.clone();
 
@@ -283,8 +286,8 @@ impl From<CollectionQueryGroupsRequest> for GroupRequest {
         } = request;
 
         let collection_query_request = CollectionQueryRequest {
-            prefetch: prefetch.into_iter().map(From::from).collect(),
-            query: query.map(From::from),
+            prefetch: prefetch.into_iter().collect(),
+            query,
             using,
             filter,
             score_threshold,
@@ -301,7 +304,7 @@ impl From<CollectionQueryGroupsRequest> for GroupRequest {
             group_by,
             group_size,
             limit,
-            with_lookup: with_lookup_interface.map(Into::into),
+            with_lookup: with_lookup_interface,
         }
     }
 }
@@ -313,7 +316,7 @@ pub async fn group_by(
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
     timeout: Option<Duration>,
-    hw_measurement_acc: &HwMeasurementAcc,
+    hw_measurement_acc: HwMeasurementAcc,
 ) -> CollectionResult<Vec<PointGroup>> {
     let start = std::time::Instant::now();
     let collection_params = collection.collection_config.read().await.params.clone();
@@ -374,7 +377,7 @@ pub async fn group_by(
                 read_consistency,
                 shard_selection.clone(),
                 timeout,
-                hw_measurement_acc,
+                hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -437,7 +440,7 @@ pub async fn group_by(
                     read_consistency,
                     shard_selection.clone(),
                     timeout,
-                    hw_measurement_acc,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
 
@@ -467,7 +470,7 @@ pub async fn group_by(
     let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
 
     // enrich with payload and vector
-    let enriched_points: HashMap<_, _> = collection
+    let enriched_points: AHashMap<_, _> = collection
         .fill_search_result_with_payload(
             bare_points,
             Some(request.source.with_payload),
@@ -475,6 +478,7 @@ pub async fn group_by(
             read_consistency,
             &shard_selection,
             timeout,
+            hw_measurement_acc.clone(),
         )
         .await?
         .into_iter()
@@ -550,9 +554,9 @@ fn increase_limit_for_group(shard_prefetch: &mut ShardPrefetch, group_size: usiz
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
+    use ahash::AHashMap;
     use segment::data_types::groups::GroupId;
+    use segment::payload_json;
     use segment::types::{Payload, ScoredPoint};
 
     use crate::grouping::types::Group;
@@ -598,8 +602,8 @@ mod tests {
             groups.push(group);
         });
 
-        let payload_a = Payload::from(serde_json::json!({"some_key": "some value a"}));
-        let payload_b = Payload::from(serde_json::json!({"some_key": "some value b"}));
+        let payload_a = payload_json! {"some_key": "some value a"};
+        let payload_b = payload_json! {"some_key": "some value b"};
 
         let hydrated = vec![
             make_scored_point(1, 1.0, Some(payload_a.clone())),
@@ -608,7 +612,7 @@ mod tests {
             make_scored_point(4, 1.0, Some(payload_b.clone())),
         ];
 
-        let set: HashMap<_, _> = hydrated.into_iter().map(|p| (p.id, p)).collect();
+        let set: AHashMap<_, _> = hydrated.into_iter().map(|p| (p.id, p)).collect();
 
         // act
         groups.iter_mut().for_each(|group| group.hydrate_from(&set));
@@ -621,13 +625,15 @@ mod tests {
         let a = groups.first().unwrap();
         let b = groups.get(1).unwrap();
 
-        assert!(a
-            .hits
-            .iter()
-            .all(|x| x.payload.as_ref() == Some(&payload_a)));
-        assert!(b
-            .hits
-            .iter()
-            .all(|x| x.payload.as_ref() == Some(&payload_b)));
+        assert!(
+            a.hits
+                .iter()
+                .all(|x| x.payload.as_ref() == Some(&payload_a)),
+        );
+        assert!(
+            b.hits
+                .iter()
+                .all(|x| x.payload.as_ref() == Some(&payload_b)),
+        );
     }
 }

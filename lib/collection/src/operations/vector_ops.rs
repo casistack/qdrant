@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use api::rest::schema::ShardKeySelector;
 use api::rest::PointVectors;
+use api::rest::schema::ShardKeySelector;
 use schemars::JsonSchema;
-use segment::types::{Filter, PointIdType};
+use segment::types::{Filter, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
 use validator::Validate;
 
 use super::point_ops::{PointIdsList, VectorStructPersisted};
-use super::{point_to_shards, split_iter_by_shard, OperationToShard, SplitByShard};
+use super::{OperationToShard, SplitByShard, point_to_shards, split_iter_by_shard};
 use crate::hash_ring::HashRingRouter;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -29,7 +29,7 @@ pub struct DeleteVectors {
     /// Vector names
     #[serde(alias = "vectors")]
     #[validate(length(min = 1, message = "must specify vector names to delete"))]
-    pub vector: HashSet<String>,
+    pub vector: HashSet<VectorNameBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
 }
@@ -47,9 +47,9 @@ pub enum VectorOperations {
     /// Update vectors
     UpdateVectors(UpdateVectorsOp),
     /// Delete vectors if exists
-    DeleteVectors(PointIdsList, Vec<String>),
+    DeleteVectors(PointIdsList, Vec<VectorNameBuf>),
     /// Delete vectors by given filter criteria
-    DeleteVectorsByFilter(Filter, Vec<String>),
+    DeleteVectorsByFilter(Filter, Vec<VectorNameBuf>),
 }
 
 impl VectorOperations {

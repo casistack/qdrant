@@ -234,6 +234,16 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "details_level",
+            "in": "query",
+            "description": "Level of details in telemetry data. Minimal level is 0, maximal is infinity",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -4751,6 +4761,7 @@
     },
     "/collections/{collection_name}/points/search": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -4862,6 +4873,7 @@
     },
     "/collections/{collection_name}/points/search/batch": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -4976,6 +4988,7 @@
     },
     "/collections/{collection_name}/points/search/groups": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -5084,6 +5097,7 @@
     },
     "/collections/{collection_name}/points/recommend": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -5195,6 +5209,7 @@
     },
     "/collections/{collection_name}/points/recommend/batch": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -5309,6 +5324,7 @@
     },
     "/collections/{collection_name}/points/recommend/groups": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -5417,6 +5433,7 @@
     },
     "/collections/{collection_name}/points/discover": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -5528,6 +5545,7 @@
     },
     "/collections/{collection_name}/points/discover/batch": {
       "post": {
+        "deprecated": true,
         "tags": [
           "Search"
         ],
@@ -6686,7 +6704,7 @@
           "strict_mode_config": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/StrictModeConfig"
+                "$ref": "#/components/schemas/StrictModeConfigOutput"
               },
               {
                 "nullable": true
@@ -7179,7 +7197,7 @@
             "default": null,
             "type": "integer",
             "format": "uint",
-            "minimum": 0,
+            "minimum": 1,
             "nullable": true
           },
           "memmap_threshold": {
@@ -7235,7 +7253,7 @@
           }
         }
       },
-      "StrictModeConfig": {
+      "StrictModeConfigOutput": {
         "type": "object",
         "properties": {
           "enabled": {
@@ -7258,12 +7276,12 @@
             "nullable": true
           },
           "unindexed_filtering_retrieve": {
-            "description": "Allow usage of unindexed fields in retrieval based (eg. search) filters.",
+            "description": "Allow usage of unindexed fields in retrieval based (e.g. search) filters.",
             "type": "boolean",
             "nullable": true
           },
           "unindexed_filtering_update": {
-            "description": "Allow usage of unindexed fields in filtered updates (eg. delete by payload).",
+            "description": "Allow usage of unindexed fields in filtered updates (e.g. delete by payload).",
             "type": "boolean",
             "nullable": true
           },
@@ -7293,21 +7311,107 @@
             "nullable": true
           },
           "max_collection_vector_size_bytes": {
-            "description": "Max size of a collections vector storage in bytes",
+            "description": "Max size of a collections vector storage in bytes, ignoring replicas.",
             "type": "integer",
             "format": "uint",
             "minimum": 0,
             "nullable": true
           },
-          "read_rate_limit_per_sec": {
-            "description": "Max number of read operations per second per shard per peer",
+          "read_rate_limit": {
+            "description": "Max number of read operations per minute per replica",
             "type": "integer",
             "format": "uint",
             "minimum": 0,
             "nullable": true
           },
-          "write_rate_limit_per_sec": {
-            "description": "Max number of write operations per second per shard per peer",
+          "write_rate_limit": {
+            "description": "Max number of write operations per minute per replica",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_collection_payload_size_bytes": {
+            "description": "Max size of a collections payload storage in bytes",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_points_count": {
+            "description": "Max number of points estimated in a collection",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "filter_max_conditions": {
+            "description": "Max conditions a filter can have.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "condition_max_size": {
+            "description": "Max size of a condition, eg. items in `MatchAny`.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "multivector_config": {
+            "description": "Multivector configuration",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrictModeMultivectorConfigOutput"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "sparse_config": {
+            "description": "Sparse vector configuration",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrictModeSparseConfigOutput"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "StrictModeMultivectorConfigOutput": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/StrictModeMultivectorOutput"
+        }
+      },
+      "StrictModeMultivectorOutput": {
+        "type": "object",
+        "properties": {
+          "max_vectors": {
+            "description": "Max number of vectors in a multivector",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
+      "StrictModeSparseConfigOutput": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/StrictModeSparseOutput"
+        }
+      },
+      "StrictModeSparseOutput": {
+        "type": "object",
+        "properties": {
+          "max_length": {
+            "description": "Max length of sparse vector",
             "type": "integer",
             "format": "uint",
             "minimum": 0,
@@ -7561,6 +7665,11 @@
         "properties": {
           "type": {
             "$ref": "#/components/schemas/BoolIndexType"
+          },
+          "on_disk": {
+            "description": "If true, store the index on disk. Default: false.",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -8246,7 +8355,7 @@
             ]
           },
           "geo_bounding_box": {
-            "description": "Check if points geo location lies in a given area",
+            "description": "Check if points geolocation lies in a given area",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/GeoBoundingBox"
@@ -8288,6 +8397,16 @@
                 "nullable": true
               }
             ]
+          },
+          "is_empty": {
+            "description": "Check that the field is empty, alternative syntax for `is_empty: \"field_name\"`",
+            "type": "boolean",
+            "nullable": true
+          },
+          "is_null": {
+            "description": "Check that the field is null, alternative syntax for `is_null: \"field_name\"`",
+            "type": "boolean",
+            "nullable": true
           }
         }
       },
@@ -9002,11 +9121,12 @@
         ]
       },
       "RecommendStrategy": {
-        "description": "How to use positive and negative examples to find the results, default is `average_vector`:\n\n* `average_vector` - Average positive and negative vectors and create a single query with the formula `query = avg_pos + avg_pos - avg_neg`. Then performs normal search.\n\n* `best_score` - Uses custom search objective. Each candidate is compared against all examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`. If the `max_neg_score` is chosen then it is squared and negated, otherwise it is just the `max_pos_score`.",
+        "description": "How to use positive and negative examples to find the results, default is `average_vector`:\n\n* `average_vector` - Average positive and negative vectors and create a single query with the formula `query = avg_pos + avg_pos - avg_neg`. Then performs normal search.\n\n* `best_score` - Uses custom search objective. Each candidate is compared against all examples, its score is then chosen from the `max(max_pos_score, max_neg_score)`. If the `max_neg_score` is chosen then it is squared and negated, otherwise it is just the `max_pos_score`.\n\n* `sum_scores` - Uses custom search objective. Compares against all inputs, sums all the scores. Scores against positive vectors are added, against negatives are subtracted.",
         "type": "string",
         "enum": [
           "average_vector",
-          "best_score"
+          "best_score",
+          "sum_scores"
         ]
       },
       "UsingVector": {
@@ -9412,7 +9532,7 @@
             "description": "Do not create segments larger this size (in kilobytes). Large segments might require disproportionately long indexation times, therefore it makes sense to limit the size of segments.\n\nIf indexation speed have more priority for your - make this parameter lower. If search speed is more important - make this parameter higher. Note: 1Kb = 1 vector of size 256",
             "type": "integer",
             "format": "uint",
-            "minimum": 0,
+            "minimum": 1,
             "nullable": true
           },
           "memmap_threshold": {
@@ -9437,13 +9557,35 @@
             "nullable": true
           },
           "max_optimization_threads": {
-            "description": "Max number of threads (jobs) for running optimizations per shard. Note: each optimization job will also use `max_indexing_threads` threads by itself for index building. If null - have no limit and choose dynamically to saturate CPU. If 0 - no optimization threads, optimizations will be disabled.",
-            "type": "integer",
-            "format": "uint",
-            "minimum": 0,
-            "nullable": true
+            "description": "Max number of threads (jobs) for running optimizations per shard. Note: each optimization job will also use `max_indexing_threads` threads by itself for index building. If \"auto\" - have no limit and choose dynamically to saturate CPU. If 0 - no optimization threads, optimizations will be disabled.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MaxOptimizationThreads"
+              },
+              {
+                "nullable": true
+              }
+            ]
           }
         }
+      },
+      "MaxOptimizationThreads": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/MaxOptimizationThreadsSetting"
+          },
+          {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        ]
+      },
+      "MaxOptimizationThreadsSetting": {
+        "type": "string",
+        "enum": [
+          "auto"
+        ]
       },
       "InitFrom": {
         "description": "Operation for creating new collection and (optionally) specify index params",
@@ -9454,6 +9596,172 @@
         "properties": {
           "collection": {
             "type": "string"
+          }
+        }
+      },
+      "StrictModeConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "description": "Whether strict mode is enabled for a collection or not.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "max_query_limit": {
+            "description": "Max allowed `limit` parameter for all APIs that don't have their own max limit.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "max_timeout": {
+            "description": "Max allowed `timeout` parameter.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "unindexed_filtering_retrieve": {
+            "description": "Allow usage of unindexed fields in retrieval based (e.g. search) filters.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "unindexed_filtering_update": {
+            "description": "Allow usage of unindexed fields in filtered updates (e.g. delete by payload).",
+            "type": "boolean",
+            "nullable": true
+          },
+          "search_max_hnsw_ef": {
+            "description": "Max HNSW value allowed in search parameters.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "search_allow_exact": {
+            "description": "Whether exact search is allowed or not.",
+            "type": "boolean",
+            "nullable": true
+          },
+          "search_max_oversampling": {
+            "description": "Max oversampling value allowed in search.",
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "upsert_max_batchsize": {
+            "description": "Max batchsize when upserting",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_collection_vector_size_bytes": {
+            "description": "Max size of a collections vector storage in bytes, ignoring replicas.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "read_rate_limit": {
+            "description": "Max number of read operations per minute per replica",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "write_rate_limit": {
+            "description": "Max number of write operations per minute per replica",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "max_collection_payload_size_bytes": {
+            "description": "Max size of a collections payload storage in bytes",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "max_points_count": {
+            "description": "Max number of points estimated in a collection",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          },
+          "filter_max_conditions": {
+            "description": "Max conditions a filter can have.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "condition_max_size": {
+            "description": "Max size of a condition, eg. items in `MatchAny`.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "multivector_config": {
+            "description": "Multivector configuration",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrictModeMultivectorConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "sparse_config": {
+            "description": "Sparse vector configuration",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrictModeSparseConfig"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "StrictModeMultivectorConfig": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/StrictModeMultivector"
+        }
+      },
+      "StrictModeMultivector": {
+        "type": "object",
+        "properties": {
+          "max_vectors": {
+            "description": "Max number of vectors in a multivector",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
+          }
+        }
+      },
+      "StrictModeSparseConfig": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/StrictModeSparse"
+        }
+      },
+      "StrictModeSparse": {
+        "type": "object",
+        "properties": {
+          "max_length": {
+            "description": "Max length of sparse vector",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 1,
+            "nullable": true
           }
         }
       },
@@ -10666,7 +10974,10 @@
           "Partial",
           "Initializing",
           "Listener",
-          "Recovery"
+          "PartialSnapshot",
+          "Recovery",
+          "Resharding",
+          "ReshardingScaleDown"
         ]
       },
       "RemoteShardInfo": {
@@ -10718,6 +11029,13 @@
             "type": "integer",
             "format": "uint32",
             "minimum": 0
+          },
+          "to_shard_id": {
+            "description": "Target shard ID if different than source shard ID\n\nUsed exclusively with `ReshardStreamRecords` transfer method.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "nullable": true
           },
           "from": {
             "description": "Source peer id",
@@ -10775,6 +11093,13 @@
             "enum": [
               "wal_delta"
             ]
+          },
+          {
+            "description": "Shard transfer for resharding: stream all records in batches until all points are transferred.",
+            "type": "string",
+            "enum": [
+              "resharding_stream_records"
+            ]
           }
         ]
       },
@@ -10808,11 +11133,6 @@
                 "nullable": true
               }
             ]
-          },
-          "comment": {
-            "description": "A human-readable report of the operation progress. Available only on the source peer.",
-            "type": "string",
-            "nullable": true
           }
         }
       },
@@ -10839,10 +11159,8 @@
         "type": "object",
         "required": [
           "app",
-          "cluster",
           "collections",
-          "id",
-          "requests"
+          "id"
         ],
         "properties": {
           "id": {
@@ -10855,10 +11173,24 @@
             "$ref": "#/components/schemas/CollectionsTelemetry"
           },
           "cluster": {
-            "$ref": "#/components/schemas/ClusterTelemetry"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClusterTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "requests": {
-            "$ref": "#/components/schemas/RequestsTelemetry"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RequestsTelemetry"
+              },
+              {
+                "nullable": true
+              }
+            ]
           },
           "memory": {
             "anyOf": [
@@ -11069,10 +11401,7 @@
         "required": [
           "config",
           "id",
-          "init_time_ms",
-          "resharding",
-          "shards",
-          "transfers"
+          "init_time_ms"
         ],
         "properties": {
           "id": {
@@ -11084,29 +11413,39 @@
             "minimum": 0
           },
           "config": {
-            "$ref": "#/components/schemas/CollectionConfigInternal"
+            "$ref": "#/components/schemas/CollectionConfigTelemetry"
           },
           "shards": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReplicaSetTelemetry"
-            }
+            },
+            "nullable": true
           },
           "transfers": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ShardTransferInfo"
-            }
+            },
+            "nullable": true
           },
           "resharding": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReshardingInfo"
-            }
+            },
+            "nullable": true
+          },
+          "shard_clean_tasks": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ShardCleanStatusTelemetry"
+            },
+            "nullable": true
           }
         }
       },
-      "CollectionConfigInternal": {
+      "CollectionConfigTelemetry": {
         "type": "object",
         "required": [
           "hnsw_config",
@@ -11141,7 +11480,7 @@
           "strict_mode_config": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/StrictModeConfig"
+                "$ref": "#/components/schemas/StrictModeConfigOutput"
               },
               {
                 "nullable": true
@@ -11207,7 +11546,6 @@
         "type": "object",
         "required": [
           "optimizations",
-          "segments",
           "total_optimized_points"
         ],
         "properties": {
@@ -11231,11 +11569,40 @@
             "format": "uint",
             "minimum": 0
           },
+          "vectors_size_bytes": {
+            "description": "An ESTIMATION of effective amount of bytes used for vectors Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "payloads_size_bytes": {
+            "description": "An estimation of the effective amount of bytes used for payloads Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_points": {
+            "description": "Sum of segment points This is an approximate number Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
+          "num_vectors": {
+            "description": "Sum of number of vectors in all segments This is an approximate number Do NOT rely on this number unless you know what you are doing",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "nullable": true
+          },
           "segments": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SegmentTelemetry"
-            }
+            },
+            "nullable": true
           },
           "optimizations": {
             "$ref": "#/components/schemas/OptimizerTelemetry"
@@ -11754,8 +12121,7 @@
       "OperationDurationStatistics": {
         "type": "object",
         "required": [
-          "count",
-          "total_duration_micros"
+          "count"
         ],
         "properties": {
           "count": {
@@ -11766,7 +12132,8 @@
           "fail_count": {
             "type": "integer",
             "format": "uint",
-            "minimum": 0
+            "minimum": 0,
+            "nullable": true
           },
           "avg_duration_micros": {
             "description": "The average time taken by 128 latest operations, calculated as a weighted mean.",
@@ -11790,7 +12157,8 @@
             "description": "The total duration of all operations in microseconds.",
             "type": "integer",
             "format": "uint64",
-            "minimum": 0
+            "minimum": 0,
+            "nullable": true
           },
           "last_responded": {
             "type": "string",
@@ -11802,6 +12170,7 @@
       "PayloadIndexTelemetry": {
         "type": "object",
         "required": [
+          "index_type",
           "points_count",
           "points_values_count"
         ],
@@ -11810,12 +12179,17 @@
             "type": "string",
             "nullable": true
           },
+          "index_type": {
+            "type": "string"
+          },
           "points_values_count": {
+            "description": "The amount of values indexed for all points.",
             "type": "integer",
             "format": "uint",
             "minimum": 0
           },
           "points_count": {
+            "description": "The amount of points that have at least one value indexed.",
             "type": "integer",
             "format": "uint",
             "minimum": 0
@@ -11831,7 +12205,6 @@
       "OptimizerTelemetry": {
         "type": "object",
         "required": [
-          "log",
           "optimizations",
           "status"
         ],
@@ -11846,7 +12219,8 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/TrackerTelemetry"
-            }
+            },
+            "nullable": true
           }
         }
       },
@@ -11949,6 +12323,66 @@
           },
           "updates": {
             "$ref": "#/components/schemas/OperationDurationStatistics"
+          }
+        }
+      },
+      "ShardCleanStatusTelemetry": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "started",
+              "done",
+              "cancelled"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "progress"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/ShardCleanStatusProgressTelemetry"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "failed"
+            ],
+            "properties": {
+              "failed": {
+                "$ref": "#/components/schemas/ShardCleanStatusFailedTelemetry"
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ShardCleanStatusProgressTelemetry": {
+        "type": "object",
+        "required": [
+          "deleted_points"
+        ],
+        "properties": {
+          "deleted_points": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
+      "ShardCleanStatusFailedTelemetry": {
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string"
           }
         }
       },
@@ -12236,10 +12670,46 @@
         "description": "Usage of the hardware resources, spent to process the request",
         "type": "object",
         "required": [
-          "cpu"
+          "cpu",
+          "payload_index_io_read",
+          "payload_index_io_write",
+          "payload_io_read",
+          "payload_io_write",
+          "vector_io_read",
+          "vector_io_write"
         ],
         "properties": {
           "cpu": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "payload_io_read": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "payload_io_write": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "payload_index_io_read": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "payload_index_io_write": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "vector_io_read": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "vector_io_write": {
             "type": "integer",
             "format": "uint",
             "minimum": 0
@@ -12268,6 +12738,12 @@
           },
           {
             "$ref": "#/components/schemas/RestartTransferOperation"
+          },
+          {
+            "$ref": "#/components/schemas/StartReshardingOperation"
+          },
+          {
+            "$ref": "#/components/schemas/AbortReshardingOperation"
           }
         ]
       },
@@ -12538,6 +13014,58 @@
             "$ref": "#/components/schemas/ShardTransferMethod"
           }
         }
+      },
+      "StartReshardingOperation": {
+        "type": "object",
+        "required": [
+          "start_resharding"
+        ],
+        "properties": {
+          "start_resharding": {
+            "$ref": "#/components/schemas/StartResharding"
+          }
+        }
+      },
+      "StartResharding": {
+        "type": "object",
+        "required": [
+          "direction"
+        ],
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/ReshardingDirection"
+          },
+          "peer_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "shard_key": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShardKey"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          }
+        }
+      },
+      "AbortReshardingOperation": {
+        "type": "object",
+        "required": [
+          "abort_resharding"
+        ],
+        "properties": {
+          "abort_resharding": {
+            "$ref": "#/components/schemas/AbortResharding"
+          }
+        }
+      },
+      "AbortResharding": {
+        "type": "object"
       },
       "SearchRequestBatch": {
         "type": "object",
@@ -13775,6 +14303,9 @@
             "$ref": "#/components/schemas/FusionQuery"
           },
           {
+            "$ref": "#/components/schemas/FormulaQuery"
+          },
+          {
             "$ref": "#/components/schemas/SampleQuery"
           }
         ]
@@ -13944,6 +14475,351 @@
           "rrf",
           "dbsf"
         ]
+      },
+      "FormulaQuery": {
+        "type": "object",
+        "required": [
+          "formula"
+        ],
+        "properties": {
+          "formula": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "defaults": {
+            "default": {},
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "Expression": {
+        "anyOf": [
+          {
+            "type": "number",
+            "format": "float"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/components/schemas/Condition"
+          },
+          {
+            "$ref": "#/components/schemas/GeoDistance"
+          },
+          {
+            "$ref": "#/components/schemas/DatetimeExpression"
+          },
+          {
+            "$ref": "#/components/schemas/DatetimeKeyExpression"
+          },
+          {
+            "$ref": "#/components/schemas/MultExpression"
+          },
+          {
+            "$ref": "#/components/schemas/SumExpression"
+          },
+          {
+            "$ref": "#/components/schemas/NegExpression"
+          },
+          {
+            "$ref": "#/components/schemas/AbsExpression"
+          },
+          {
+            "$ref": "#/components/schemas/DivExpression"
+          },
+          {
+            "$ref": "#/components/schemas/SqrtExpression"
+          },
+          {
+            "$ref": "#/components/schemas/PowExpression"
+          },
+          {
+            "$ref": "#/components/schemas/ExpExpression"
+          },
+          {
+            "$ref": "#/components/schemas/Log10Expression"
+          },
+          {
+            "$ref": "#/components/schemas/LnExpression"
+          },
+          {
+            "$ref": "#/components/schemas/LinDecayExpression"
+          },
+          {
+            "$ref": "#/components/schemas/ExpDecayExpression"
+          },
+          {
+            "$ref": "#/components/schemas/GaussDecayExpression"
+          }
+        ]
+      },
+      "GeoDistance": {
+        "type": "object",
+        "required": [
+          "geo_distance"
+        ],
+        "properties": {
+          "geo_distance": {
+            "$ref": "#/components/schemas/GeoDistanceParams"
+          }
+        }
+      },
+      "GeoDistanceParams": {
+        "type": "object",
+        "required": [
+          "origin",
+          "to"
+        ],
+        "properties": {
+          "origin": {
+            "$ref": "#/components/schemas/GeoPoint"
+          },
+          "to": {
+            "description": "Payload field with the destination geo point",
+            "type": "string"
+          }
+        }
+      },
+      "DatetimeExpression": {
+        "type": "object",
+        "required": [
+          "datetime"
+        ],
+        "properties": {
+          "datetime": {
+            "type": "string"
+          }
+        }
+      },
+      "DatetimeKeyExpression": {
+        "type": "object",
+        "required": [
+          "datetime_key"
+        ],
+        "properties": {
+          "datetime_key": {
+            "type": "string"
+          }
+        }
+      },
+      "MultExpression": {
+        "type": "object",
+        "required": [
+          "mult"
+        ],
+        "properties": {
+          "mult": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Expression"
+            }
+          }
+        }
+      },
+      "SumExpression": {
+        "type": "object",
+        "required": [
+          "sum"
+        ],
+        "properties": {
+          "sum": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Expression"
+            }
+          }
+        }
+      },
+      "NegExpression": {
+        "type": "object",
+        "required": [
+          "neg"
+        ],
+        "properties": {
+          "neg": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "AbsExpression": {
+        "type": "object",
+        "required": [
+          "abs"
+        ],
+        "properties": {
+          "abs": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "DivExpression": {
+        "type": "object",
+        "required": [
+          "div"
+        ],
+        "properties": {
+          "div": {
+            "$ref": "#/components/schemas/DivParams"
+          }
+        }
+      },
+      "DivParams": {
+        "type": "object",
+        "required": [
+          "left",
+          "right"
+        ],
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "right": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "by_zero_default": {
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          }
+        }
+      },
+      "SqrtExpression": {
+        "type": "object",
+        "required": [
+          "sqrt"
+        ],
+        "properties": {
+          "sqrt": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "PowExpression": {
+        "type": "object",
+        "required": [
+          "pow"
+        ],
+        "properties": {
+          "pow": {
+            "$ref": "#/components/schemas/PowParams"
+          }
+        }
+      },
+      "PowParams": {
+        "type": "object",
+        "required": [
+          "base",
+          "exponent"
+        ],
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "exponent": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "ExpExpression": {
+        "type": "object",
+        "required": [
+          "exp"
+        ],
+        "properties": {
+          "exp": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "Log10Expression": {
+        "type": "object",
+        "required": [
+          "log10"
+        ],
+        "properties": {
+          "log10": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "LnExpression": {
+        "type": "object",
+        "required": [
+          "ln"
+        ],
+        "properties": {
+          "ln": {
+            "$ref": "#/components/schemas/Expression"
+          }
+        }
+      },
+      "LinDecayExpression": {
+        "type": "object",
+        "required": [
+          "lin_decay"
+        ],
+        "properties": {
+          "lin_decay": {
+            "$ref": "#/components/schemas/DecayParamsExpression"
+          }
+        }
+      },
+      "DecayParamsExpression": {
+        "type": "object",
+        "required": [
+          "x"
+        ],
+        "properties": {
+          "x": {
+            "$ref": "#/components/schemas/Expression"
+          },
+          "target": {
+            "description": "The target value to start decaying from. Defaults to 0.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Expression"
+              },
+              {
+                "nullable": true
+              }
+            ]
+          },
+          "scale": {
+            "description": "The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          },
+          "midpoint": {
+            "description": "The midpoint of the decay. Defaults to 0.5. Output will be this value when `|x - target| == scale`.",
+            "type": "number",
+            "format": "float",
+            "nullable": true
+          }
+        }
+      },
+      "ExpDecayExpression": {
+        "type": "object",
+        "required": [
+          "exp_decay"
+        ],
+        "properties": {
+          "exp_decay": {
+            "$ref": "#/components/schemas/DecayParamsExpression"
+          }
+        }
+      },
+      "GaussDecayExpression": {
+        "type": "object",
+        "required": [
+          "gauss_decay"
+        ],
+        "properties": {
+          "gauss_decay": {
+            "$ref": "#/components/schemas/DecayParamsExpression"
+          }
+        }
       },
       "SampleQuery": {
         "type": "object",

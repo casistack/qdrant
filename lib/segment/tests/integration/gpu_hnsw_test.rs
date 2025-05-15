@@ -1,27 +1,28 @@
-use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::flags::FeatureFlags;
 use common::types::TelemetryDetail;
 use parking_lot::Mutex;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
-use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
 use segment::index::hnsw_index::gpu::gpu_devices_manager::LockedGpuDevice;
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
 use segment::json_path::JsonPath;
-use segment::segment_constructor::build_segment;
+use segment::payload_json;
+use segment::segment_constructor::VectorIndexBuildArgs;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, PayloadSchemaType,
-    Range, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, PayloadSchemaType, Range,
+    SearchParams, SeqNumberType,
 };
-use serde_json::json;
 use tempfile::Builder;
 
 /// Captured logs from env_logger. It's used to check that indexing was performed using GPU correctly.
@@ -71,38 +72,28 @@ fn test_gpu_filterable_hnsw() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
 
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-
     let int_key = "int";
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
         let vector = random_vector(&mut rnd, dim);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
 
         segment
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
 
@@ -122,29 +113,38 @@ fn test_gpu_filterable_hnsw() {
 
     payload_index_ptr
         .borrow_mut()
-        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new(int_key),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
-    let debug_messenger = gpu::PanicIfErrorMessenger {};
-    let instance = gpu::Instance::new(Some(&debug_messenger), None, false).unwrap();
+    let instance = gpu::GPU_TEST_INSTANCE.clone();
     let device =
         Mutex::new(gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap());
     let locked_device = LockedGpuDevice::new(device.lock());
 
-    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir.path(),
-        id_tracker: segment.id_tracker.clone(),
-        vector_storage: vector_storage.clone(),
-        quantized_vectors: quantized_vectors.clone(),
-        payload_index: payload_index_ptr.clone(),
-        hnsw_config,
-        permit: Some(permit),
-        gpu_device: Some(&locked_device), // enable GPU
-        stopped: &stopped,
-    })
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            quantized_vectors: quantized_vectors.clone(),
+            payload_index: payload_index_ptr.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: Some(&locked_device), // enable GPU
+            stopped: &stopped,
+            feature_flags: FeatureFlags::default(),
+        },
+    )
     .unwrap();
 
     let top = 3;
@@ -154,7 +154,7 @@ fn test_gpu_filterable_hnsw() {
         let query = random_vector(&mut rnd, dim).into();
 
         let range_size = 40;
-        let left_range = rnd.gen_range(0..400);
+        let left_range = rnd.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(

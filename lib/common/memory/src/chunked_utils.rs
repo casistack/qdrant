@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
+
+use ahash::AHashMap;
 
 use crate::madvise::{Advice, AdviceSetting};
 use crate::mmap_ops::{create_and_ensure_length, open_read_mmap, open_write_mmap};
@@ -40,6 +42,10 @@ impl<T: Sized + 'static> UniversalMmapChunk<T> {
     pub fn is_empty(&self) -> bool {
         self.mmap.is_empty()
     }
+
+    pub fn populate(&self) -> io::Result<()> {
+        self.mmap.populate()
+    }
 }
 
 /// Checks if the file name matches the pattern for mmap chunks
@@ -57,7 +63,7 @@ pub fn read_mmaps<T: Sized>(
     populate: bool,
     advice: AdviceSetting,
 ) -> Result<Vec<UniversalMmapChunk<T>>, MmapError> {
-    let mut mmap_files: HashMap<usize, _> = HashMap::new();
+    let mut mmap_files: AHashMap<usize, _> = AHashMap::new();
     for entry in directory.read_dir()? {
         let entry = entry?;
         let path = entry.path();

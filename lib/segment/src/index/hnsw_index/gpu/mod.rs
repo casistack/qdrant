@@ -68,28 +68,22 @@ fn create_graph_layers_builder(
     let mut graph_layers_builder =
         GraphLayersBuilder::new(num_vectors, m, m0, ef, entry_points_num, true);
 
-    // mark all vectors as ready
-    graph_layers_builder.clear_ready_list();
+    if let Some(first_point_id) = batched_points.first_point_id() {
+        // set first entry point
+        graph_layers_builder.get_entry_points().new_point(
+            first_point_id,
+            batched_points.levels_count() - 1,
+            |_| true,
+        );
 
-    // set first entry point
-    graph_layers_builder.set_levels(
-        batched_points.first_point_id(),
-        batched_points.levels_count() - 1,
-    );
-    graph_layers_builder.get_entry_points().new_point(
-        batched_points.first_point_id(),
-        batched_points.levels_count() - 1,
-        |_| true,
-    );
+        graph_layers_builder.set_ready(first_point_id);
 
-    // set levels
-    graph_layers_builder.set_levels(
-        batched_points.first_point_id(),
-        batched_points.levels_count() - 1,
-    );
-    for batch in batched_points.iter_batches(0) {
-        for linking_point in batch.points {
-            graph_layers_builder.set_levels(linking_point.point_id, batch.level);
+        // set levels
+        graph_layers_builder.set_levels(first_point_id, batched_points.levels_count() - 1);
+        for batch in batched_points.iter_batches(0) {
+            for linking_point in batch.points {
+                graph_layers_builder.set_levels(linking_point.point_id, batch.level);
+            }
         }
     }
 
@@ -99,29 +93,29 @@ fn create_graph_layers_builder(
 #[cfg(test)]
 mod tests {
     use ahash::HashSet;
+    use common::counter::hardware_counter::HardwareCounterCell;
     use common::types::PointOffsetType;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use tempfile::TempDir;
 
     use super::batched_points::BatchedPoints;
-    use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
     use crate::data_types::vectors::DenseVector;
     use crate::fixtures::index_fixtures::{FakeFilterContext, TestRawScorerProducer};
     use crate::fixtures::payload_fixtures::random_vector;
     use crate::index::hnsw_index::graph_layers::GraphLayers;
     use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
-    use crate::index::hnsw_index::graph_links::GraphLinksRam;
+    use crate::index::hnsw_index::graph_links::GraphLinksFormat;
     use crate::index::hnsw_index::point_scorer::FilteredScorer;
     use crate::spaces::simple::CosineMetric;
     use crate::types::Distance;
     use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
     use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
-    use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage, VectorStorageEnum};
 
-    #[allow(dead_code)]
     pub struct GpuGraphTestData {
-        pub dir: TempDir,
+        pub _temp_dir: TempDir,
         pub vector_storage: VectorStorageEnum,
         pub vector_holder: TestRawScorerProducer<CosineMetric>,
         pub graph_layers_builder: GraphLayersBuilder,
@@ -141,8 +135,8 @@ mod tests {
         let vector_holder = TestRawScorerProducer::<CosineMetric>::new(dim, num_vectors, &mut rng);
 
         // upload vectors to storage
-        let dir = tempfile::Builder::new().prefix("db_dir").tempdir().unwrap();
-        let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
+        let temp_dir = tempfile::Builder::new().prefix("db_dir").tempdir().unwrap();
+        let db = open_db(temp_dir.path(), &[DB_VECTOR_CF]).unwrap();
         let mut storage = open_simple_dense_vector_storage(
             db,
             DB_VECTOR_CF,
@@ -154,7 +148,11 @@ mod tests {
         for idx in 0..num_vectors {
             let v = vector_holder.get_vector(idx as PointOffsetType);
             storage
-                .insert_vector(idx as PointOffsetType, v.as_vec_ref())
+                .insert_vector(
+                    idx as PointOffsetType,
+                    v.as_vec_ref(),
+                    &HardwareCounterCell::new(),
+                )
                 .unwrap();
         }
 
@@ -177,7 +175,6 @@ mod tests {
             let raw_scorer = vector_holder.get_raw_scorer(added_vector.clone()).unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             graph_layers_builder.link_new_point(idx, scorer);
-            raw_scorer.take_hardware_counter().discard_results();
         }
 
         let search_vectors = (0..search_counts)
@@ -185,7 +182,7 @@ mod tests {
             .collect();
 
         GpuGraphTestData {
-            dir,
+            _temp_dir: temp_dir,
             vector_storage: storage,
             vector_holder,
             graph_layers_builder,
@@ -212,7 +209,7 @@ mod tests {
                     .read()
                     .clone();
                 if links_a != links_b {
-                    log::error!("Wrong links point_id={} at level {}", point_id, level);
+                    log::error!("Wrong links point_id={point_id} at level {level}");
                 }
                 assert_eq!(links_a, links_b);
             }
@@ -226,9 +223,10 @@ mod tests {
         ef: usize,
         accuracy: f32,
     ) {
-        let graph: GraphLayers<GraphLinksRam> = graph.into_graph_layers(None).unwrap();
-        let ref_graph: GraphLayers<GraphLinksRam> =
-            test.graph_layers_builder.into_graph_layers(None).unwrap();
+        let graph: GraphLayers = graph.into_graph_layers_ram(GraphLinksFormat::Plain);
+        let ref_graph: GraphLayers = test
+            .graph_layers_builder
+            .into_graph_layers_ram(GraphLinksFormat::Plain);
 
         let mut total_sames = 0;
         let total_top = top * test.search_vectors.len();
@@ -240,8 +238,9 @@ mod tests {
                 .unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
 
-            let search_result_gpu = graph.search(top, ef, scorer, None);
-            raw_scorer.take_hardware_counter().discard_results();
+            let search_result_gpu = graph
+                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .unwrap();
 
             let fake_filter_context = FakeFilterContext {};
             let raw_scorer = test
@@ -250,8 +249,9 @@ mod tests {
                 .unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
 
-            let search_result_cpu = ref_graph.search(top, ef, scorer, None);
-            raw_scorer.take_hardware_counter().discard_results();
+            let search_result_cpu = ref_graph
+                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .unwrap();
 
             let mut gpu_set = HashSet::default();
             let mut cpu_set = HashSet::default();

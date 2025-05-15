@@ -37,11 +37,12 @@ pub fn build_hnsw_on_gpu<'a>(
     ids: Vec<PointOffsetType>,
     // Scorer builder for CPU build.
     points_scorer_builder: impl Fn(
-            PointOffsetType,
-        )
-            -> OperationResult<(Box<dyn RawScorer + 'a>, Option<Box<dyn FilterContext + 'a>>)>
-        + Send
-        + Sync,
+        PointOffsetType,
+    ) -> OperationResult<(
+        Box<dyn RawScorer + 'a>,
+        Option<Box<dyn FilterContext + 'a>>,
+    )> + Send
+    + Sync,
     stopped: &AtomicBool,
 ) -> OperationResult<GraphLayersBuilder> {
     let num_vectors = reference_graph.links_layers().len();
@@ -57,6 +58,40 @@ pub fn build_hnsw_on_gpu<'a>(
         groups_count,
     )?;
 
+    let mut graph_layers_builder =
+        create_graph_layers_builder(&batched_points, num_vectors, m, m0, ef, entry_points_num);
+
+    // Link first points on CPU.
+    let mut cpu_linked_points_count = 0;
+    for batch in batched_points.iter_batches(0) {
+        for point in batch.points {
+            check_stopped(stopped)?;
+            let (raw_scorer, filter_context) = points_scorer_builder(point.point_id)?;
+            let points_scorer = FilteredScorer::new(raw_scorer.as_ref(), filter_context.as_deref());
+            graph_layers_builder.link_new_point(point.point_id, points_scorer);
+            cpu_linked_points_count += 1;
+            if cpu_linked_points_count >= cpu_linked_points {
+                break;
+            }
+        }
+        if cpu_linked_points_count >= cpu_linked_points {
+            break;
+        }
+    }
+
+    // Mark all points as ready, as GPU will fill layer by layer.
+    graph_layers_builder.fill_ready_list();
+
+    // Check if all points are linked on CPU.
+    // If there are no batches left, we can return result before gpu resources creation.
+    if batched_points
+        .iter_batches(cpu_linked_points_count)
+        .next()
+        .is_none()
+    {
+        return Ok(graph_layers_builder);
+    }
+
     // Create all GPU resources.
     let mut gpu_search_context = GpuInsertContext::new(
         gpu_vector_storage,
@@ -69,31 +104,9 @@ pub fn build_hnsw_on_gpu<'a>(
         1..MAX_VISITED_FLAGS_FACTOR,
     )?;
 
-    let graph_layers_builder =
-        create_graph_layers_builder(&batched_points, num_vectors, m, m0, ef, entry_points_num);
-
-    // Link first points on CPU.
-    let mut cpu_linked_points_count = 0;
-    for batch in batched_points.iter_batches(0) {
-        for point in batch.points {
-            check_stopped(stopped)?;
-            let (raw_scorer, filter_context) = points_scorer_builder(point.point_id)?;
-            let points_scorer = FilteredScorer::new(raw_scorer.as_ref(), filter_context.as_deref());
-            graph_layers_builder.link_new_point(point.point_id, points_scorer);
-            raw_scorer.take_hardware_counter().discard_results();
-            cpu_linked_points_count += 1;
-            if cpu_linked_points_count >= cpu_linked_points {
-                break;
-            }
-        }
-        if cpu_linked_points_count >= cpu_linked_points {
-            break;
-        }
-    }
-
     // Build all levels on GPU level by level.
     for level in (0..batched_points.levels_count()).rev() {
-        log::debug!("Starting GPU level {}", level,);
+        log::trace!("Starting GPU level {level}");
 
         gpu_search_context.upload_links(level, &graph_layers_builder, stopped)?;
         build_level_on_gpu(
@@ -118,8 +131,8 @@ mod tests {
     use super::*;
     use crate::fixtures::index_fixtures::FakeFilterContext;
     use crate::index::hnsw_index::gpu::tests::{
-        check_graph_layers_builders_quality, compare_graph_layers_builders,
-        create_gpu_graph_test_data, GpuGraphTestData,
+        GpuGraphTestData, check_graph_layers_builders_quality, compare_graph_layers_builders,
+        create_gpu_graph_test_data,
     };
     use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
 
@@ -130,8 +143,7 @@ mod tests {
         exact: bool,
     ) -> GraphLayersBuilder {
         let num_vectors = test.graph_layers_builder.links_layers().len();
-        let debug_messenger = gpu::PanicIfErrorMessenger {};
-        let instance = gpu::Instance::new(Some(&debug_messenger), None, false).unwrap();
+        let instance = gpu::GPU_TEST_INSTANCE.clone();
         let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
 
         let gpu_vector_storage = GpuVectorStorage::new(
@@ -236,5 +248,27 @@ mod tests {
             build_gpu_graph(&test, groups_count, min_cpu_linked_points_count, false);
 
         check_graph_layers_builders_quality(graph_layers_builder, test, top, ef, 0.8)
+    }
+
+    #[test]
+    fn test_gpu_empty_hnsw() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
+
+        let num_vectors = 0;
+        let dim = 64;
+        let m = 8;
+        let m0 = 16;
+        let ef = 32;
+        let groups_count = 4;
+        let searches_count = 20;
+        let min_cpu_linked_points_count = 64;
+
+        let test = create_gpu_graph_test_data(num_vectors, dim, m, m0, ef, searches_count);
+        let graph_layers_builder =
+            build_gpu_graph(&test, groups_count, min_cpu_linked_points_count, false);
+        assert!(graph_layers_builder.links_layers().is_empty());
     }
 }

@@ -2,13 +2,17 @@ use core::marker::{Send, Sync};
 use std::future::{self, Future};
 use std::path::Path;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::tar_ext;
 use common::types::TelemetryDetail;
-use segment::types::SnapshotFormat;
+use segment::data_types::segment_manifest::SegmentManifests;
+use segment::index::field_index::CardinalityEstimation;
+use segment::types::{Filter, SizeStats, SnapshotFormat};
 
 use super::local_shard::clock_map::RecoveryPoint;
 use super::update_tracker::UpdateTracker;
-use crate::operations::types::{CollectionError, CollectionResult};
+use crate::operations::operation_effect::{EstimateOperationEffectArea, OperationEffectArea};
+use crate::operations::types::{CollectionError, CollectionResult, OptimizersStatus};
 use crate::shards::dummy_shard::DummyShard;
 use crate::shards::forward_proxy_shard::ForwardProxyShard;
 use crate::shards::local_shard::LocalShard;
@@ -46,7 +50,7 @@ pub enum Shard {
 }
 
 impl Shard {
-    pub fn variant_name(&self) -> &str {
+    pub fn variant_name(&self) -> &'static str {
         match self {
             Shard::Local(_) => "local shard",
             Shard::Proxy(_) => "proxy shard",
@@ -82,6 +86,26 @@ impl Shard {
         };
         telemetry.variant_name = Some(self.variant_name().to_string());
         telemetry
+    }
+
+    pub fn get_optimization_status(&self) -> OptimizersStatus {
+        match self {
+            Shard::Local(local_shard) => local_shard.get_optimization_status(),
+            Shard::Proxy(proxy_shard) => proxy_shard.get_optimization_status(),
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_optimization_status(),
+            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.get_optimization_status(),
+            Shard::Dummy(dummy_shard) => dummy_shard.get_optimization_status(),
+        }
+    }
+
+    pub fn get_size_stats(&self) -> SizeStats {
+        match self {
+            Shard::Local(local_shard) => local_shard.get_size_stats(),
+            Shard::Proxy(proxy_shard) => proxy_shard.get_size_stats(),
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_size_stats(),
+            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.get_size_stats(),
+            Shard::Dummy(dummy_shard) => dummy_shard.get_size_stats(),
+        }
     }
 
     pub async fn create_snapshot(
@@ -120,6 +144,16 @@ impl Shard {
         }
     }
 
+    pub fn segment_manifests(&self) -> CollectionResult<SegmentManifests> {
+        match self {
+            Shard::Local(local_shard) => local_shard.segment_manifests(),
+            Shard::Proxy(proxy_shard) => proxy_shard.segment_manifests(),
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.segment_manifests(),
+            Shard::QueueProxy(proxy_shard) => proxy_shard.segment_manifests(),
+            Shard::Dummy(dummy_shard) => dummy_shard.segment_manifests(),
+        }
+    }
+
     pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         match self {
             Shard::Local(local_shard) => local_shard.on_optimizer_config_update().await,
@@ -130,7 +164,7 @@ impl Shard {
         }
     }
 
-    pub async fn on_strict_mode_config_update(&self) {
+    pub async fn on_strict_mode_config_update(&mut self) {
         match self {
             Shard::Local(local_shard) => local_shard.on_strict_mode_config_update().await,
             Shard::Proxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
@@ -228,7 +262,7 @@ impl Shard {
             Ok(Some(version)) => {
                 log::debug!(
                     "Resolved WAL delta from {version}, which counts {} records",
-                    wal.wal.lock().last_index().saturating_sub(version),
+                    wal.wal.lock().await.last_index().saturating_sub(version),
                 );
                 Ok(Some(version))
             }
@@ -244,9 +278,9 @@ impl Shard {
         }
     }
 
-    pub fn wal_version(&self) -> CollectionResult<Option<u64>> {
+    pub async fn wal_version(&self) -> CollectionResult<Option<u64>> {
         match self {
-            Self::Local(local_shard) => local_shard.wal.wal_version().map_err(|err| {
+            Self::Local(local_shard) => local_shard.wal.wal_version().await.map_err(|err| {
                 CollectionError::service_error(format!(
                     "Cannot get WAL version on {}: {err}",
                     self.variant_name(),
@@ -258,6 +292,38 @@ impl Shard {
                     "Cannot get WAL version on {}",
                     self.variant_name(),
                 )))
+            }
+        }
+    }
+
+    pub fn estimate_cardinality(
+        &self,
+        filter: Option<&Filter>,
+        hw_counter: &HardwareCounterCell,
+    ) -> CollectionResult<CardinalityEstimation> {
+        match self {
+            Shard::Local(local_shard) => local_shard.estimate_cardinality(filter, hw_counter),
+            Shard::Proxy(proxy_shard) => proxy_shard.estimate_cardinality(filter, hw_counter),
+            Shard::ForwardProxy(forward_proxy_shard) => {
+                forward_proxy_shard.estimate_cardinality(filter, hw_counter)
+            }
+            Shard::QueueProxy(queue_proxy_shard) => {
+                queue_proxy_shard.estimate_cardinality(filter, hw_counter)
+            }
+            Shard::Dummy(dummy_shard) => dummy_shard.estimate_cardinality(filter),
+        }
+    }
+
+    pub fn estimate_request_cardinality(
+        &self,
+        operation: &impl EstimateOperationEffectArea,
+        hw_counter: &HardwareCounterCell,
+    ) -> CollectionResult<CardinalityEstimation> {
+        match operation.estimate_effect_area() {
+            OperationEffectArea::Empty => Ok(CardinalityEstimation::exact(0)),
+            OperationEffectArea::Points(vec) => Ok(CardinalityEstimation::exact(vec.len())),
+            OperationEffectArea::Filter(filter) => {
+                self.estimate_cardinality(Some(filter), hw_counter)
             }
         }
     }

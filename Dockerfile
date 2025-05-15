@@ -12,7 +12,7 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} tonistiigi/xx AS xx
 # Utilizing Docker layer caching with `cargo-chef`.
 #
 # https://www.lpalmieri.com/posts/fast-rust-docker-builds/
-FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.82.0 AS chef
+FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.86.0 AS chef
 
 
 FROM chef AS planner
@@ -45,7 +45,7 @@ RUN apt-get update \
 ARG BUILDPLATFORM
 ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
 
-ARG MOLD_VERSION=2.31.0
+ARG MOLD_VERSION=2.36.0
 
 RUN case "$BUILDPLATFORM" in \
         */amd64 ) PLATFORM=x86_64 ;; \
@@ -120,7 +120,7 @@ FROM debian:12-slim AS qdrant-cpu
 
 
 # Base images for Qdrant with nvidia GPU support.
-FROM nvidia/opengl:1.0-glvnd-devel-ubuntu22.04 AS qdrant-gpu-nvidia
+FROM nvidia/opengl:1.2-glvnd-devel-ubuntu22.04 AS qdrant-gpu-nvidia
 # Set non-interactive mode for apt-get.
 ENV DEBIAN_FRONTEND=noninteractive
 # Set NVIDIA driver capabilities. By default, all capabilities are disabled.

@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use ahash::AHashSet;
 use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{
     Condition, Distance, Filter, PayloadFieldSchema, PayloadSchemaType, PointIdType,
@@ -25,14 +24,14 @@ pub const TEST_OPTIMIZERS_CONFIG: OptimizersConfig = OptimizersConfig {
     max_optimization_threads: Some(2),
 };
 
-pub fn create_collection_config() -> CollectionConfigInternal {
+pub fn create_collection_config_with_dim(dim: usize) -> CollectionConfigInternal {
     let wal_config = WalConfig {
         wal_capacity_mb: 1,
         wal_segments_ahead: 0,
     };
 
     let collection_params = CollectionParams {
-        vectors: VectorsConfig::Single(VectorParamsBuilder::new(4, Distance::Dot).build()),
+        vectors: VectorsConfig::Single(VectorParamsBuilder::new(dim as u64, Distance::Dot).build()),
         ..CollectionParams::empty()
     };
 
@@ -50,6 +49,10 @@ pub fn create_collection_config() -> CollectionConfigInternal {
         strict_mode_config: Default::default(),
         uuid: None,
     }
+}
+
+pub fn create_collection_config() -> CollectionConfigInternal {
+    create_collection_config_with_dim(4)
 }
 
 pub fn upsert_operation() -> CollectionUpdateOperations {
@@ -112,5 +115,5 @@ pub fn delete_point_operation(idx: u64) -> CollectionUpdateOperations {
 }
 
 pub fn filter_single_id(id: impl Into<PointIdType>) -> Filter {
-    Filter::new_must(Condition::HasId(HashSet::from([id.into()]).into()))
+    Filter::new_must(Condition::HasId(AHashSet::from([id.into()]).into()))
 }

@@ -55,6 +55,7 @@ pub fn intersect_compressed_postings_iterator<'a>(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_list::CompressedPostingList;
 

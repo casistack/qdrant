@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use bitvec::vec::BitVec;
+use common::counter::hardware_counter::HardwareCounterCell;
 use parking_lot::RwLock;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -10,7 +11,7 @@ use rocksdb::DB;
 use rstest::rstest;
 
 use super::*;
-use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use crate::data_types::vectors::{MultiDenseVectorInternal, QueryVector, VectorRef};
 use crate::fixtures::index_fixtures::random_vector;
 use crate::fixtures::payload_fixtures::random_dense_byte_vector;
@@ -29,7 +30,7 @@ use crate::vector_storage::multi_dense::simple_multi_dense_vector_storage::{
     open_simple_multi_dense_vector_storage, open_simple_multi_dense_vector_storage_byte,
     open_simple_multi_dense_vector_storage_half,
 };
-use crate::vector_storage::{new_raw_scorer, RawScorer};
+use crate::vector_storage::{RawScorer, new_raw_scorer_for_test};
 
 #[derive(Debug, Clone, Copy)]
 enum TestElementType {
@@ -89,11 +90,7 @@ fn test_gpu_vector_storage_sq(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing SQ distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing SQ distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -101,6 +98,7 @@ fn test_gpu_vector_storage_sq(
         dim,
         distance,
         Some(quantization_config.clone()),
+        false,
         false,
         precision,
     );
@@ -135,11 +133,7 @@ fn test_gpu_vector_storage_bq(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing BQ distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing BQ distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -147,6 +141,7 @@ fn test_gpu_vector_storage_bq(
         dim,
         distance,
         Some(quantization_config.clone()),
+        false,
         false,
         precision,
     );
@@ -180,11 +175,7 @@ fn test_gpu_vector_storage_pq(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing PQ distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing PQ distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -192,6 +183,7 @@ fn test_gpu_vector_storage_pq(
         dim,
         distance,
         Some(quantization_config.clone()),
+        false,
         false,
         precision,
     );
@@ -225,11 +217,7 @@ fn test_gpu_vector_storage(
 
     let precision = get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -237,6 +225,7 @@ fn test_gpu_vector_storage(
         dim,
         distance,
         None,
+        false,
         false,
         precision,
     );
@@ -261,11 +250,7 @@ fn test_gpu_vector_storage_force_half(
 
     let precision = 5.0 * get_precision(storage_type, dim, distance);
     log::info!(
-        "Testing distance {:?}, element type {:?}, dim {} with precision {}",
-        distance,
-        storage_type,
-        dim,
-        precision
+        "Testing distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
     );
     test_gpu_vector_storage_impl(
         storage_type,
@@ -274,6 +259,41 @@ fn test_gpu_vector_storage_force_half(
         distance,
         None,
         true, // force half precision
+        false,
+        precision,
+    );
+}
+
+#[rstest]
+fn test_gpu_vector_storage_without_half(
+    #[values(Distance::Cosine)] distance: Distance,
+    #[values(
+        TestStorageType::Dense(TestElementType::Float32),
+        TestStorageType::Multi(TestElementType::Float32),
+        TestStorageType::Dense(TestElementType::Float16),
+        TestStorageType::Multi(TestElementType::Float16)
+    )]
+    storage_type: TestStorageType,
+    #[values(15)] dim: usize,
+    #[values(2048 + 17)] num_vectors: usize,
+) {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Trace)
+        .try_init();
+
+    let precision = 5.0 * get_precision(storage_type, dim, distance);
+    log::info!(
+        "Testing distance {distance:?}, element type {storage_type:?}, dim {dim} with precision {precision}"
+    );
+    test_gpu_vector_storage_impl(
+        storage_type,
+        num_vectors,
+        dim,
+        distance,
+        None,
+        true, // force half precision
+        true, // skip half support
         precision,
     );
 }
@@ -341,7 +361,7 @@ fn create_vector_storage_f32(
         };
         let vec_ref = VectorRef::from(&vec);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -369,7 +389,7 @@ fn create_vector_storage_f16(
         };
         let vec_ref = VectorRef::from(&vec);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -397,7 +417,7 @@ fn create_vector_storage_u8(
         };
         let vec_ref = VectorRef::from(&vec);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -422,7 +442,7 @@ fn create_vector_storage_f32_multi(
     .unwrap();
     for i in 0..num_vectors {
         let mut vectors = vec![];
-        let num_vectors_per_points = 1 + rnd.gen::<usize>() % 3;
+        let num_vectors_per_points = 1 + rnd.random::<u8>() % 3;
         for _ in 0..num_vectors_per_points {
             let vec = random_vector(&mut rnd, dim);
             let vec = match distance {
@@ -438,7 +458,7 @@ fn create_vector_storage_f32_multi(
         let multivector = MultiDenseVectorInternal::new(vectors, dim);
         let vec_ref = VectorRef::from(&multivector);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -463,7 +483,7 @@ fn create_vector_storage_f16_multi(
     .unwrap();
     for i in 0..num_vectors {
         let mut vectors = vec![];
-        let num_vectors_per_points = 1 + rnd.gen::<usize>() % 3;
+        let num_vectors_per_points = 1 + rnd.random::<u8>() % 3;
         for _ in 0..num_vectors_per_points {
             let vec = random_vector(&mut rnd, dim);
             let vec = match distance {
@@ -485,7 +505,7 @@ fn create_vector_storage_f16_multi(
         let multivector = MultiDenseVectorInternal::new(vectors, dim);
         let vec_ref = VectorRef::from(&multivector);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
@@ -510,7 +530,7 @@ fn create_vector_storage_u8_multi(
     .unwrap();
     for i in 0..num_vectors {
         let mut vectors = vec![];
-        let num_vectors_per_points = 1 + rnd.gen::<usize>() % 3;
+        let num_vectors_per_points = 1 + rnd.random::<u8>() % 3;
         for _ in 0..num_vectors_per_points {
             let vec = random_dense_byte_vector(&mut rnd, dim);
             let vec = match distance {
@@ -532,12 +552,14 @@ fn create_vector_storage_u8_multi(
         let multivector = MultiDenseVectorInternal::new(vectors, dim);
         let vec_ref = VectorRef::from(&multivector);
         vector_storage
-            .insert_vector(i as PointOffsetType, vec_ref)
+            .insert_vector(i as PointOffsetType, vec_ref, &HardwareCounterCell::new())
             .unwrap();
     }
     vector_storage
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn test_gpu_vector_storage_impl(
     storage_type: TestStorageType,
     num_vectors: usize,
@@ -545,6 +567,7 @@ fn test_gpu_vector_storage_impl(
     distance: Distance,
     quantization_config: Option<QuantizationConfig>,
     force_half_precision: bool,
+    skip_half_support: bool,
     precision: f32,
 ) {
     let test_point_id: PointOffsetType = 0;
@@ -557,9 +580,14 @@ fn test_gpu_vector_storage_impl(
             .unwrap()
     });
 
-    let debug_messenger = gpu::PanicIfErrorMessenger {};
-    let instance = gpu::Instance::new(Some(&debug_messenger), None, false).unwrap();
-    let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
+    let instance = gpu::GPU_TEST_INSTANCE.clone();
+    let device = gpu::Device::new_with_params(
+        instance.clone(),
+        &instance.physical_devices()[0],
+        0,
+        skip_half_support,
+    )
+    .unwrap();
 
     let gpu_vector_storage = GpuVectorStorage::new(
         device.clone(),
@@ -578,13 +606,19 @@ fn test_gpu_vector_storage_impl(
         } else {
             match storage_type.element_type() {
                 TestElementType::Float32 => {
-                    if force_half_precision {
+                    if force_half_precision && device.has_half_precision() {
                         VectorStorageDatatype::Float16
                     } else {
                         VectorStorageDatatype::Float32
                     }
                 }
-                TestElementType::Float16 => VectorStorageDatatype::Float16,
+                TestElementType::Float16 => {
+                    if device.has_half_precision() {
+                        VectorStorageDatatype::Float16
+                    } else {
+                        VectorStorageDatatype::Float32
+                    }
+                }
                 TestElementType::Uint8 => VectorStorageDatatype::Uint8,
             }
         }
@@ -654,18 +688,18 @@ fn test_gpu_vector_storage_impl(
     context.run().unwrap();
     context.wait_finish(GPU_TIMEOUT).unwrap();
 
-    let mut gpu_scores = vec![0.0f32; num_vectors];
-    staging_buffer.download_slice(&mut gpu_scores, 0).unwrap();
+    let gpu_scores = staging_buffer.download_vec(0, num_vectors).unwrap();
 
-    let stopped = false.into();
     let point_deleted = BitVec::repeat(false, num_vectors);
     let query = QueryVector::Nearest(storage.get_vector(test_point_id).to_owned());
+
+    let hardware_counter = HardwareCounterCell::new();
     let scorer: Box<dyn RawScorer> = if let Some(quantized_vectors) = quantized_vectors.as_ref() {
         quantized_vectors
-            .raw_scorer(query, &point_deleted, &point_deleted, &stopped)
+            .raw_scorer(query, &point_deleted, &point_deleted, hardware_counter)
             .unwrap()
     } else {
-        new_raw_scorer(query, &storage, &point_deleted).unwrap()
+        new_raw_scorer_for_test(query, &storage, &point_deleted).unwrap()
     };
 
     for (point_id, gpu_score) in gpu_scores.iter().enumerate() {
@@ -675,6 +709,4 @@ fn test_gpu_vector_storage_impl(
         );
         assert!((score - gpu_score).abs() < precision);
     }
-
-    scorer.take_hardware_counter().discard_results();
 }

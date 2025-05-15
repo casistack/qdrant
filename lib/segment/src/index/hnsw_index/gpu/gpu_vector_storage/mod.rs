@@ -6,8 +6,8 @@ mod tests;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use common::types::PointOffsetType;
 use gpu_multivectors::GpuMultivectors;
@@ -16,7 +16,7 @@ use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin};
 use quantization::{EncodedStorage, EncodedVectorsPQ, EncodedVectorsU8};
 
 use super::shader_builder::ShaderBuilderParameters;
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorElementTypeHalf};
 use crate::index::hnsw_index::gpu::GPU_TIMEOUT;
@@ -137,13 +137,6 @@ impl GpuVectorStorage {
         force_half_precision: bool,
         stopped: &AtomicBool,
     ) -> OperationResult<Self> {
-        // GPU buffers should not be empty.
-        // Check that we have enough vectors to store at least one vector in each buffer.
-        if vector_storage.total_vector_count() < STORAGES_COUNT {
-            return Err(OperationError::service_error(
-                "Vectors count is less than `STORAGES_COUNT`",
-            ));
-        }
         if let Some(quantized_storage) = quantized_storage {
             Self::new_quantized(
                 device,
@@ -347,7 +340,7 @@ impl GpuVectorStorage {
                 Self::new_dense(device, vector_storage, stopped)
             }
             VectorStorageEnum::DenseSimpleHalf(vector_storage) => {
-                Self::new_dense(device, vector_storage, stopped)
+                Self::new_dense_f16(device, vector_storage, stopped)
             }
             VectorStorageEnum::DenseMemmap(vector_storage) => Self::new_dense_f32(
                 device,
@@ -359,7 +352,7 @@ impl GpuVectorStorage {
                 Self::new_dense(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::DenseMemmapHalf(vector_storage) => {
-                Self::new_dense(device, vector_storage.as_ref(), stopped)
+                Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::DenseAppendableMemmap(vector_storage) => Self::new_dense_f32(
                 device,
@@ -371,7 +364,7 @@ impl GpuVectorStorage {
                 Self::new_dense(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::DenseAppendableMemmapHalf(vector_storage) => {
-                Self::new_dense(device, vector_storage.as_ref(), stopped)
+                Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::DenseAppendableInRam(vector_storage) => Self::new_dense_f32(
                 device,
@@ -383,7 +376,7 @@ impl GpuVectorStorage {
                 Self::new_dense(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::DenseAppendableInRamHalf(vector_storage) => {
-                Self::new_dense(device, vector_storage.as_ref(), stopped)
+                Self::new_dense_f16(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::SparseSimple(_) => Err(OperationError::from(
                 gpu::GpuError::NotSupported("Sparse vectors are not supported on GPU".to_string()),
@@ -401,7 +394,7 @@ impl GpuVectorStorage {
                 Self::new_multi(device, vector_storage, stopped)
             }
             VectorStorageEnum::MultiDenseSimpleHalf(vector_storage) => {
-                Self::new_multi(device, vector_storage, stopped)
+                Self::new_multi_f16(device, vector_storage, stopped)
             }
             VectorStorageEnum::MultiDenseAppendableMemmap(vector_storage) => Self::new_multi_f32(
                 device.clone(),
@@ -413,7 +406,7 @@ impl GpuVectorStorage {
                 Self::new_multi(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::MultiDenseAppendableMemmapHalf(vector_storage) => {
-                Self::new_multi(device, vector_storage.as_ref(), stopped)
+                Self::new_multi_f16(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::MultiDenseAppendableInRam(vector_storage) => Self::new_multi_f32(
                 device.clone(),
@@ -425,7 +418,7 @@ impl GpuVectorStorage {
                 Self::new_multi(device, vector_storage.as_ref(), stopped)
             }
             VectorStorageEnum::MultiDenseAppendableInRamHalf(vector_storage) => {
-                Self::new_multi(device, vector_storage.as_ref(), stopped)
+                Self::new_multi_f16(device, vector_storage.as_ref(), stopped)
             }
         }
     }
@@ -436,7 +429,7 @@ impl GpuVectorStorage {
         force_half_precision: bool,
         stopped: &AtomicBool,
     ) -> OperationResult<Self> {
-        if force_half_precision {
+        if force_half_precision && device.has_half_precision() {
             Self::new_typed::<VectorElementTypeHalf>(
                 device,
                 vector_storage.distance(),
@@ -454,6 +447,32 @@ impl GpuVectorStorage {
             )
         } else {
             Self::new_dense(device, vector_storage, stopped)
+        }
+    }
+
+    fn new_dense_f16<TVectorStorage: DenseVectorStorage<VectorElementTypeHalf>>(
+        device: Arc<gpu::Device>,
+        vector_storage: &TVectorStorage,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Self> {
+        if device.has_half_precision() {
+            Self::new_dense(device, vector_storage, stopped)
+        } else {
+            Self::new_typed::<VectorElementType>(
+                device,
+                vector_storage.distance(),
+                vector_storage.total_vector_count(),
+                vector_storage.total_vector_count(),
+                vector_storage.vector_dim(),
+                (0..vector_storage.total_vector_count()).map(|id| {
+                    VectorElementTypeHalf::slice_to_float_cow(Cow::Borrowed(
+                        vector_storage.get_dense(id as PointOffsetType),
+                    ))
+                }),
+                None,
+                None,
+                stopped,
+            )
         }
     }
 
@@ -482,7 +501,7 @@ impl GpuVectorStorage {
         force_half_precision: bool,
         stopped: &AtomicBool,
     ) -> OperationResult<Self> {
-        if force_half_precision {
+        if force_half_precision && device.has_half_precision() {
             Self::new_typed::<VectorElementTypeHalf>(
                 device.clone(),
                 vector_storage.distance(),
@@ -504,6 +523,36 @@ impl GpuVectorStorage {
             )
         } else {
             Self::new_multi(device, vector_storage, stopped)
+        }
+    }
+
+    fn new_multi_f16<TVectorStorage: MultiVectorStorage<VectorElementTypeHalf>>(
+        device: Arc<gpu::Device>,
+        vector_storage: &TVectorStorage,
+        stopped: &AtomicBool,
+    ) -> OperationResult<Self> {
+        if device.has_half_precision() {
+            Self::new_multi(device, vector_storage, stopped)
+        } else {
+            Self::new_typed::<VectorElementType>(
+                device.clone(),
+                vector_storage.distance(),
+                (0..vector_storage.total_vector_count())
+                    .map(|id| {
+                        vector_storage
+                            .get_multi(id as PointOffsetType)
+                            .vectors_count()
+                    })
+                    .sum(),
+                vector_storage.total_vector_count(),
+                vector_storage.vector_dim(),
+                vector_storage
+                    .iterate_inner_vectors()
+                    .map(|vector| VectorElementTypeHalf::slice_to_float_cow(Cow::Borrowed(vector))),
+                None,
+                Some(GpuMultivectors::new_multidense(device, vector_storage)?),
+                stopped,
+            )
         }
     }
 
@@ -557,7 +606,7 @@ impl GpuVectorStorage {
                     device.clone(),
                     "Vector storage buffer",
                     gpu::BufferType::Storage,
-                    points_in_storage_count * gpu_vector_size,
+                    std::cmp::max(points_in_storage_count, 1) * gpu_vector_size,
                 )
             })
             .collect::<gpu::GpuResult<Vec<_>>>()?;
@@ -576,12 +625,12 @@ impl GpuVectorStorage {
             device.clone(),
             "Vector storage upload staging buffer",
             gpu::BufferType::CpuToGpu,
-            upload_points_count * gpu_vector_size,
+            std::cmp::max(upload_points_count, 1) * gpu_vector_size,
         )?;
         // fill staging buffer with zeros
         let zero_vector = vec![TElement::default(); gpu_vector_capacity];
         for i in 0..upload_points_count {
-            staging_buffer.upload_slice(&zero_vector, i * gpu_vector_capacity)?;
+            staging_buffer.upload(TElement::as_bytes(&zero_vector), i * gpu_vector_capacity)?;
         }
         log::trace!(
             "GPU staging buffer size {}, `upload_points_count` = {}",
@@ -598,7 +647,8 @@ impl GpuVectorStorage {
 
             for vector in vectors.clone().skip(storage_index).step_by(STORAGES_COUNT) {
                 check_process_stopped(stopped)?;
-                staging_buffer.upload_slice(vector.as_ref(), upload_points * gpu_vector_size)?;
+                staging_buffer
+                    .upload(TElement::as_bytes(&vector), upload_points * gpu_vector_size)?;
                 upload_size += gpu_vector_size;
                 upload_points += 1;
 

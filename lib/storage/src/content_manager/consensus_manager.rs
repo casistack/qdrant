@@ -7,13 +7,13 @@ use std::str;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use chrono::Utc;
 use collection::collection_state;
 use collection::common::is_ready::IsReady;
 use collection::operations::types::PeerMetadata;
-use collection::shards::shard::PeerId;
 use collection::shards::CollectionId;
+use collection::shards::shard::PeerId;
 use common::defaults;
 use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
@@ -25,10 +25,10 @@ use tokio::sync::broadcast::Receiver;
 use tokio::time::error::Elapsed;
 use tonic::transport::Uri;
 
+use super::CollectionContainer;
 use super::alias_mapping::AliasMapping;
 use super::consensus_ops::{ConsensusOperations, SnapshotStatus};
 use super::errors::StorageError;
-use super::CollectionContainer;
 use crate::content_manager::consensus::consensus_wal::ConsensusOpWal;
 use crate::content_manager::consensus::entry_queue::EntryId;
 use crate::content_manager::consensus::operation_sender::OperationSender;
@@ -54,6 +54,8 @@ pub struct SnapshotData {
     pub address_by_id: PeerAddressById,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata_by_id: PeerMetadataById,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cluster_metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -286,7 +288,9 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
         if let Some(on_apply) = on_apply {
             if on_apply.send(report).is_err() {
-                log::warn!("Failed to notify on consensus operation completion: channel receiver is dropped")
+                log::warn!(
+                    "Failed to notify on consensus operation completion: channel receiver is dropped",
+                )
             }
         }
         Ok(stop_consensus)
@@ -337,7 +341,8 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                             Ok(result) => {
                                 log::debug!(
                                     "Successfully applied consensus operation entry. Index: {}. Result: {result}",
-                                    entry.index);
+                                    entry.index,
+                                );
                                 false
                             }
                             Err(err @ StorageError::ServiceError { .. }) => {
@@ -346,7 +351,9 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                                     .context("Failed to apply collection meta operation entry");
                             }
                             Err(err) => {
-                                log::warn!("Failed to apply collection meta operation entry with user error: {err}");
+                                log::warn!(
+                                    "Failed to apply collection meta operation entry with user error: {err}",
+                                );
                                 // This is a user error so we can safely consider it applied but with error as it was incorrect.
                                 false
                             }
@@ -392,7 +399,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         let change: ConfChangeV2 = prost_for_raft::Message::decode(entry.get_data())?;
 
         let conf_state = raw_node.apply_conf_change(&change)?;
-        log::debug!("Applied conf state {:?}", conf_state);
+        log::debug!("Applied conf state {conf_state:?}");
         self.persistent
             .write()
             .apply_state_update(|state| state.conf_state = conf_state)?;
@@ -449,7 +456,9 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                             let on_apply = self.on_consensus_op_apply.lock().remove(&operation);
                             if let Some(on_apply) = on_apply {
                                 if on_apply.send(Ok(true)).is_err() {
-                                    log::warn!("Failed to notify on consensus operation completion: channel receiver is dropped")
+                                    log::warn!(
+                                        "Failed to notify on consensus operation completion: channel receiver is dropped",
+                                    )
                                 }
                             }
                         }
@@ -520,7 +529,9 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
         if let Some(on_apply) = on_apply {
             if on_apply.send(result.clone()).is_err() {
-                log::warn!("Failed to notify on consensus operation completion: channel receiver is dropped")
+                log::warn!(
+                    "Failed to notify on consensus operation completion: channel receiver is dropped",
+                )
             }
         }
         result
@@ -533,13 +544,20 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     ) -> Result<Result<(), StorageError>, StorageError> {
         let meta = snapshot.get_metadata();
 
-        let data: SnapshotData = snapshot.get_data().try_into()?;
-        self.toc.apply_collections_snapshot(data.collections_data)?;
+        let SnapshotData {
+            collections_data,
+            address_by_id,
+            metadata_by_id,
+            cluster_metadata,
+        } = snapshot.get_data().try_into()?;
+
+        self.toc.apply_collections_snapshot(collections_data)?;
         self.wal.lock().clear()?;
         self.persistent.write().update_from_snapshot(
             meta,
-            data.address_by_id,
-            data.metadata_by_id,
+            address_by_id,
+            metadata_by_id,
+            cluster_metadata,
         )?;
 
         Ok(Ok(()))
@@ -586,7 +604,10 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         // plus we need to make additional removing in the `channel_pool`.
         // So we handle `remove_peer` inside the `toc` and persist changes in the `persistent` after that.
         self.toc.remove_peer(peer_id)?;
-        self.persistent.read().save()
+
+        let persistent = self.persistent.read();
+        persistent.peer_metadata_by_id.write().remove(&peer_id);
+        persistent.save()
     }
 
     async fn await_receiver(
@@ -781,20 +802,22 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             return Ok(false);
         };
 
-        let Some(applied_index) = self.persistent.read().last_applied_entry() else {
+        let Some(last_applied_index) = self.persistent.read().last_applied_entry() else {
             return Ok(false);
         };
 
-        let first_unapplied_index = applied_index + 1;
-
-        // ToDo: it seems like a mistake, need to check if it's correct
-        // debug_assert!(first_unapplied_index <= first_entry.index);
-
-        if first_unapplied_index - first_entry.index < min_entries_to_compact {
+        debug_assert!(
+            last_applied_index >= first_entry.index - 1,
+            "Raft WAL is missing {} unapplied entries (last applied index: {}, first WAL entry index: {})",
+            first_entry.index - last_applied_index - 1,
+            last_applied_index,
+            first_entry.index,
+        );
+        if last_applied_index.saturating_sub(first_entry.index) < min_entries_to_compact {
             return Ok(false);
         }
 
-        self.wal.lock().compact(first_unapplied_index)?;
+        self.wal.lock().compact(last_applied_index)?;
         Ok(true)
     }
 
@@ -890,7 +913,7 @@ fn recover_first_voter(
                 }
             }
 
-            EntryType::EntryNormal => continue,
+            EntryType::EntryNormal => (),
         }
     }
 
@@ -926,15 +949,12 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
         let first_index = self.first_index()?;
         if low < first_index {
             log::debug!(
-                "Requested entries from {} to {} are already compacted (first index: {})",
-                low,
-                high,
-                first_index
+                "Requested entries from {low} to {high} are already compacted (first index: {first_index})"
             );
             return Err(raft::Error::Store(raft::StorageError::Compacted));
         }
 
-        log::debug!("Requesting entries from {} to {}", low, high);
+        log::debug!("Requesting entries from {low} to {high}");
 
         if high > self.last_index()? + 1 {
             panic!(
@@ -975,6 +995,8 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<raft::eraftpb::Snapshot> {
         let collections_data = self.toc.collections_snapshot();
 
+        // Lock first WAL and then persistent to avoid deadlock
+        let wal_guard = self.wal.lock();
         // TODO: Should we lock `persistent` *before* calling `TableOfContent::collections_snapshot`!?
         let persistent = self.persistent.read();
 
@@ -989,6 +1011,7 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
             collections_data,
             address_by_id: persistent.peer_address_by_id(),
             metadata_by_id: persistent.peer_metadata_by_id(),
+            cluster_metadata: persistent.cluster_metadata.clone(),
         };
 
         let raft_state = persistent.state();
@@ -1004,7 +1027,7 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
         let term = if index == persistent.latest_snapshot_meta.index {
             persistent.latest_snapshot_meta.term
         } else {
-            self.wal.lock().entry(index)?.term
+            wal_guard.entry(index)?.term
         };
 
         let meta = raft::eraftpb::SnapshotMetadata {
@@ -1081,7 +1104,7 @@ pub fn raft_error_other(e: impl std::error::Error) -> raft::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{mpsc, Arc};
+    use std::sync::{Arc, mpsc};
 
     use collection::shards::shard::PeerId;
     use proptest::prelude::*;
@@ -1092,11 +1115,11 @@ mod tests {
     use tempfile::Builder;
 
     use super::ConsensusManager;
+    use crate::content_manager::CollectionContainer;
     use crate::content_manager::consensus::consensus_wal::ConsensusOpWal;
     use crate::content_manager::consensus::entry_queue::EntryApplyProgressQueue;
     use crate::content_manager::consensus::operation_sender::OperationSender;
     use crate::content_manager::consensus::persistent::Persistent;
-    use crate::content_manager::CollectionContainer;
 
     #[test]
     fn update_is_applied() {
@@ -1115,9 +1138,11 @@ mod tests {
             path: "./unexistent_dir/file".into(),
             ..Default::default()
         };
-        assert!(state
-            .apply_state_update(|state| { state.hard_state.commit = 1 })
-            .is_err());
+        assert!(
+            state
+                .apply_state_update(|state| { state.hard_state.commit = 1 })
+                .is_err(),
+        );
     }
 
     #[test]

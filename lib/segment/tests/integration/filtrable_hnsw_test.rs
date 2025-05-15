@@ -1,79 +1,43 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::flags::FeatureFlags;
 use common::types::{PointOffsetType, TelemetryDetail};
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
-use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
+use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
 use segment::json_path::JsonPath;
-use segment::segment_constructor::build_segment;
+use segment::payload_json;
+use segment::segment_constructor::VectorIndexBuildArgs;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, PayloadSchemaType,
-    Range, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, PayloadSchemaType, Range,
+    SearchParams, SeqNumberType,
 };
-use segment::vector_storage::query::{ContextPair, DiscoveryQuery, RecoQuery};
-use serde_json::json;
 use tempfile::Builder;
 
-const MAX_EXAMPLE_PAIRS: usize = 4;
-
-enum QueryVariant {
-    Nearest,
-    RecommendBestScore,
-    Discovery,
-}
-
-fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_pairs: usize = rnd.gen_range(1..MAX_EXAMPLE_PAIRS);
-
-    let target = random_vector(rnd, dim).into();
-
-    let pairs = (0..num_pairs)
-        .map(|_| {
-            let positive = random_vector(rnd, dim).into();
-            let negative = random_vector(rnd, dim).into();
-            ContextPair { positive, negative }
-        })
-        .collect_vec();
-
-    DiscoveryQuery::new(target, pairs).into()
-}
-
-fn random_reco_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_examples: usize = rnd.gen_range(1..MAX_EXAMPLE_PAIRS);
-
-    let positive = (0..num_examples)
-        .map(|_| random_vector(rnd, dim).into())
-        .collect_vec();
-    let negative = (0..num_examples)
-        .map(|_| random_vector(rnd, dim).into())
-        .collect_vec();
-
-    RecoQuery::new(positive, negative).into()
-}
-
-fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rnd: &mut R, dim: usize) -> QueryVector {
-    match variant {
-        QueryVariant::Nearest => random_vector(rnd, dim).into(),
-        QueryVariant::Discovery => random_discovery_query(rnd, dim),
-        QueryVariant::RecommendBestScore => random_reco_query(rnd, dim),
-    }
+fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rng: &mut R, dim: usize) -> QueryVector {
+    segment::fixtures::query_fixtures::random_query(variant, rng, move |rng| {
+        random_vector(rng, dim).into()
+    })
 }
 
 #[rstest]
 #[case::nearest(QueryVariant::Nearest, 32, 5)]
 #[case::discovery(QueryVariant::Discovery, 128, 10)] // tests that check better precision are in `hnsw_discover_test.rs`
-#[case::recommend(QueryVariant::RecommendBestScore, 64, 10)]
+#[case::reco_best_score(QueryVariant::RecoBestScore, 64, 10)]
+#[case::reco_sum_scores(QueryVariant::RecoSumScores, 64, 10)]
 fn test_filterable_hnsw(
     #[case] query_variant: QueryVariant,
     #[case] ef: usize,
@@ -103,38 +67,27 @@ fn _test_filterable_hnsw(
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
 
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-
     let int_key = "int";
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
         let vector = random_vector(&mut rnd, dim);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
 
         segment
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
 
@@ -154,7 +107,11 @@ fn _test_filterable_hnsw(
 
     payload_index_ptr
         .borrow_mut()
-        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new(int_key),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     let borrowed_payload_index = payload_index_ptr.borrow();
     let blocks = borrowed_payload_index
@@ -171,7 +128,7 @@ fn _test_filterable_hnsw(
     let px = payload_index_ptr.borrow();
     for block in &blocks {
         let filter = Filter::new_must(Condition::Field(block.condition.clone()));
-        let points = px.query_points(&filter);
+        let points = px.query_points(&filter, &hw_counter);
         for point in points {
             coverage.insert(point, coverage.get(&point).unwrap_or(&0) + 1);
         }
@@ -191,18 +148,24 @@ fn _test_filterable_hnsw(
     );
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
-    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir.path(),
-        id_tracker: segment.id_tracker.clone(),
-        vector_storage: vector_storage.clone(),
-        quantized_vectors: quantized_vectors.clone(),
-        payload_index: payload_index_ptr.clone(),
-        hnsw_config,
-        permit: Some(permit),
-        gpu_device: None,
-        stopped: &stopped,
-    })
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            quantized_vectors: quantized_vectors.clone(),
+            payload_index: payload_index_ptr.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+            feature_flags: FeatureFlags::default(),
+        },
+    )
     .unwrap();
 
     let top = 3;
@@ -212,7 +175,7 @@ fn _test_filterable_hnsw(
         let query = random_query(&query_variant, &mut rnd, dim);
 
         let range_size = 40;
-        let left_range = rnd.gen_range(0..400);
+        let left_range = rnd.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(

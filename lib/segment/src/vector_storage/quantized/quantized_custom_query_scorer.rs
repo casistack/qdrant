@@ -11,7 +11,6 @@ use crate::data_types::vectors::{
 };
 use crate::spaces::metric::Metric;
 use crate::types::QuantizationConfig;
-use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query::{Query, TransformInto};
 use crate::vector_storage::query_scorer::QueryScorer;
 
@@ -42,6 +41,7 @@ where
         raw_query: TInputQuery,
         quantized_storage: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        mut hardware_counter: HardwareCounterCell,
     ) -> Self
     where
         TOriginalQuery: Query<TypedDenseVector<TElement>>
@@ -70,13 +70,17 @@ where
             })
             .unwrap();
 
+        hardware_counter.set_cpu_multiplier(size_of::<TElement>());
+
+        hardware_counter.set_vector_io_read_multiplier(usize::from(quantized_storage.is_on_disk()));
+
         Self {
             query,
             quantized_storage,
             phantom: PhantomData,
             metric: PhantomData,
             element: PhantomData,
-            hardware_counter: HardwareCounterCell::new(),
+            hardware_counter,
         }
     }
 
@@ -84,6 +88,7 @@ where
         raw_query: TInputQuery,
         quantized_storage: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        mut hardware_counter: HardwareCounterCell,
     ) -> Self
     where
         TOriginalQuery: Query<TypedMultiDenseVector<TElement>>
@@ -117,13 +122,17 @@ where
             })
             .unwrap();
 
+        hardware_counter.set_cpu_multiplier(size_of::<TElement>());
+
+        hardware_counter.set_vector_io_read_multiplier(usize::from(quantized_storage.is_on_disk()));
+
         Self {
             query,
             quantized_storage,
             phantom: PhantomData,
             metric: PhantomData,
             element: PhantomData,
-            hardware_counter: HardwareCounterCell::new(),
+            hardware_counter,
         }
     }
 }
@@ -143,30 +152,11 @@ where
         })
     }
 
-    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
-        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
-        debug_assert_eq!(ids.len(), scores.len());
-        // no specific implementation for batch scoring
-        for (idx, id) in ids.iter().enumerate() {
-            scores[idx] = self.score_stored(*id);
-        }
-    }
-
     fn score(&self, _v2: &[TElement]) -> ScoreType {
         unimplemented!("This method is not expected to be called for quantized scorer");
     }
 
     fn score_internal(&self, _point_a: PointOffsetType, _point_b: PointOffsetType) -> ScoreType {
         unimplemented!("Custom scorer compares against multiple vectors, not just one")
-    }
-
-    fn take_hardware_counter(&self) -> HardwareCounterCell {
-        let mut counter = self.hardware_counter.take();
-
-        counter
-            .cpu_counter_mut()
-            .multiplied_mut(size_of::<TElement>());
-
-        counter
     }
 }

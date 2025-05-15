@@ -7,8 +7,8 @@ use quantization::{EncodedStorage, EncodedVectorsPQ, EncodedVectorsU8};
 
 use super::{GpuVectorStorage, STORAGES_COUNT};
 use crate::common::operation_error::OperationResult;
-use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
 use crate::index::hnsw_index::gpu::GPU_TIMEOUT;
+use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
 
 pub const START_QUANTIZATION_BINDING: usize = STORAGES_COUNT;
 pub const MAX_QUANTIZATION_BINDINGS: usize = 2;
@@ -230,7 +230,7 @@ impl GpuScalarQuantization {
             device.clone(),
             "SQ offsets buffer",
             gpu::BufferType::Storage,
-            quantized_storage.vectors_count() * std::mem::size_of::<f32>(),
+            std::cmp::max(quantized_storage.vectors_count(), 1) * std::mem::size_of::<f32>(),
         )?;
 
         let sq_offsets_staging_buffer = gpu::Buffer::new(
@@ -349,7 +349,9 @@ impl GpuProductQuantization {
             device.clone(),
             "PQ vector division buffer",
             gpu::BufferType::Storage,
-            quantized_storage.get_metadata().vector_division.len() * std::mem::size_of::<u32>() * 2,
+            std::cmp::max(quantized_storage.get_metadata().vector_division.len(), 1)
+                * std::mem::size_of::<u32>()
+                * 2,
         )?;
         let vector_division_staging_buffer = gpu::Buffer::new(
             device.clone(),
@@ -362,7 +364,7 @@ impl GpuProductQuantization {
 
         let mut centroids_offset = 0;
         for centroids in &quantized_storage.get_metadata().centroids {
-            centroids_staging_buffer.upload_slice(centroids, centroids_offset)?;
+            centroids_staging_buffer.upload(centroids.as_slice(), centroids_offset)?;
             centroids_offset += centroids.len() * std::mem::size_of::<f32>();
         }
 
@@ -380,7 +382,7 @@ impl GpuProductQuantization {
             .iter()
             .flat_map(|range| [range.start as u32, range.end as u32].into_iter())
             .collect();
-        vector_division_staging_buffer.upload_slice(&vector_division, 0)?;
+        vector_division_staging_buffer.upload(vector_division.as_slice(), 0)?;
 
         upload_context.copy_gpu_buffer(
             vector_division_staging_buffer,

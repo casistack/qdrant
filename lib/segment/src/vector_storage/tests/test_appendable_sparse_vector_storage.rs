@@ -1,20 +1,23 @@
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use sparse::common::sparse_vector::SparseVector;
 use tempfile::Builder;
 
-use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use crate::data_types::vectors::QueryVector;
 use crate::fixtures::payload_context_fixture::FixtureIdTracker;
 use crate::id_tracker::IdTrackerSS;
 use crate::vector_storage::query::RecoQuery;
 use crate::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
 use crate::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
-use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{
+    DEFAULT_STOPPED, VectorStorage, VectorStorageEnum, new_raw_scorer_for_test,
+};
 
 fn do_test_delete_points(storage: &mut VectorStorageEnum) {
     let points: Vec<SparseVector> = vec![
@@ -34,10 +37,12 @@ fn do_test_delete_points(storage: &mut VectorStorageEnum) {
 
     let borrowed_id_tracker = id_tracker.borrow_mut();
 
+    let hw_counter = HardwareCounterCell::new();
+
     // Insert all points
     for (i, vec) in points.iter().enumerate() {
         storage
-            .insert_vector(i as PointOffsetType, vec.into())
+            .insert_vector(i as PointOffsetType, vec.into(), &hw_counter)
             .unwrap();
     }
 
@@ -69,19 +74,20 @@ fn do_test_delete_points(storage: &mut VectorStorageEnum) {
     let vector: SparseVector = vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)]
         .try_into()
         .unwrap();
-    let query_vector = QueryVector::Recommend(RecoQuery {
+    let query_vector = QueryVector::RecommendBestScore(RecoQuery {
         positives: vec![vector.into()],
         negatives: vec![],
     });
     // Because nearest search for raw scorer is incorrect,
-    let scorer = new_raw_scorer(
+    let scorer = new_raw_scorer_for_test(
         query_vector,
         storage,
         borrowed_id_tracker.deleted_point_bitslice(),
     )
     .unwrap();
-    let closest = scorer.peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5);
-    scorer.take_hardware_counter().discard_results();
+    let closest = scorer
+        .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+        .unwrap();
     drop(scorer);
     assert_eq!(closest.len(), 3, "must have 3 vectors, 2 are deleted");
     assert_eq!(closest[0].idx, 0);
@@ -124,6 +130,8 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
     let id_tracker: Arc<AtomicRefCell<IdTrackerSS>> =
         Arc::new(AtomicRefCell::new(FixtureIdTracker::new(points.len())));
 
+    let hw_counter = HardwareCounterCell::new();
+
     let borrowed_id_tracker = id_tracker.borrow_mut();
     {
         let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
@@ -134,7 +142,7 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
         points.iter().enumerate().for_each(|(i, opt_vec)| {
             if let Some(vec) = opt_vec {
                 storage2
-                    .insert_vector(i as PointOffsetType, vec.into())
+                    .insert_vector(i as PointOffsetType, vec.into(), &hw_counter)
                     .unwrap();
             } else {
                 storage2.delete_vector(i as PointOffsetType).unwrap();
@@ -163,18 +171,19 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
     let vector: SparseVector = vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)]
         .try_into()
         .unwrap();
-    let query_vector = QueryVector::Recommend(RecoQuery {
+    let query_vector = QueryVector::RecommendBestScore(RecoQuery {
         positives: vec![vector.into()],
         negatives: vec![],
     });
-    let scorer = new_raw_scorer(
+    let scorer = new_raw_scorer_for_test(
         query_vector,
         storage,
         borrowed_id_tracker.deleted_point_bitslice(),
     )
     .unwrap();
-    let closest = scorer.peek_top_iter(&mut [0, 1, 2, 3, 4, 5].iter().cloned(), 5);
-    scorer.take_hardware_counter().discard_results();
+    let closest = scorer
+        .peek_top_iter(&mut [0, 1, 2, 3, 4, 5].iter().cloned(), 5, &DEFAULT_STOPPED)
+        .unwrap();
     drop(scorer);
 
     assert_eq!(
@@ -199,7 +208,7 @@ fn do_test_update_from_delete_points(storage: &mut VectorStorageEnum) {
     );
 }
 
-fn do_test_persistance(open: impl Fn(&Path) -> VectorStorageEnum) {
+fn do_test_persistence(open: impl Fn(&Path) -> VectorStorageEnum) {
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
     let mut storage = open(dir.path());
 
@@ -214,9 +223,11 @@ fn do_test_persistance(open: impl Fn(&Path) -> VectorStorageEnum) {
     .map(|v| v.try_into().unwrap())
     .collect::<Vec<SparseVector>>();
 
+    let hw_counter = HardwareCounterCell::new();
+
     points.iter().enumerate().for_each(|(i, vec)| {
         storage
-            .insert_vector(i as PointOffsetType, vec.into())
+            .insert_vector(i as PointOffsetType, vec.into(), &hw_counter)
             .unwrap();
     });
 
@@ -227,7 +238,6 @@ fn do_test_persistance(open: impl Fn(&Path) -> VectorStorageEnum) {
 
     let deleted_vector_count = storage.deleted_vector_count();
     let available_vector_count = storage.available_vector_count();
-    let size_of_available_vectors_in_bytes = storage.size_of_available_vectors_in_bytes();
 
     drop(storage);
 
@@ -252,10 +262,6 @@ fn do_test_persistance(open: impl Fn(&Path) -> VectorStorageEnum) {
 
     assert_eq!(storage.deleted_vector_count(), deleted_vector_count);
     assert_eq!(storage.available_vector_count(), available_vector_count);
-    assert_eq!(
-        storage.size_of_available_vectors_in_bytes(),
-        size_of_available_vectors_in_bytes
-    );
 }
 
 #[test]
@@ -277,17 +283,15 @@ fn test_delete_points_in_simple_sparse_vector_storage() {
 #[test]
 fn test_delete_points_in_mmap_sparse_vector_storage() {
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
-    let mut storage = VectorStorageEnum::SparseMmap(
-        MmapSparseVectorStorage::open_or_create(dir.path(), &Default::default()).unwrap(),
-    );
+    let mut storage =
+        VectorStorageEnum::SparseMmap(MmapSparseVectorStorage::open_or_create(dir.path()).unwrap());
     do_test_delete_points(&mut storage);
 
     storage.flusher()().unwrap();
 
     drop(storage);
 
-    let _storage =
-        MmapSparseVectorStorage::open_or_create(dir.path(), &Default::default()).unwrap();
+    let _storage = MmapSparseVectorStorage::open_or_create(dir.path()).unwrap();
 }
 
 #[test]
@@ -310,32 +314,28 @@ fn test_update_from_delete_points_simple_sparse_vector_storage() {
 fn test_update_from_delete_points_mmap_sparse_vector_storage() {
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
 
-    let mut storage = VectorStorageEnum::SparseMmap(
-        MmapSparseVectorStorage::open_or_create(dir.path(), &Default::default()).unwrap(),
-    );
+    let mut storage =
+        VectorStorageEnum::SparseMmap(MmapSparseVectorStorage::open_or_create(dir.path()).unwrap());
 
     do_test_update_from_delete_points(&mut storage);
     storage.flusher()().unwrap();
 
     drop(storage);
 
-    let mut _storage = VectorStorageEnum::SparseMmap(
-        MmapSparseVectorStorage::open_or_create(dir.path(), &Default::default()).unwrap(),
-    );
+    let _storage =
+        VectorStorageEnum::SparseMmap(MmapSparseVectorStorage::open_or_create(dir.path()).unwrap());
 }
 
 #[test]
-fn test_persistance_in_mmap_sparse_vector_storage() {
-    do_test_persistance(|path| {
-        VectorStorageEnum::SparseMmap(
-            MmapSparseVectorStorage::open_or_create(path, &Default::default()).unwrap(),
-        )
+fn test_persistence_in_mmap_sparse_vector_storage() {
+    do_test_persistence(|path| {
+        VectorStorageEnum::SparseMmap(MmapSparseVectorStorage::open_or_create(path).unwrap())
     });
 }
 
 #[test]
-fn test_persistance_in_simple_sparse_vector_storage() {
-    do_test_persistance(|path| {
+fn test_persistence_in_simple_sparse_vector_storage() {
+    do_test_persistence(|path| {
         let db = open_db(path, &[DB_VECTOR_CF]).unwrap();
         open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &AtomicBool::new(false)).unwrap()
     });

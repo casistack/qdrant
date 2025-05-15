@@ -3,22 +3,24 @@ use std::sync::Arc;
 
 use common::types::PointOffsetType;
 use quantization::EncodedVectors;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::gpu_quantization::MAX_QUANTIZATION_BINDINGS;
 use super::STORAGES_COUNT;
+use super::gpu_quantization::MAX_QUANTIZATION_BINDINGS;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::primitive::PrimitiveVectorElement;
-use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
 use crate::index::hnsw_index::gpu::GPU_TIMEOUT;
+use crate::index::hnsw_index::gpu::shader_builder::ShaderBuilderParameters;
+use crate::vector_storage::MultiVectorStorage;
 use crate::vector_storage::quantized::quantized_multivector_storage::{
     MultivectorOffsetsStorage, QuantizedMultivectorStorage,
 };
-use crate::vector_storage::MultiVectorStorage;
 
 // Multivector shader binding is after vectot data and quantization data bindings.
 const START_MULTIVECTORS_BINDING: usize = STORAGES_COUNT + MAX_QUANTIZATION_BINDINGS;
 
 /// Shader struct for multivector offsets with start id and count of vectors in multivector.
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 struct GpuMultivectorOffset {
     start: u32,
@@ -129,7 +131,7 @@ impl GpuMultivectors {
             device.clone(),
             "Multivector offsets buffer",
             gpu::BufferType::Storage,
-            multivectors_count * std::mem::size_of::<GpuMultivectorOffset>(),
+            std::cmp::max(multivectors_count, 1) * std::mem::size_of::<GpuMultivectorOffset>(),
         )?;
         let offsets_staging_buffer = gpu::Buffer::new(
             device.clone(),

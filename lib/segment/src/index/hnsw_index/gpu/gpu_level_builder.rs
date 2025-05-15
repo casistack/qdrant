@@ -107,8 +107,8 @@ mod tests {
     use crate::index::hnsw_index::gpu::create_graph_layers_builder;
     use crate::index::hnsw_index::gpu::gpu_vector_storage::GpuVectorStorage;
     use crate::index::hnsw_index::gpu::tests::{
-        check_graph_layers_builders_quality, compare_graph_layers_builders,
-        create_gpu_graph_test_data, GpuGraphTestData,
+        GpuGraphTestData, check_graph_layers_builders_quality, compare_graph_layers_builders,
+        create_gpu_graph_test_data,
     };
     use crate::index::hnsw_index::graph_layers::GraphLayersBase;
     use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
@@ -130,11 +130,12 @@ mod tests {
         )
         .unwrap();
 
-        let graph_layers_builder =
+        let mut graph_layers_builder =
             create_graph_layers_builder(&batched_points, num_vectors, m, m0, ef, 1);
 
-        let debug_messenger = gpu::PanicIfErrorMessenger {};
-        let instance = gpu::Instance::new(Some(&debug_messenger), None, false).unwrap();
+        graph_layers_builder.fill_ready_list();
+
+        let instance = gpu::GPU_TEST_INSTANCE.clone();
         let device = gpu::Device::new(instance.clone(), &instance.physical_devices()[0]).unwrap();
 
         let gpu_vector_storage = GpuVectorStorage::new(

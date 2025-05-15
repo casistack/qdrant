@@ -4,6 +4,7 @@ use api::grpc::transport_channel_pool::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_GRPC_TIMEOUT, DEFAULT_POOL_SIZE,
 };
 use collection::operations::validation;
+use common::flags::FeatureFlags;
 use config::{Config, ConfigError, Environment, File, FileFormat, Source};
 use serde::Deserialize;
 use storage::types::StorageConfig;
@@ -16,7 +17,6 @@ use crate::tracing;
 const DEFAULT_CONFIG: &str = include_str!("../config/config.yaml");
 
 #[derive(Debug, Deserialize, Validate, Clone)]
-#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct ServiceConfig {
     #[validate(length(min = 1))]
     pub host: String,
@@ -77,10 +77,11 @@ pub struct ClusterConfig {
     #[serde(default)]
     #[validate(nested)]
     pub consensus: ConsensusConfig,
+    #[serde(default)]
+    pub resharding_enabled: bool, // disabled by default
 }
 
 #[derive(Debug, Deserialize, Clone, Validate)]
-#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct P2pConfig {
     #[serde(default)]
     pub port: Option<u16>,
@@ -114,9 +115,9 @@ pub struct ConsensusConfig {
     #[validate(range(min = 1))]
     #[serde(default = "default_message_timeout_tics")]
     pub message_timeout_ticks: u64,
-    #[allow(dead_code)] // `schema_generator` complains about this 🙄
-    #[serde(default)]
-    pub compact_wal_entries: u64, // compact WAL when it grows to enough applied entries
+    /// Compact WAL when it grows to enough applied entries
+    #[serde(default = "default_compact_wal_entries")]
+    pub compact_wal_entries: u64,
 }
 
 impl Default for ConsensusConfig {
@@ -126,7 +127,7 @@ impl Default for ConsensusConfig {
             tick_period_ms: default_tick_period_ms(),
             bootstrap_timeout_sec: default_bootstrap_timeout_sec(),
             message_timeout_ticks: default_message_timeout_tics(),
-            compact_wal_entries: 0,
+            compact_wal_entries: default_compact_wal_entries(),
         }
     }
 }
@@ -135,7 +136,7 @@ impl Default for ConsensusConfig {
 pub struct TlsConfig {
     pub cert: String,
     pub key: String,
-    pub ca_cert: String,
+    pub ca_cert: Option<String>,
     #[serde(default = "default_tls_cert_ttl")]
     #[validate(range(min = 1))]
     pub cert_ttl: Option<u64>,
@@ -187,7 +188,6 @@ pub struct GpuConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, Validate)]
-#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct Settings {
     #[serde(default)]
     pub log_level: Option<String>,
@@ -216,10 +216,11 @@ pub struct Settings {
     #[serde(default)]
     #[validate(nested)]
     pub gpu: Option<GpuConfig>,
+    #[serde(default)]
+    pub feature_flags: FeatureFlags,
 }
 
 impl Settings {
-    #[allow(dead_code)]
     pub fn new(custom_config_path: Option<String>) -> Result<Self, ConfigError> {
         let mut load_errors = vec![];
         let config_exists = |path| File::with_name(path).collect().is_ok();
@@ -257,6 +258,12 @@ impl Settings {
             // Merge local config, not tracked in git: config/local
             .add_source(File::with_name("config/local").required(false));
 
+        #[cfg(feature = "deb")]
+        {
+            // Read config, installed with deb package
+            config = config.add_source(File::with_name("/etc/qdrant/config").required(false));
+        }
+
         // Merge user provided config with --config-path
         if let Some(path) = custom_config_path {
             config = config.add_source(File::with_name(&path).required(false));
@@ -285,7 +292,6 @@ impl Settings {
         )
     }
 
-    #[allow(dead_code)]
     pub fn validate_and_warn(&self) {
         //
         // JWT RBAC
@@ -302,9 +308,8 @@ impl Settings {
                 < JWT_RECOMMENDED_SECRET_LENGTH
             {
                 log::warn!(
-                "It is highly recommended to use an API key of {} bytes when JWT RBAC is enabled",
-                JWT_RECOMMENDED_SECRET_LENGTH
-            )
+                    "It is highly recommended to use an API key of {JWT_RECOMMENDED_SECRET_LENGTH} bytes when JWT RBAC is enabled",
+                )
             }
         }
 
@@ -381,6 +386,10 @@ const fn default_message_timeout_tics() -> u64 {
     10
 }
 
+const fn default_compact_wal_entries() -> u64 {
+    128
+}
+
 #[allow(clippy::unnecessary_wraps)] // Used as serde default
 const fn default_tls_cert_ttl() -> Option<u64> {
     // Default one hour
@@ -411,7 +420,7 @@ mod tests {
 
     #[sealed_test(files = ["config/config.yaml", "config/development.yaml"])]
     fn test_runtime_development_config() {
-        env::set_var("RUN_MODE", "development");
+        unsafe { env::set_var("RUN_MODE", "development") };
 
         // `sealed_test` copies files into the same directory as the test runs in.
         // We need them in a subdirectory.

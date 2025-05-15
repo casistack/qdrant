@@ -35,7 +35,7 @@ impl ShardReplicaSet {
             Some(Shard::ForwardProxy(proxy))
                 if proxy.remote_shard.peer_id == remote_shard.peer_id =>
             {
-                return Ok(())
+                return Ok(());
             }
 
             // Unexpected states, error
@@ -177,19 +177,19 @@ impl ShardReplicaSet {
 
         // Try to queue proxify with or without version
         let proxy_shard = match from_version {
-            None => Ok(QueueProxyShard::new(
-                local_shard,
-                remote_shard,
-                wal_keep_from,
-                progress,
-            )),
-            Some(from_version) => QueueProxyShard::new_from_version(
-                local_shard,
-                remote_shard,
-                wal_keep_from,
-                from_version,
-                progress,
-            ),
+            None => {
+                Ok(QueueProxyShard::new(local_shard, remote_shard, wal_keep_from, progress).await)
+            }
+            Some(from_version) => {
+                QueueProxyShard::new_from_version(
+                    local_shard,
+                    remote_shard,
+                    wal_keep_from,
+                    from_version,
+                    progress,
+                )
+                .await
+            }
         };
 
         // Insert queue proxy shard on success or revert to local shard on failure
@@ -333,6 +333,8 @@ impl ShardReplicaSet {
 
     /// Custom operation for transferring data from one shard to another during transfer
     ///
+    /// Returns new point offset and transferred count
+    ///
     /// # Cancel safety
     ///
     /// This method is cancel safe.
@@ -342,7 +344,7 @@ impl ShardReplicaSet {
         batch_size: usize,
         hashring_filter: Option<&HashRingRouter>,
         merge_points: bool,
-    ) -> CollectionResult<Option<PointIdType>> {
+    ) -> CollectionResult<(Option<PointIdType>, usize)> {
         let local = self.local.read().await;
 
         let Some(Shard::ForwardProxy(proxy)) = local.deref() else {
@@ -495,6 +497,6 @@ impl ShardReplicaSet {
             ));
         };
 
-        local_shard.wal_version()
+        local_shard.wal_version().await
     }
 }

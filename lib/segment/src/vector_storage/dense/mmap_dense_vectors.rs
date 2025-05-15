@@ -1,13 +1,15 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::mem::{self, size_of, transmute};
+use std::mem::{self, MaybeUninit, size_of, transmute};
 use std::path::Path;
 use std::sync::Arc;
 
 use bitvec::prelude::BitSlice;
+use common::ext::BitSliceExt as _;
+use common::maybe_uninit::maybe_uninit_fill_from;
 use common::types::PointOffsetType;
 use memmap2::Mmap;
-use memory::madvise::{Advice, AdviceSetting};
+use memory::madvise::{Advice, AdviceSetting, Madviseable};
 use memory::mmap_ops;
 use memory::mmap_type::{MmapBitSlice, MmapFlusher};
 use parking_lot::Mutex;
@@ -79,7 +81,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         // Advise kernel that we'll need this page soon so the kernel can prepare
         #[cfg(unix)]
         if let Err(err) = deleted_mmap.advise(memmap2::Advice::WillNeed) {
-            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {}", err,);
+            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {err}");
         }
 
         // Transform into mmap BitSlice
@@ -155,17 +157,22 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             .map(|offset| self.raw_vector_offset_sequential(offset))
     }
 
-    pub fn get_vectors<'a>(&'a self, keys: &[PointOffsetType], vectors: &mut [&'a [T]]) {
+    pub fn get_vectors<'a>(
+        &'a self,
+        keys: &[PointOffsetType],
+        vectors: &'a mut [MaybeUninit<&'a [T]>],
+    ) -> &'a [&'a [T]] {
         debug_assert_eq!(keys.len(), vectors.len());
         debug_assert!(keys.len() <= VECTOR_READ_BATCH_SIZE);
         if is_read_with_prefetch_efficient_points(keys) {
-            for (i, key) in keys.iter().enumerate() {
-                vectors[i] = self.get_vector_opt_sequential(*key).unwrap_or(&[]);
-            }
+            maybe_uninit_fill_from(
+                vectors,
+                keys.iter()
+                    .map(|key| self.get_vector_opt_sequential(*key).unwrap_or(&[])),
+            )
+            .0
         } else {
-            for (i, key) in keys.iter().enumerate() {
-                vectors[i] = self.get_vector(*key);
-            }
+            maybe_uninit_fill_from(vectors, keys.iter().map(|key| self.get_vector(*key))).0
         }
     }
 
@@ -181,7 +188,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
     }
 
     pub fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key as usize).map(|b| *b).unwrap_or(false)
+        self.deleted.get_bit(key as usize).unwrap_or(false)
     }
 
     /// Get [`BitSlice`] representation for deleted vectors with deletion flags
@@ -190,10 +197,6 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
     /// vectors in this segment.
     pub fn deleted_vector_bitslice(&self) -> &BitSlice {
         &self.deleted
-    }
-
-    pub fn prefault_mmap_pages(&self, path: &Path) -> mmap_ops::PrefaultMmapPages {
-        mmap_ops::PrefaultMmapPages::new(self.mmap.clone(), Some(path))
     }
 
     #[cfg(target_os = "linux")]
@@ -239,6 +242,11 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
             self.process_points_simple(points, callback);
             Ok(())
         }
+    }
+
+    pub fn populate(&self) -> OperationResult<()> {
+        self.mmap.populate();
+        Ok(())
     }
 }
 

@@ -19,9 +19,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
-        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.gen()).collect();
+        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.random()).collect();
 
         let encoded = EncodedVectorsPQ::encode(
             vector_data.iter(),
@@ -45,7 +45,6 @@ mod tests {
             let orginal_score = dot_similarity(&query, vector);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -53,9 +52,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
-        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.gen()).collect();
+        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.random()).collect();
 
         let encoded = EncodedVectorsPQ::encode(
             vector_data.iter(),
@@ -79,7 +78,6 @@ mod tests {
             let orginal_score = l2_similarity(&query, vector);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -87,9 +85,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
-        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.gen()).collect();
+        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.random()).collect();
 
         let encoded = EncodedVectorsPQ::encode(
             vector_data.iter(),
@@ -113,7 +111,6 @@ mod tests {
             let orginal_score = l1_similarity(&query, vector);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -121,9 +118,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
-        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.gen()).collect();
+        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.random()).collect();
 
         let encoded = EncodedVectorsPQ::encode(
             vector_data.iter(),
@@ -147,7 +144,6 @@ mod tests {
             let orginal_score = -dot_similarity(&query, vector);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -155,9 +151,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
-        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.gen()).collect();
+        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.random()).collect();
 
         let encoded = EncodedVectorsPQ::encode(
             vector_data.iter(),
@@ -181,7 +177,6 @@ mod tests {
             let orginal_score = -l2_similarity(&query, vector);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -189,9 +184,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
-        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.gen()).collect();
+        let query: Vec<_> = (0..VECTOR_DIM).map(|_| rng.random()).collect();
 
         let encoded = EncodedVectorsPQ::encode(
             vector_data.iter(),
@@ -215,7 +210,6 @@ mod tests {
             let orginal_score = -l1_similarity(&query, vector);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -223,7 +217,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
 
         let encoded = EncodedVectorsPQ::encode(
@@ -247,7 +241,6 @@ mod tests {
             let orginal_score = dot_similarity(&vector_data[0], &vector_data[i]);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     #[test]
@@ -255,7 +248,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
 
         let encoded = EncodedVectorsPQ::encode(
@@ -279,7 +272,6 @@ mod tests {
             let orginal_score = -dot_similarity(&vector_data[0], &vector_data[i]);
             assert!((score - orginal_score).abs() < ERROR);
         }
-        counter.discard_results();
     }
 
     // ignore this test because it requires long time
@@ -291,7 +283,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut vector_data: Vec<Vec<_>> = vec![];
         for _ in 0..VECTORS_COUNT {
-            vector_data.push((0..VECTOR_DIM).map(|_| rng.gen()).collect());
+            vector_data.push((0..VECTOR_DIM).map(|_| rng.random()).collect());
         }
 
         for i in 0.. {
@@ -336,7 +328,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
 
             // check that all threads are finished
-            assert!(num_threads::num_threads() == start_num_threads);
+            assert_eq!(num_threads::num_threads(), start_num_threads);
 
             println!("Finished iteration {i}");
         }

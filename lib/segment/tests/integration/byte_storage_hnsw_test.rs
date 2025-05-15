@@ -1,72 +1,32 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::flags::FeatureFlags;
 use common::types::{ScoredPointOffset, TelemetryDetail};
-use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
-use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_dense_byte_vector, random_int_payload};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
+use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::{PayloadIndex, VectorIndex};
 use segment::segment_constructor::build_segment;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, Range, SearchParams,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Range, SearchParams,
     SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
-use segment::vector_storage::query::{ContextPair, DiscoveryQuery, RecoQuery};
 use segment::vector_storage::VectorStorageEnum;
-use serde_json::json;
 use tempfile::Builder;
 
-const MAX_EXAMPLE_PAIRS: usize = 4;
-
-enum QueryVariant {
-    Nearest,
-    RecommendBestScore,
-    Discovery,
-}
-
-fn random_discovery_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_pairs: usize = rnd.gen_range(1..MAX_EXAMPLE_PAIRS);
-
-    let target = random_dense_byte_vector(rnd, dim).into();
-
-    let pairs = (0..num_pairs)
-        .map(|_| {
-            let positive = random_dense_byte_vector(rnd, dim).into();
-            let negative = random_dense_byte_vector(rnd, dim).into();
-            ContextPair { positive, negative }
-        })
-        .collect_vec();
-
-    DiscoveryQuery::new(target, pairs).into()
-}
-
-fn random_reco_query<R: Rng + ?Sized>(rnd: &mut R, dim: usize) -> QueryVector {
-    let num_examples: usize = rnd.gen_range(1..MAX_EXAMPLE_PAIRS);
-
-    let positive = (0..num_examples)
-        .map(|_| random_dense_byte_vector(rnd, dim).into())
-        .collect_vec();
-    let negative = (0..num_examples)
-        .map(|_| random_dense_byte_vector(rnd, dim).into())
-        .collect_vec();
-
-    RecoQuery::new(positive, negative).into()
-}
-
-fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rnd: &mut R, dim: usize) -> QueryVector {
-    match variant {
-        QueryVariant::Nearest => random_dense_byte_vector(rnd, dim).into(),
-        QueryVariant::Discovery => random_discovery_query(rnd, dim),
-        QueryVariant::RecommendBestScore => random_reco_query(rnd, dim),
-    }
+fn random_query<R: Rng + ?Sized>(variant: &QueryVariant, rng: &mut R, dim: usize) -> QueryVector {
+    segment::fixtures::query_fixtures::random_query(variant, rng, |rng| {
+        random_dense_byte_vector(rng, dim).into()
+    })
 }
 
 fn compare_search_result(result_a: &[Vec<ScoredPointOffset>], result_b: &[Vec<ScoredPointOffset>]) {
@@ -84,20 +44,19 @@ fn compare_search_result(result_a: &[Vec<ScoredPointOffset>], result_b: &[Vec<Sc
 #[case::nearest(QueryVariant::Nearest, VectorStorageDatatype::Uint8, 32, 10)]
 #[case::nearest(QueryVariant::Nearest, VectorStorageDatatype::Float16, 32, 10)]
 #[case::discovery(QueryVariant::Discovery, VectorStorageDatatype::Uint8, 128, 20)]
-#[case::recommend(
-    QueryVariant::RecommendBestScore,
-    VectorStorageDatatype::Float16,
-    64,
-    20
-)]
+#[case::reco_best_score(QueryVariant::RecoBestScore, VectorStorageDatatype::Float16, 64, 20)]
+#[case::reco_sum_scores(QueryVariant::RecoSumScores, VectorStorageDatatype::Float16, 64, 20)]
 fn test_byte_storage_hnsw(
     #[case] query_variant: QueryVariant,
     #[case] storage_data_type: VectorStorageDatatype,
     #[case] ef: usize,
     #[case] max_failures: usize, // out of 100
 ) {
+    use common::counter::hardware_counter::HardwareCounterCell;
     use segment::index::hnsw_index::num_rayon_threads;
     use segment::json_path::JsonPath;
+    use segment::payload_json;
+    use segment::segment_constructor::VectorIndexBuildArgs;
     use segment::types::PayloadSchemaType;
 
     let stopped = AtomicBool::new(false);
@@ -119,22 +78,6 @@ fn test_byte_storage_hnsw(
     let dir_byte = Builder::new().prefix("segment_dir_byte").tempdir().unwrap();
     let hnsw_dir_byte = Builder::new().prefix("hnsw_dir_byte").tempdir().unwrap();
 
-    let config_float = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
     let config_byte = SegmentConfig {
         vector_data: HashMap::from([(
             DEFAULT_VECTOR_NAME.to_owned(),
@@ -154,7 +97,7 @@ fn test_byte_storage_hnsw(
 
     let int_key = "int";
 
-    let mut segment_float = build_segment(dir_float.path(), &config_float, true).unwrap();
+    let mut segment_float = build_simple_segment(dir_float.path(), dim, distance).unwrap();
     let mut segment_byte = build_segment(dir_byte.path(), &config_byte, true).unwrap();
     // check that `segment_byte` uses byte or half storage
     {
@@ -173,31 +116,53 @@ fn test_byte_storage_hnsw(
         let vector = random_dense_byte_vector(&mut rnd, dim);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
+
+        let hw_counter = HardwareCounterCell::new();
 
         segment_float
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment_float
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
         segment_byte
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment_byte
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
+
+    let hw_counter = HardwareCounterCell::new();
 
     segment_float
         .payload_index
         .borrow_mut()
-        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new(int_key),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     segment_byte
         .payload_index
         .borrow_mut()
-        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
+        .set_indexed(
+            &JsonPath::new(int_key),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
 
     let hnsw_config = HnswConfig {
@@ -210,22 +175,28 @@ fn test_byte_storage_hnsw(
     };
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
-    let hnsw_index_byte = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir_byte.path(),
-        id_tracker: segment_byte.id_tracker.clone(),
-        vector_storage: segment_byte.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        quantized_vectors: segment_byte.vector_data[DEFAULT_VECTOR_NAME]
-            .quantized_vectors
-            .clone(),
-        payload_index: segment_byte.payload_index.clone(),
-        hnsw_config,
-        permit: Some(permit),
-        gpu_device: None,
-        stopped: &stopped,
-    })
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
+    let hnsw_index_byte = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir_byte.path(),
+            id_tracker: segment_byte.id_tracker.clone(),
+            vector_storage: segment_byte.vector_data[DEFAULT_VECTOR_NAME]
+                .vector_storage
+                .clone(),
+            quantized_vectors: segment_byte.vector_data[DEFAULT_VECTOR_NAME]
+                .quantized_vectors
+                .clone(),
+            payload_index: segment_byte.payload_index.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+            feature_flags: FeatureFlags::default(),
+        },
+    )
     .unwrap();
 
     let top = 3;
@@ -235,7 +206,7 @@ fn test_byte_storage_hnsw(
         let query = random_query(&query_variant, &mut rnd, dim);
 
         let range_size = 40;
-        let left_range = rnd.gen_range(0..400);
+        let left_range = rnd.random_range(0..400);
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(

@@ -2,19 +2,23 @@ use std::fs::{create_dir_all, remove_dir};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+use common::counter::conditioned_counter::ConditionedCounter;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
 use memmap2::MmapMut;
+use memory::fadvise::clear_disk_cache;
 use memory::madvise::AdviceSetting;
 use memory::mmap_ops::{self, create_and_ensure_length};
 use memory::mmap_type::{MmapBitSlice, MmapSlice};
 use serde::{Deserialize, Serialize};
 
-use super::mutable_numeric_index::InMemoryNumericIndex;
 use super::Encodable;
+use super::mutable_numeric_index::InMemoryNumericIndex;
+use crate::common::Flusher;
 use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
 use crate::common::operation_error::OperationResult;
-use crate::common::Flusher;
 use crate::index::field_index::histogram::{Histogram, Numericable, Point};
 use crate::index::field_index::mmap_point_to_values::{MmapPointToValues, MmapValue};
 
@@ -31,6 +35,7 @@ pub struct MmapNumericIndex<T: Encodable + Numericable + Default + MmapValue + '
     deleted_count: usize,
     max_values_per_point: usize,
     point_to_values: MmapPointToValues<T>,
+    is_on_disk: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +83,11 @@ impl<T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterat
 }
 
 impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
-    pub fn build(in_memory_index: InMemoryNumericIndex<T>, path: &Path) -> OperationResult<Self> {
+    pub fn build(
+        in_memory_index: InMemoryNumericIndex<T>,
+        path: &Path,
+        is_on_disk: bool,
+    ) -> OperationResult<Self> {
         create_dir_all(path)?;
 
         let pairs_path = path.join(PAIRS_PATH);
@@ -139,10 +148,10 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
             }
         }
 
-        Self::load(path)
+        Self::load(path, is_on_disk)
     }
 
-    pub fn load(path: &Path) -> OperationResult<Self> {
+    pub fn load(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
         let pairs_path = path.join(PAIRS_PATH);
         let deleted_path = path.join(DELETED_PATH);
         let config_path = path.join(CONFIG_PATH);
@@ -152,14 +161,15 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
         let deleted = MmapBitSlice::from(deleted, 0);
         let deleted_count = deleted.count_ones();
+        let do_populate = !is_on_disk;
         let map = unsafe {
             MmapSlice::try_from(mmap_ops::open_write_mmap(
                 &pairs_path,
                 AdviceSetting::Global,
-                false,
+                do_populate,
             )?)?
         };
-        let point_to_values = MmapPointToValues::open(path)?;
+        let point_to_values = MmapPointToValues::open(path, do_populate)?;
 
         Ok(Self {
             pairs: map,
@@ -169,6 +179,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
             deleted_count,
             max_values_per_point: config.max_values_per_point,
             point_to_values,
+            is_on_disk,
         })
     }
 
@@ -197,14 +208,20 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         self.deleted.flusher()
     }
 
-    pub(super) fn check_values_any(
+    pub fn check_values_any(
         &self,
         idx: PointOffsetType,
         check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
     ) -> bool {
+        let hw_counter = self.make_conditioned_counter(hw_counter);
+
         if self.deleted.get(idx as usize) == Some(false) {
-            self.point_to_values
-                .check_values_any(idx, |v| check_fn(T::from_referenced(&v)))
+            self.point_to_values.check_values_any(
+                idx,
+                |v| check_fn(T::from_referenced(&v)),
+                &hw_counter,
+            )
         } else {
             false
         }
@@ -236,13 +253,19 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         self.pairs.len()
     }
 
-    pub(super) fn values_range(
-        &self,
+    pub(super) fn values_range<'a>(
+        &'a self,
         start_bound: Bound<Point<T>>,
         end_bound: Bound<Point<T>>,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = PointOffsetType> + 'a {
+        let hw_counter = self.make_conditioned_counter(hw_counter);
+
         self.values_range_iterator(start_bound, end_bound)
             .map(|Point { idx, .. }| idx)
+            .measure_hw_with_condition_cell(hw_counter, size_of::<Point<T>>(), |i| {
+                i.payload_index_io_read_counter()
+            })
     }
 
     pub(super) fn orderable_values_range(
@@ -325,5 +348,37 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
             start_index,
             end_index,
         }
+    }
+
+    fn make_conditioned_counter<'a>(
+        &self,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> ConditionedCounter<'a> {
+        ConditionedCounter::new(self.is_on_disk, hw_counter)
+    }
+
+    pub fn is_on_disk(&self) -> bool {
+        self.is_on_disk
+    }
+
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        self.pairs.populate()?;
+        self.point_to_values.populate();
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        let pairs_path = self.path.join(PAIRS_PATH);
+        let deleted_path = self.path.join(DELETED_PATH);
+
+        clear_disk_cache(&pairs_path)?;
+        clear_disk_cache(&deleted_path)?;
+
+        self.point_to_values.clear_cache()?;
+
+        Ok(())
     }
 }

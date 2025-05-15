@@ -1,16 +1,19 @@
 use std::borrow::Cow;
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{self, Write};
+use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use memory::fadvise::clear_disk_cache;
 use memory::mmap_ops;
 
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
@@ -34,6 +37,24 @@ pub struct MemmapDenseVectorStorage<T: PrimitiveVectorElement> {
     deleted_path: PathBuf,
     mmap_store: Option<MmapDenseVectors<T>>,
     distance: Distance,
+}
+
+impl<T: PrimitiveVectorElement> MemmapDenseVectorStorage<T> {
+    /// Populate all pages in the mmap.
+    /// Block until all pages are populated.
+    pub fn populate(&self) -> OperationResult<()> {
+        if let Some(mmap_store) = &self.mmap_store {
+            mmap_store.populate()?;
+        }
+        Ok(())
+    }
+
+    /// Drop disk cache.
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        clear_disk_cache(&self.vectors_path)?;
+        clear_disk_cache(&self.deleted_path)?;
+        Ok(())
+    }
 }
 
 pub fn open_memmap_vector_storage(
@@ -106,14 +127,6 @@ fn open_memmap_vector_storage_with_async_io_impl<T: PrimitiveVectorElement>(
 }
 
 impl<T: PrimitiveVectorElement> MemmapDenseVectorStorage<T> {
-    pub fn prefault_mmap_pages(&self) -> Option<mmap_ops::PrefaultMmapPages> {
-        Some(
-            self.mmap_store
-                .as_ref()?
-                .prefault_mmap_pages(&self.vectors_path),
-        )
-    }
-
     pub fn get_mmap_vectors(&self) -> &MmapDenseVectors<T> {
         self.mmap_store.as_ref().unwrap()
     }
@@ -139,9 +152,13 @@ impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for MemmapDenseVectorStora
             .unwrap_or_else(|| panic!("vector not found: {key}"))
     }
 
-    fn get_dense_batch<'a>(&'a self, keys: &[PointOffsetType], vectors: &mut [&'a [T]]) {
+    fn get_dense_batch<'a>(
+        &'a self,
+        keys: &[PointOffsetType],
+        vectors: &'a mut [MaybeUninit<&'a [T]>],
+    ) -> &'a [&'a [T]] {
         let mmap_store = self.mmap_store.as_ref().unwrap();
-        mmap_store.get_vectors(keys, vectors);
+        mmap_store.get_vectors(keys, vectors)
     }
 }
 
@@ -162,10 +179,6 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
         self.mmap_store.as_ref().unwrap().num_vectors
     }
 
-    fn size_of_available_vectors_in_bytes(&self) -> usize {
-        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
-    }
-
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
         self.get_vector_opt(key).expect("vector not found")
     }
@@ -178,13 +191,18 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
             .map(|vector| T::slice_to_float_cow(vector.into()).into())
     }
 
-    fn insert_vector(&mut self, _key: PointOffsetType, _vector: VectorRef) -> OperationResult<()> {
+    fn insert_vector(
+        &mut self,
+        _key: PointOffsetType,
+        _vector: VectorRef,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         panic!("Can't directly update vector in mmap storage")
     }
 
     fn update_from<'a>(
         &mut self,
-        other_ids: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
+        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let dim = self.vector_dim();
@@ -200,7 +218,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
         // Extend vectors file, write other vectors into it
         let mut vectors_file = open_append(&self.vectors_path)?;
         let mut deleted_ids = vec![];
-        for (offset, (other_vector, other_deleted)) in other_ids.enumerate() {
+        for (offset, (other_vector, other_deleted)) in other_vectors.enumerate() {
             check_process_stopped(stopped)?;
             let vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
             let raw_bites = mmap_ops::transmute_to_u8_slice(vector.as_ref());
@@ -212,7 +230,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
                 deleted_ids.push(start_index as PointOffsetType + offset as PointOffsetType);
             }
         }
-        vectors_file.flush()?;
+        vectors_file.sync_all()?;
         drop(vectors_file);
 
         // Load store with updated files
@@ -269,12 +287,7 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
 
 /// Open a file shortly for appending
 fn open_append<P: AsRef<Path>>(path: P) -> io::Result<File> {
-    OpenOptions::new()
-        .read(false)
-        .write(false)
-        .append(true)
-        .create(false)
-        .open(path)
+    OpenOptions::new().append(true).open(path)
 }
 
 #[cfg(test)]
@@ -283,19 +296,20 @@ mod tests {
     use std::sync::Arc;
 
     use atomic_refcell::AtomicRefCell;
+    use common::counter::hardware_counter::HardwareCounterCell;
     use common::types::ScoredPointOffset;
     use memory::mmap_ops::transmute_to_u8_slice;
     use tempfile::Builder;
 
     use super::*;
-    use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
     use crate::data_types::vectors::{DenseVector, QueryVector};
     use crate::fixtures::payload_context_fixture::FixtureIdTracker;
     use crate::id_tracker::id_tracker_base::IdTracker;
     use crate::types::{PointIdType, QuantizationConfig, ScalarQuantizationConfig};
     use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
-    use crate::vector_storage::new_raw_scorer;
     use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+    use crate::vector_storage::{DEFAULT_STOPPED, new_raw_scorer_for_test};
 
     #[test]
     fn test_basic_persistence() {
@@ -321,6 +335,8 @@ mod tests {
                 .expect("storage is missing required file");
         }
 
+        let hw_counter = HardwareCounterCell::new();
+
         {
             let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
             let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
@@ -334,13 +350,13 @@ mod tests {
             .unwrap();
             {
                 storage2
-                    .insert_vector(0, points[0].as_slice().into())
+                    .insert_vector(0, points[0].as_slice().into(), &hw_counter)
                     .unwrap();
                 storage2
-                    .insert_vector(1, points[1].as_slice().into())
+                    .insert_vector(1, points[1].as_slice().into(), &hw_counter)
                     .unwrap();
                 storage2
-                    .insert_vector(2, points[2].as_slice().into())
+                    .insert_vector(2, points[2].as_slice().into(), &hw_counter)
                     .unwrap();
             }
             let mut iter = (0..3).map(|i| {
@@ -374,10 +390,10 @@ mod tests {
             .unwrap();
             {
                 storage2
-                    .insert_vector(3, points[3].as_slice().into())
+                    .insert_vector(3, points[3].as_slice().into(), &hw_counter)
                     .unwrap();
                 storage2
-                    .insert_vector(4, points[4].as_slice().into())
+                    .insert_vector(4, points[4].as_slice().into(), &hw_counter)
                     .unwrap();
             }
             let mut iter = (0..2).map(|i| {
@@ -395,21 +411,22 @@ mod tests {
 
         assert_eq!(stored_ids, [0, 1, 3, 4]);
 
-        let raw_scorer = new_raw_scorer(
+        let raw_scorer = new_raw_scorer_for_test(
             points[2].as_slice().into(),
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
         )
         .unwrap();
-        let res = raw_scorer.peek_top_all(2);
+        let res = raw_scorer.peek_top_all(2, &DEFAULT_STOPPED).unwrap();
 
         assert_eq!(res.len(), 2);
 
         assert_ne!(res[0].idx, 2);
 
-        let res = raw_scorer.peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 2);
+        let res = raw_scorer
+            .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 2, &DEFAULT_STOPPED)
+            .unwrap();
 
-        raw_scorer.take_hardware_counter().discard_results();
         assert_eq!(res.len(), 2);
         assert_ne!(res[0].idx, 2);
     }
@@ -430,6 +447,8 @@ mod tests {
         let mut storage = open_memmap_vector_storage(dir.path(), 4, Distance::Dot).unwrap();
         let borrowed_id_tracker = id_tracker.borrow_mut();
 
+        let hw_counter = HardwareCounterCell::new();
+
         {
             let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
             let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
@@ -444,7 +463,7 @@ mod tests {
             {
                 points.iter().enumerate().for_each(|(i, vec)| {
                     storage2
-                        .insert_vector(i as PointOffsetType, vec.as_slice().into())
+                        .insert_vector(i as PointOffsetType, vec.as_slice().into(), &hw_counter)
                         .unwrap();
                 });
             }
@@ -476,19 +495,20 @@ mod tests {
 
         let vector = vec![0.0, 1.0, 1.1, 1.0];
         let query = vector.as_slice().into();
-        let scorer = new_raw_scorer(
+        let scorer = new_raw_scorer_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
         )
         .unwrap();
 
-        let closest = scorer.peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5);
+        let closest = scorer
+            .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+            .unwrap();
         assert_eq!(closest.len(), 3, "must have 3 vectors, 2 are deleted");
         assert_eq!(closest[0].idx, 0);
         assert_eq!(closest[1].idx, 1);
         assert_eq!(closest[2].idx, 4);
-        scorer.take_hardware_counter().discard_results();
         drop(scorer);
 
         // Delete 1, redelete 2
@@ -503,17 +523,18 @@ mod tests {
         let vector = vec![1.0, 0.0, 0.0, 0.0];
         let query = vector.as_slice().into();
 
-        let scorer = new_raw_scorer(
+        let scorer = new_raw_scorer_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
         )
         .unwrap();
-        let closest = scorer.peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5);
+        let closest = scorer
+            .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+            .unwrap();
         assert_eq!(closest.len(), 2, "must have 2 vectors, 3 are deleted");
         assert_eq!(closest[0].idx, 4);
         assert_eq!(closest[1].idx, 0);
-        scorer.take_hardware_counter().discard_results();
         drop(scorer);
 
         // Delete all
@@ -527,14 +548,13 @@ mod tests {
 
         let vector = vec![1.0, 0.0, 0.0, 0.0];
         let query = vector.as_slice().into();
-        let scorer = new_raw_scorer(
+        let scorer = new_raw_scorer_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
         )
         .unwrap();
-        let closest = scorer.peek_top_all(5);
-        scorer.take_hardware_counter().discard_results();
+        let closest = scorer.peek_top_all(5, &DEFAULT_STOPPED).unwrap();
         assert!(closest.is_empty(), "must have no results, all deleted");
     }
 
@@ -555,6 +575,8 @@ mod tests {
         let mut storage = open_memmap_vector_storage(dir.path(), 4, Distance::Dot).unwrap();
         let borrowed_id_tracker = id_tracker.borrow_mut();
 
+        let hw_counter = HardwareCounterCell::new();
+
         {
             let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
             let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
@@ -569,7 +591,7 @@ mod tests {
             {
                 points.iter().enumerate().for_each(|(i, vec)| {
                     storage2
-                        .insert_vector(i as PointOffsetType, vec.as_slice().into())
+                        .insert_vector(i as PointOffsetType, vec.as_slice().into(), &hw_counter)
                         .unwrap();
                     if delete_mask[i] {
                         storage2.delete_vector(i as PointOffsetType).unwrap();
@@ -593,15 +615,15 @@ mod tests {
 
         let vector = vec![0.0, 1.0, 1.1, 1.0];
         let query = vector.as_slice().into();
-        let scorer = new_raw_scorer(
+        let scorer = new_raw_scorer_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
         )
         .unwrap();
-        let closest = scorer.peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5);
-
-        scorer.take_hardware_counter().discard_results();
+        let closest = scorer
+            .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+            .unwrap();
 
         drop(scorer);
 
@@ -636,6 +658,8 @@ mod tests {
         let mut storage = open_memmap_vector_storage(dir.path(), 4, Distance::Dot).unwrap();
         let borrowed_id_tracker = id_tracker.borrow_mut();
 
+        let hw_counter = HardwareCounterCell::new();
+
         {
             let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
             let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
@@ -650,7 +674,7 @@ mod tests {
             {
                 for (i, vec) in points.iter().enumerate() {
                     storage2
-                        .insert_vector(i as PointOffsetType, vec.as_slice().into())
+                        .insert_vector(i as PointOffsetType, vec.as_slice().into(), &hw_counter)
                         .unwrap();
                 }
             }
@@ -667,7 +691,7 @@ mod tests {
         let query = vector.as_slice().into();
         let query_points: Vec<PointOffsetType> = vec![0, 2, 4];
 
-        let scorer = new_raw_scorer(
+        let scorer = new_raw_scorer_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
@@ -677,8 +701,6 @@ mod tests {
         let mut res = vec![ScoredPointOffset { idx: 0, score: 0. }; query_points.len()];
         let res_count = scorer.score_points(&query_points, &mut res);
         res.resize(res_count, ScoredPointOffset { idx: 0, score: 0. });
-
-        scorer.take_hardware_counter().discard_results();
 
         assert_eq!(res.len(), 3);
         assert_eq!(res[0].idx, 0);
@@ -722,6 +744,8 @@ mod tests {
         let mut storage = open_memmap_vector_storage(dir.path(), 4, Distance::Dot).unwrap();
         let borrowed_id_tracker = id_tracker.borrow_mut();
 
+        let hw_counter = HardwareCounterCell::new();
+
         {
             let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
             let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
@@ -736,7 +760,7 @@ mod tests {
             {
                 for (i, vec) in points.iter().enumerate() {
                     storage2
-                        .insert_vector(i as PointOffsetType, vec.as_slice().into())
+                        .insert_vector(i as PointOffsetType, vec.as_slice().into(), &hw_counter)
                         .unwrap();
                 }
             }
@@ -757,6 +781,7 @@ mod tests {
         .into();
 
         let stopped = Arc::new(AtomicBool::new(false));
+        let hardware_counter = HardwareCounterCell::new();
         let quantized_vectors =
             QuantizedVectors::create(&storage, &config, dir.path(), 1, &stopped).unwrap();
 
@@ -767,11 +792,11 @@ mod tests {
                 query.clone(),
                 borrowed_id_tracker.deleted_point_bitslice(),
                 storage.deleted_vector_bitslice(),
-                &stopped,
+                hardware_counter,
             )
             .unwrap();
 
-        let scorer_orig = new_raw_scorer(
+        let scorer_orig = new_raw_scorer_for_test(
             query.clone(),
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
@@ -788,9 +813,6 @@ mod tests {
             assert!((orig - quant).abs() < 0.15);
         }
 
-        scorer_orig.take_hardware_counter().discard_results();
-        scorer_quant.take_hardware_counter().discard_results();
-
         let files = storage.files();
         let quantization_files = quantized_vectors.files();
 
@@ -798,16 +820,16 @@ mod tests {
         let quantized_vectors = QuantizedVectors::load(&storage, dir.path()).unwrap();
         assert_eq!(files, storage.files());
         assert_eq!(quantization_files, quantized_vectors.files());
-
+        let hardware_counter = HardwareCounterCell::new();
         let scorer_quant = quantized_vectors
             .raw_scorer(
                 query.clone(),
                 borrowed_id_tracker.deleted_point_bitslice(),
                 storage.deleted_vector_bitslice(),
-                &stopped,
+                hardware_counter,
             )
             .unwrap();
-        let scorer_orig = new_raw_scorer(
+        let scorer_orig = new_raw_scorer_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
@@ -823,8 +845,5 @@ mod tests {
             let orig = scorer_orig.score_internal(0, i);
             assert!((orig - quant).abs() < 0.15);
         }
-
-        scorer_orig.take_hardware_counter().discard_results();
-        scorer_quant.take_hardware_counter().discard_results();
     }
 }

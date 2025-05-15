@@ -9,12 +9,12 @@ use memory::mmap_type::Error as MmapError;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
 
-use crate::types::{PayloadKeyType, PointIdType, SeqNumberType};
+use crate::types::{PayloadKeyType, PointIdType, SeqNumberType, VectorNameBuf};
 use crate::utils::mem::Mem;
 
 pub const PROCESS_CANCELLED_BY_SERVICE_MESSAGE: &str = "process cancelled by service";
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug, Clone, PartialEq)]
 #[error("{0}")]
 pub enum OperationError {
     #[error("Vector dimension error: expected dim: {expected_dim}, got {received_dim}")]
@@ -23,12 +23,12 @@ pub enum OperationError {
         received_dim: usize,
     },
     #[error("Not existing vector name error: {received_name}")]
-    VectorNameNotExists { received_name: String },
-    #[error("Missed vector name error: {received_name}")]
-    MissedVectorName { received_name: String },
+    VectorNameNotExists { received_name: VectorNameBuf },
     #[error("No point with id {missed_point_id}")]
     PointIdError { missed_point_id: PointIdType },
-    #[error("Payload type does not match with previously given for field {field_name}. Expected: {expected_type}")]
+    #[error(
+        "Payload type does not match with previously given for field {field_name}. Expected: {expected_type}"
+    )]
     TypeError {
         field_name: PayloadKeyType,
         expected_type: String,
@@ -54,10 +54,28 @@ pub enum OperationError {
     WrongSparse,
     #[error("Wrong usage of multi vectors")]
     WrongMulti,
-    #[error("No range index for `order_by` key: `{key}`. Please create one to use `order_by`. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Range conditions")]
+    #[error(
+        "No range index for `order_by` key: `{key}`. Please create one to use `order_by`. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Range conditions"
+    )]
     MissingRangeIndexForOrderBy { key: String },
-    #[error("No appropriate index for faceting: `{key}`. Please create one to facet on this field. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Match conditions")]
+    #[error(
+        "No appropriate index for faceting: `{key}`. Please create one to facet on this field. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Match conditions"
+    )]
     MissingMapIndexForFacet { key: String },
+    #[error(
+        "Expected {expected_type} value for {field_name} in the payload and/or in the formula defaults. Error: {description}"
+    )]
+    VariableTypeError {
+        field_name: PayloadKeyType,
+        expected_type: String,
+        description: String,
+    },
+    #[error("The expression {expression} produced a non-finite number")]
+    NonFiniteNumber { expression: String },
+
+    // ToDo: Remove after RocksDB is deprecated
+    #[error("RocksDB column family {name} not found")]
+    RocksDbColumnFamilyNotFound { name: String },
 }
 
 impl OperationError {
@@ -77,15 +95,12 @@ impl OperationError {
             backtrace: None,
         }
     }
-}
 
-pub fn check_process_stopped(stopped: &AtomicBool) -> OperationResult<()> {
-    if stopped.load(Ordering::Relaxed) {
-        return Err(OperationError::Cancelled {
-            description: PROCESS_CANCELLED_BY_SERVICE_MESSAGE.to_string(),
-        });
+    pub fn validation_error(description: impl Into<String>) -> OperationError {
+        OperationError::ValidationError {
+            description: description.into(),
+        }
     }
-    Ok(())
 }
 
 /// Contains information regarding last operation error, which should be fixed before next operation could be processed
@@ -209,4 +224,24 @@ pub fn get_service_error<T>(err: &OperationResult<T>) -> Option<OperationError> 
             _ => None,
         },
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct CancelledError;
+
+pub type CancellableResult<T> = Result<T, CancelledError>;
+
+impl From<CancelledError> for OperationError {
+    fn from(CancelledError: CancelledError) -> Self {
+        OperationError::Cancelled {
+            description: PROCESS_CANCELLED_BY_SERVICE_MESSAGE.to_string(),
+        }
+    }
+}
+
+pub fn check_process_stopped(stopped: &AtomicBool) -> CancellableResult<()> {
+    if stopped.load(Ordering::Relaxed) {
+        return Err(CancelledError);
+    }
+    Ok(())
 }

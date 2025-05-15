@@ -1,7 +1,8 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use common::cpu::CpuBudget;
+use common::budget::ResourceBudget;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::json_path::JsonPath;
 use segment::types::{
     Condition, FieldCondition, Filter, GeoPoint, GeoRadius, PayloadFieldSchema, PayloadSchemaType,
@@ -42,7 +43,7 @@ async fn test_payload_missing_index_check() {
         payload_index_schema.clone(),
         current_runtime.clone(),
         current_runtime.clone(),
-        CpuBudget::default(),
+        ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
     .await
@@ -50,7 +51,10 @@ async fn test_payload_missing_index_check() {
 
     let upsert_ops = upsert_operation();
 
-    shard.update(upsert_ops.into(), true).await.unwrap();
+    shard
+        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .await
+        .unwrap();
 
     let geo_filter = Filter::new_must(Condition::Field(FieldCondition::new_geo_radius(
         JsonPath::from_str("location").unwrap(),
@@ -65,7 +69,7 @@ async fn test_payload_missing_index_check() {
         shard
             .payload_index_schema
             .read()
-            .one_unindexed_key(&geo_filter)
+            .one_unindexed_filter_key(&geo_filter)
             .map(|(x, _)| x),
         Some(JsonPath::from_str("location").unwrap())
     );
@@ -84,7 +88,7 @@ async fn test_payload_missing_index_check() {
         shard
             .payload_index_schema
             .read()
-            .one_unindexed_key(&geo_filter),
+            .one_unindexed_filter_key(&geo_filter),
         None
     );
 
@@ -107,7 +111,7 @@ async fn test_payload_missing_index_check() {
         shard
             .payload_index_schema
             .read()
-            .one_unindexed_key(&num_filter)
+            .one_unindexed_filter_key(&num_filter)
             .map(|(x, _)| x),
         Some("location.lat".parse().unwrap())
     );
@@ -126,7 +130,7 @@ async fn test_payload_missing_index_check() {
         shard
             .payload_index_schema
             .read()
-            .one_unindexed_key(&num_filter),
+            .one_unindexed_filter_key(&num_filter),
         None,
     );
 
@@ -136,7 +140,7 @@ async fn test_payload_missing_index_check() {
         shard
             .payload_index_schema
             .read()
-            .one_unindexed_key(&combined_filter),
+            .one_unindexed_filter_key(&combined_filter),
         None,
     );
 }
@@ -161,5 +165,8 @@ async fn create_index(
             field_schema: Some(PayloadFieldSchema::FieldType(field_type)),
         }),
     );
-    shard.update(create_index.into(), true).await.unwrap();
+    shard
+        .update(create_index.into(), true, HwMeasurementAcc::new())
+        .await
+        .unwrap();
 }

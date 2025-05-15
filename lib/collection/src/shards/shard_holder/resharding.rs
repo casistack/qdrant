@@ -3,13 +3,14 @@ use std::fmt;
 use std::ops::Deref as _;
 use std::sync::Arc;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::{Condition, CustomIdCheckerCondition as _, Filter, ShardKey};
 
 use super::ShardHolder;
 use crate::hash_ring::{self, HashRingRouter};
 use crate::operations::cluster_ops::ReshardingDirection;
-use crate::operations::types::{CollectionError, CollectionResult, UpdateResult};
-use crate::operations::{point_ops, CollectionUpdateOperations};
+use crate::operations::types::{CollectionError, CollectionResult};
+use crate::operations::{CollectionUpdateOperations, point_ops};
 use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
 use crate::shards::resharding::{ReshardKey, ReshardStage, ReshardState};
 use crate::shards::shard::ShardId;
@@ -21,6 +22,7 @@ impl ShardHolder {
 
     pub fn check_start_resharding(&mut self, resharding_key: &ReshardKey) -> CollectionResult<()> {
         let ReshardKey {
+            uuid: _,
             direction,
             peer_id: _,
             shard_id,
@@ -34,15 +36,15 @@ impl ShardHolder {
             assert_resharding_state_consistency(&state, ring, shard_key);
 
             if let Some(state) = state.deref() {
-                if state.matches(resharding_key) {
-                    return Err(CollectionError::bad_request(format!(
+                return if state.matches(resharding_key) {
+                    Err(CollectionError::bad_request(format!(
                         "resharding {resharding_key} is already in progress:\n{state:#?}"
-                    )));
+                    )))
                 } else {
-                    return Err(CollectionError::bad_request(format!(
+                    Err(CollectionError::bad_request(format!(
                         "another resharding is in progress:\n{state:#?}"
-                    )));
-                }
+                    )))
+                };
             }
         }
 
@@ -92,6 +94,7 @@ impl ShardHolder {
         new_shard: Option<ShardReplicaSet>,
     ) -> CollectionResult<()> {
         let ReshardKey {
+            uuid,
             direction,
             peer_id,
             shard_id,
@@ -115,7 +118,9 @@ impl ShardHolder {
                 "resharding is already in progress:\n{state:#?}",
             );
 
-            *state = Some(ReshardState::new(direction, peer_id, shard_id, shard_key));
+            *state = Some(ReshardState::new(
+                uuid, direction, peer_id, shard_id, shard_key,
+            ));
         })?;
 
         Ok(())
@@ -227,7 +232,7 @@ impl ShardHolder {
             )));
         };
 
-        // - do not abort if there is no active reshardinog operation with that key
+        // - do not abort if there is no active resharding operation with that key
         if !state.matches(resharding_key) {
             return Err(CollectionError::bad_request(format!(
                 "can't abort resharding {resharding_key}, \
@@ -236,7 +241,7 @@ impl ShardHolder {
             )));
         }
 
-        // - it's safe to run, if write hash ring was not committed yet
+        // - it's safe to run, if read hash ring was not committed yet
         if state.stage < ReshardStage::ReadHashRingCommitted {
             return Ok(());
         }
@@ -255,8 +260,9 @@ impl ShardHolder {
         force: bool,
     ) -> CollectionResult<()> {
         let ReshardKey {
+            uuid: _,
             direction,
-            peer_id,
+            peer_id: _,
             shard_id,
             ref shard_key,
         } = resharding_key;
@@ -309,7 +315,7 @@ impl ShardHolder {
 
                 // Revert replicas in `Resharding` state back into `Active` state
                 for (peer, state) in shard.peers() {
-                    if state == ReplicaState::Resharding {
+                    if state.is_resharding() {
                         shard.set_replica_state(peer, ReplicaState::Active)?;
                     }
                 }
@@ -320,9 +326,12 @@ impl ShardHolder {
                 }
 
                 // Remove any points that might have been transferred from target shard
+                // Replica may be dead, so we force the delete operation
                 let filter = self.hash_ring_filter(id).expect("hash ring filter");
                 let filter = Filter::new_must_not(Condition::CustomIdChecker(Arc::new(filter)));
-                shard.delete_local_points(filter).await?;
+                shard
+                    .delete_local_points(filter, HwMeasurementAcc::disposable(), true) // Internal operation, no performance tracking needed
+                    .await?;
             }
         }
 
@@ -337,51 +346,39 @@ impl ShardHolder {
         }
 
         // Remove new shard if resharding up
-        if direction == ReshardingDirection::Up {
+        if is_in_progress && direction == ReshardingDirection::Up {
             if let Some(shard) = self.get_shard(shard_id) {
-                match shard.peer_state(peer_id) {
-                    Some(ReplicaState::Resharding) => {
-                        log::debug!("removing peer {peer_id} from {shard_id} replica set");
-                        shard.remove_peer(peer_id).await?;
-                    }
-
-                    Some(ReplicaState::Dead) if is_in_progress => {
-                        log::debug!("removing dead peer {peer_id} from {shard_id} replica set");
-                        shard.remove_peer(peer_id).await?;
-                    }
-
-                    Some(state) => {
-                        return Err(CollectionError::bad_request(format!(
-                            "peer {peer_id} is in {state:?} state"
-                        )));
-                    }
-
-                    None => {
-                        log::warn!(
-                            "aborting resharding {resharding_key}, \
-                             but peer {peer_id} does not exist in {shard_id} replica set"
-                        );
-                    }
+                // Remove all replicas from shard
+                for (peer_id, replica_state) in shard.peers() {
+                    log::debug!(
+                        "removing peer {peer_id} with state {replica_state:?} from replica set {shard_id}",
+                    );
+                    shard.remove_peer(peer_id).await?;
                 }
 
-                if shard.peers().is_empty() {
-                    log::debug!("removing {shard_id} replica set, because replica set is empty");
+                debug_assert!(
+                    shard.peers().is_empty(),
+                    "replica set {shard_id} must be empty after removing all peers",
+                );
 
-                    if let Some(shard_key) = shard_key {
-                        self.key_mapping.write_optional(|key_mapping| {
-                            if !key_mapping.contains_key(shard_key) {
-                                return None;
-                            }
+                log::debug!("removing replica set {shard_id}");
 
-                            let mut key_mapping = key_mapping.clone();
-                            key_mapping.get_mut(shard_key).unwrap().remove(&shard_id);
-                            Some(key_mapping)
-                        })?;
-                    }
+                // Drop the shard
+                if let Some(shard_key) = shard_key {
+                    self.key_mapping.write_optional(|key_mapping| {
+                        if !key_mapping.contains_key(shard_key) {
+                            return None;
+                        }
 
-                    self.drop_and_remove_shard(shard_id).await?;
-                    self.shard_id_to_key_mapping.remove(&shard_id);
+                        let mut key_mapping = key_mapping.clone();
+                        key_mapping.get_mut(shard_key).unwrap().remove(&shard_id);
+
+                        Some(key_mapping)
+                    })?;
                 }
+
+                self.drop_and_remove_shard(shard_id).await?;
+                self.shard_id_to_key_mapping.remove(&shard_id);
             } else {
                 log::warn!(
                     "aborting resharding {resharding_key}, \
@@ -516,34 +513,23 @@ impl ShardHolder {
         }
     }
 
-    pub async fn cleanup_local_shard(&self, shard_id: ShardId) -> CollectionResult<UpdateResult> {
-        let shard = self.get_shard(shard_id).ok_or_else(|| {
-            CollectionError::not_found(format!("shard {shard_id} does not exist"))
-        })?;
-
-        if !shard.is_local().await {
-            return Err(CollectionError::bad_shard_selection(format!(
-                "shard {shard_id} is not a local shard"
-            )))?;
-        }
-
-        let filter = self.hash_ring_filter(shard_id).expect("hash ring filter");
-        let filter = Filter::new_must_not(Condition::CustomIdChecker(Arc::new(filter)));
-        shard.delete_local_points(filter).await
-    }
-
     pub fn resharding_filter(&self) -> Option<hash_ring::HashRingFilter> {
         let shard_id = self.resharding_state.read().as_ref()?.shard_id;
         self.hash_ring_filter(shard_id)
     }
 
-    pub fn hash_ring_filter(&self, shard_id: ShardId) -> Option<hash_ring::HashRingFilter> {
+    pub fn hash_ring_router(&self, shard_id: ShardId) -> Option<&HashRingRouter> {
         if !self.contains_shard(shard_id) {
             return None;
         }
 
         let shard_key = self.shard_id_to_key_mapping.get(&shard_id).cloned();
         let router = self.rings.get(&shard_key).expect("hashring exists");
+        Some(router)
+    }
+
+    pub fn hash_ring_filter(&self, shard_id: ShardId) -> Option<hash_ring::HashRingFilter> {
+        let router = self.hash_ring_router(shard_id)?;
         let ring = match router {
             HashRingRouter::Single(ring) => ring,
             HashRingRouter::Resharding { old, new } => {

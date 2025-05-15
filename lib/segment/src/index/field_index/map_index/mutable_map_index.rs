@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::iter;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -41,6 +42,7 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
         &mut self,
         idx: PointOffsetType,
         values: Vec<Q>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()>
     where
         Q: Into<N::Owned>,
@@ -54,12 +56,17 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
             self.point_to_values.resize_with(idx as usize + 1, Vec::new)
         }
 
+        let mut hw_cell_wb = hw_counter
+            .payload_index_io_write_counter()
+            .write_back_counter();
+
         self.point_to_values[idx as usize] = Vec::with_capacity(values.len());
         for value in values {
             let entry = self.map.entry(value.into());
             self.point_to_values[idx as usize].push(entry.key().clone());
             let db_record = MapIndex::encode_db_record(entry.key().borrow(), idx);
             entry.or_default().insert(idx);
+            hw_cell_wb.incr_delta(db_record.len());
             self.db_wrapper.put(db_record, [])?;
         }
         self.indexed_points += 1;
@@ -160,10 +167,10 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
         self.map.iter().map(|(k, v)| (k.borrow(), v.len()))
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter<'_>)> + '_ {
+    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter)> {
         self.map
             .iter()
-            .map(|(k, v)| (k.borrow(), Box::new(v.iter().copied()) as IdIter))
+            .map(move |(k, v)| (k.borrow(), Box::new(v.iter().copied()) as IdIter))
     }
 
     pub fn get_iterator(&self, value: &N) -> IdRefIter<'_> {

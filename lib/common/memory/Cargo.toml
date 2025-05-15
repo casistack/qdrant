@@ -6,19 +6,22 @@ authors = [
     "Qdrant Team <info@qdrant.tech>",
 ]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+ahash = { workspace = true }
+delegate = { workspace = true }
 memmap2 = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 bitvec = { workspace = true }
 thiserror = { workspace = true }
+nix = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

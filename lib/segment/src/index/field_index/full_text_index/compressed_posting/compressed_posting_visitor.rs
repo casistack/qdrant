@@ -93,14 +93,10 @@ impl<'a> CompressedPostingVisitor<'a> {
         else {
             // value is in the noncompressed postings range
             self.decompressed_chunk_idx = None;
-            return self
-                .chunk_reader
-                .remainder_postings
-                .binary_search(&val)
-                .is_ok();
+            return self.chunk_reader.search_in_remainder(val);
         };
         // if the value is the initial value of the chunk, we don't need to decompress the chunk
-        if self.chunk_reader.chunks[chunk_index].initial == val {
+        if self.chunk_reader.get_chunk_index(chunk_index).initial == val {
             return true;
         }
 
@@ -126,14 +122,10 @@ impl<'a> CompressedPostingVisitor<'a> {
     pub fn get_by_offset(&mut self, offset: usize) -> Option<PointOffsetType> {
         let chunk_idx = offset / BitPackerImpl::BLOCK_LEN;
 
-        if chunk_idx >= self.chunk_reader.chunks.len() {
+        if chunk_idx >= self.chunk_reader.chunks_len() {
             // Reminder postings
-            let reminder_idx = offset - self.chunk_reader.chunks.len() * BitPackerImpl::BLOCK_LEN;
-            return self
-                .chunk_reader
-                .remainder_postings
-                .get(reminder_idx)
-                .copied();
+            let reminder_idx = offset - self.chunk_reader.chunks_len() * BitPackerImpl::BLOCK_LEN;
+            return self.chunk_reader.get_remainder_posting(reminder_idx);
         }
 
         if self.decompressed_chunk_idx != Some(chunk_idx) {
@@ -148,6 +140,7 @@ impl<'a> CompressedPostingVisitor<'a> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_list::CompressedPostingList;
 
